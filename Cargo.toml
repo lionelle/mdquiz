@@ -16,6 +16,7 @@ pulldown-cmark = "0.13.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_norway = "0.9.42"
 thiserror = "2.0.19"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # Lints are declared here (rather than as inner attributes in source) so that
 # every target in the crate inherits the same policy. The pre-commit hook and CI

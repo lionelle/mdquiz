@@ -35,24 +35,52 @@ pub struct ItemBank {
 pub struct Question {
     /// Stable identifier, unique within the bank (used for cross-references).
     pub id: String,
+    /// Instructor-facing title (question name). Shown in the Canvas bank
+    /// editor, not to students; absent means fall back to [`Question::id`].
+    pub title: Option<String>,
     /// The question prompt, as authored Markdown.
     pub prompt: String,
     /// Points awarded for a fully correct answer.
     pub points: f64,
+    /// Free-form tags for mdquiz-side organization (e.g. future filtering by
+    /// topic). Not exported to Canvas, which organizes via item banks instead.
+    pub tags: Vec<String>,
+    /// Optional feedback shown to students after answering.
+    pub feedback: Feedback,
     /// The question type together with its (future) type-specific payload.
     pub kind: QuestionKind,
 }
 
+/// Feedback messages shown after a question is answered.
+///
+/// Each field is authored Markdown and optional; an all-empty [`Feedback`]
+/// produces no feedback in any export. Exported to Canvas as QTI
+/// `<itemfeedback>`; omitted from the print sheet, which carries no answer key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Feedback {
+    /// Shown regardless of correctness.
+    #[serde(default)]
+    pub general: Option<String>,
+    /// Shown when the answer is correct.
+    #[serde(default)]
+    pub correct: Option<String>,
+    /// Shown when the answer is incorrect.
+    #[serde(default)]
+    pub incorrect: Option<String>,
+}
+
 /// The supported question types, following the Canvas *New Quizzes* model.
 ///
-/// Variants are unit-typed for now; each gains a payload struct as it is
-/// implemented. The initial roll-out order is the order listed here.
+/// Each variant carries its type-specific payload as it is implemented;
+/// not-yet-rolled-out variants stay unit-typed. The roll-out order is the order
+/// listed here. This serde shape is *not* the authored format — questions are
+/// parsed via `parse::QuestionSpec`, which reads the flat `kind:` YAML tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum QuestionKind {
     /// True/false question.
-    TrueFalse,
+    TrueFalse(TrueFalse),
     /// Single-answer multiple choice.
     MultipleChoice,
     /// Multiple-answer ("select all that apply") multiple choice.
@@ -63,4 +91,56 @@ pub enum QuestionKind {
     Matching,
     /// Put items into the correct order.
     Ordering,
+}
+
+impl QuestionKind {
+    /// A short human-readable label for this type, used in diagnostics.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::TrueFalse(_) => "true/false",
+            Self::MultipleChoice => "multiple choice",
+            Self::MultipleSelect => "multiple select",
+            Self::FillInBlank => "fill in the blank",
+            Self::Matching => "matching",
+            Self::Ordering => "ordering",
+        }
+    }
+
+    /// Build the "not supported yet" export error for this kind.
+    ///
+    /// Shared by every exporter's reject arm so the message stays consistent
+    /// and names both the target format and the offending question.
+    pub(crate) fn unsupported_by(&self, target: &str, id: &str) -> crate::Error {
+        crate::Error::Export(format!(
+            "{target} export does not support {} questions yet (question {id:?})",
+            self.label()
+        ))
+    }
+}
+
+/// The payload for a [`QuestionKind::TrueFalse`] question.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrueFalse {
+    /// Whether the correct answer is "true" (`true`) or "false" (`false`).
+    pub answer: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// Every kind reports its documented human-readable label.
+    fn label_names_each_kind() {
+        assert_eq!(
+            QuestionKind::TrueFalse(TrueFalse { answer: true }).label(),
+            "true/false"
+        );
+        assert_eq!(QuestionKind::MultipleChoice.label(), "multiple choice");
+        assert_eq!(QuestionKind::MultipleSelect.label(), "multiple select");
+        assert_eq!(QuestionKind::FillInBlank.label(), "fill in the blank");
+        assert_eq!(QuestionKind::Matching.label(), "matching");
+        assert_eq!(QuestionKind::Ordering.label(), "ordering");
+    }
 }

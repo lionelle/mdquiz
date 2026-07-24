@@ -11,10 +11,11 @@ upload to Canvas.
 
 ## Idea
 
-Each question is one Markdown file: the prompt is plain Markdown, and a YAML
-block carries the machine-readable parts (choices, correct answers, scoring,
-matching pairs, regex for fill-in-the-blank, …). A directory of question files —
-say `module01/` with 10–20 questions — is assembled into a single item bank.
+Each question is one Markdown file: **YAML front-matter** (a `---`-delimited
+block at the top) carries the machine-readable parts (choices, correct answers,
+scoring, matching pairs, regex for fill-in-the-blank, …), and everything below
+it is the prompt as plain Markdown. A directory of question files — say
+`module01/` with 10–20 questions — is assembled into a single item bank.
 `mdquiz` parses those files into a typed model and renders the export you ask
 for.
 

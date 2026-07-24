@@ -128,7 +128,7 @@ fn bank_name(dir: &Path, name: Option<String>) -> String {
 fn write_export(bank: &ItemBank, format: export::Format, output: &Path) -> anyhow::Result<()> {
     match format {
         export::Format::Markdown => {
-            let rendered = markdown::to_print_markdown(bank);
+            let rendered = markdown::to_print_markdown(bank)?;
             fs::write(output, rendered)
                 .with_context(|| format!("writing Markdown to {}", output.display()))
         }
@@ -189,5 +189,42 @@ mod tests {
         let err = read_question_sources(Path::new("/no/such/mdquiz/dir"))
             .expect_err("missing directory must fail");
         assert!(err.to_string().contains("reading question directory"));
+    }
+
+    /// A one-question true/false bank for exercising the write seam.
+    fn true_false_bank() -> ItemBank {
+        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
+        ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: "P?".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            }],
+        }
+    }
+
+    #[test]
+    /// Markdown export writes a text sheet headed by the bank name.
+    fn write_export_writes_markdown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("quiz.md");
+        write_export(&true_false_bank(), export::Format::Markdown, &out).expect("write");
+        let text = fs::read_to_string(&out).expect("read back");
+        assert!(text.starts_with("# M"));
+    }
+
+    #[test]
+    /// Canvas export writes a zip package (starting with the PK signature).
+    fn write_export_writes_canvas_zip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let out = dir.path().join("quiz.imscc");
+        write_export(&true_false_bank(), export::Format::Canvas, &out).expect("write");
+        let bytes = fs::read(&out).expect("read back");
+        assert!(bytes.starts_with(b"PK"));
     }
 }

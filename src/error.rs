@@ -17,6 +17,16 @@ pub enum Error {
     #[error("failed to parse quiz source: {0}")]
     Parse(String),
 
+    /// A specific question file in a bank failed to parse; names the file so
+    /// the author knows which of many files to fix.
+    #[error("in question file {file}: {message}")]
+    QuestionFile {
+        /// The offending file's name.
+        file: String,
+        /// The underlying failure, rendered.
+        message: String,
+    },
+
     /// A question was structurally valid but semantically incomplete
     /// (for example, a multiple-choice item with no correct answer).
     #[error("invalid question: {0}")]
