@@ -326,6 +326,24 @@ mod tests {
     }
 
     #[test]
+    /// An empty `# ` heading is not treated as a title; the line stays in place.
+    fn empty_heading_is_not_a_title() {
+        let source = "---\nid: q\nkind: true_false\nanswer: true\n---\n\n#  \n\nBody.\n";
+        let question = parse_question(source).expect("valid source");
+        assert_eq!(question.title, None);
+        assert!(question.prompt.starts_with('#'));
+    }
+
+    #[test]
+    /// A trailing `#` ATX closing sequence is trimmed from the extracted title.
+    fn heading_closing_hashes_are_trimmed() {
+        let source = "---\nid: q\nkind: true_false\nanswer: true\n---\n\n# Title ##\n\nBody.\n";
+        let question = parse_question(source).expect("valid source");
+        assert_eq!(question.title.as_deref(), Some("Title"));
+        assert_eq!(question.prompt, "Body.");
+    }
+
+    #[test]
     /// Optional feedback messages are captured when present.
     fn parses_feedback() {
         let source = "---\nid: q\nkind: true_false\nanswer: true\n\

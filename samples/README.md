@@ -9,9 +9,12 @@ prefixes control question order).
 # Print-ready sheet (no answer key):
 cargo run -- export samples/true-false/ --output true-false.md --format markdown
 
-# Canvas New Quizzes item bank (QTI package):
-cargo run -- export samples/true-false/ --output true-false.imscc --format canvas
+# Canvas New Quizzes item bank (zipped QTI package):
+cargo run -- export samples/true-false/ --output true-false.zip --format canvas
 ```
+
+The Canvas output is a zipped QTI package; import it through Canvas's **"QTI
+.zip file"** option, so use a `.zip` extension.
 
 The bank name defaults to the directory name (`true-false`); override it with
 `--name "Module 1 — Fundamentals"`.

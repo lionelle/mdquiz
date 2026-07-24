@@ -145,6 +145,19 @@ mod tests {
     use super::*;
 
     #[test]
+    /// The CLI format maps one-to-one onto the library's export format.
+    fn format_arg_maps_to_export_format() {
+        assert_eq!(
+            export::Format::from(FormatArg::Markdown),
+            export::Format::Markdown
+        );
+        assert_eq!(
+            export::Format::from(FormatArg::Canvas),
+            export::Format::Canvas
+        );
+    }
+
+    #[test]
     /// An explicit `--name` overrides the directory-derived default.
     fn bank_name_prefers_explicit_override() {
         let name = bank_name(
@@ -222,7 +235,7 @@ mod tests {
     /// Canvas export writes a zip package (starting with the PK signature).
     fn write_export_writes_canvas_zip() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let out = dir.path().join("quiz.imscc");
+        let out = dir.path().join("quiz.zip");
         write_export(&true_false_bank(), export::Format::Canvas, &out).expect("write");
         let bytes = fs::read(&out).expect("read back");
         assert!(bytes.starts_with(b"PK"));

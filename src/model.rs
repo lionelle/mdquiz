@@ -143,4 +143,14 @@ mod tests {
         assert_eq!(QuestionKind::Matching.label(), "matching");
         assert_eq!(QuestionKind::Ordering.label(), "ordering");
     }
+
+    #[test]
+    /// The unsupported-kind error names the target format, kind, and question.
+    fn unsupported_by_message_names_target_kind_and_id() {
+        let err = QuestionKind::Matching.unsupported_by("Canvas", "q7");
+        let message = err.to_string();
+        assert!(message.contains("Canvas"));
+        assert!(message.contains("matching"));
+        assert!(message.contains("q7"));
+    }
 }

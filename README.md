@@ -36,9 +36,12 @@ or regex), matching, ordering.
 
 ```bash
 # The bank name defaults to the directory name ("module01"); override with --name.
-cargo run -- export module01/ --output module01.md     --format markdown
-cargo run -- export module01/ --output module01.imscc  --format canvas
+cargo run -- export module01/ --output module01.md   --format markdown
+cargo run -- export module01/ --output module01.zip  --format canvas
 ```
+
+The Canvas output is a zipped QTI package — import it via Canvas's **"QTI .zip
+file"** option, so give it a `.zip` extension.
 
 ## Development
 

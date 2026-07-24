@@ -3,8 +3,8 @@
 //! Canvas imports item banks as a zipped IMS content package: an
 //! `imsmanifest.xml` plus one QTI 1.2 assessment document. This is the same
 //! flavor Canvas's own quiz export produces, which New Quizzes migrates on
-//! import. The byte payload returned here is written to a `.imscc`/`.zip` file
-//! and uploaded to Canvas.
+//! import. The byte payload returned here is written to a `.zip` file and
+//! imported through Canvas's "QTI .zip file" option.
 //!
 //! XML is assembled from the module-level templates below by placeholder
 //! substitution; all authored text is escaped (prompts are first rendered from
@@ -19,9 +19,9 @@ use zip::write::SimpleFileOptions;
 use crate::Result;
 use crate::model::{Feedback, ItemBank, Question, QuestionKind, TrueFalse};
 
-/// The `response_label` ident for the "True" choice; must match the template.
+/// The `response_label` ident for the "True" choice; fills the item template.
 const TRUE_CHOICE_IDENT: &str = "true_choice";
-/// The `response_label` ident for the "False" choice; must match the template.
+/// The `response_label` ident for the "False" choice; fills the item template.
 const FALSE_CHOICE_IDENT: &str = "false_choice";
 /// The `<itemfeedback>` ident for the always-shown general feedback.
 const GENERAL_FB_IDENT: &str = "general_fb";
@@ -76,10 +76,10 @@ const TRUE_FALSE_ITEM_TEMPLATE: &str = r#"      <item ident="{{ITEM_IDENT}}" tit
           </material>
           <response_lid ident="response1" rcardinality="Single">
             <render_choice>
-              <response_label ident="true_choice">
+              <response_label ident="{{TRUE_IDENT}}">
                 <material><mattext texttype="text/plain">True</mattext></material>
               </response_label>
-              <response_label ident="false_choice">
+              <response_label ident="{{FALSE_IDENT}}">
                 <material><mattext texttype="text/plain">False</mattext></material>
               </response_label>
             </render_choice>
@@ -202,6 +202,8 @@ fn true_false_item_xml(question: &Question, answer: &TrueFalse) -> String {
     let feedback = &question.feedback;
     // `{{PROMPT}}` is substituted last so authored text is never re-scanned.
     TRUE_FALSE_ITEM_TEMPLATE
+        .replace("{{TRUE_IDENT}}", TRUE_CHOICE_IDENT)
+        .replace("{{FALSE_IDENT}}", FALSE_CHOICE_IDENT)
         .replace("{{ITEM_IDENT}}", &sanitize_ident(&question.id))
         .replace("{{ITEM_TITLE}}", &escape_xml(title))
         .replace("{{POINTS}}", &question.points.to_string())
