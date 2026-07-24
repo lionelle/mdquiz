@@ -1,0 +1,54 @@
+[package]
+name = "mdquiz"
+version = "0.1.0"
+edition = "2024"
+description = "Author quiz questions as Markdown + YAML and export them to a print-ready Markdown sheet or a Canvas New Quizzes QTI package."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lionelle/mdquiz"
+readme = "README.md"
+keywords = ["quiz", "markdown", "canvas", "qti", "education"]
+categories = ["command-line-utilities", "parsing"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+pulldown-cmark = "0.13.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_norway = "0.9.42"
+thiserror = "2.0.19"
+
+# Lints are declared here (rather than as inner attributes in source) so that
+# every target in the crate inherits the same policy. The pre-commit hook and CI
+# run clippy with `-D warnings`, which promotes every `warn` below to a hard
+# error. See CLAUDE.md for the rationale behind each rule.
+[lints.rust]
+# Documentation is mandatory on all public items; private items are covered by
+# the clippy rule below.
+missing_docs = "warn"
+# We never hand-write `unsafe`; forbid (not merely deny) so it cannot be
+# re-enabled locally with an attribute.
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[lints.clippy]
+# Baseline lint groups.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Require doc comments on private items too (public items are covered by
+# `rust::missing_docs`). Together these mean every function is documented.
+missing_docs_in_private_items = "warn"
+# Keep functions small. The line threshold lives in clippy.toml.
+too_many_lines = "warn"
+# Ban uncaught panics: no `panic!`, and no panic-on-error shortcuts. Fallible
+# paths must return `Result` and be handled explicitly.
+panic = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+# Stubs must be real code, not placeholders that panic at runtime.
+todo = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+
+[profile.release]
+strip = true

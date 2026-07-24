@@ -1,0 +1,4 @@
+# Formatting is enforced by `cargo fmt --all -- --check` in the pre-commit hook
+# and CI. Keep this list conservative so it works on stable rustfmt.
+edition = "2024"
+max_width = 100

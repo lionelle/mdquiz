@@ -1,0 +1,11 @@
+/target
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Local export output while experimenting
+/out
+*.imscc

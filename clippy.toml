@@ -1,0 +1,7 @@
+# Maximum number of lines a single function body may span before
+# `clippy::too_many_lines` fires. Keep functions small and focused.
+too-many-lines-threshold = 30
+
+# Cognitive-complexity ceiling for a single function (clippy::cognitive_complexity,
+# part of the `nursery` group). Kept modest to reinforce the line limit above.
+cognitive-complexity-threshold = 15
