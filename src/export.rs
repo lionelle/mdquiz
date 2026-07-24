@@ -1,4 +1,4 @@
-//! Export a [`crate::model::Quiz`] to a distribution format.
+//! Export a [`crate::model::ItemBank`] to a distribution format.
 //!
 //! Two targets are planned:
 //!

@@ -1,16 +1,19 @@
 //! Command-line interface for the `mdquiz` binary.
 //!
-//! The CLI is a thin shell over the library: it reads source files, hands them
-//! to [`mdquiz::parse`], and writes the chosen export target to disk. All real
-//! work lives in the library so it can be tested without a process.
+//! The CLI is a thin shell over the library: it walks a directory of question
+//! files, hands their contents to [`mdquiz::parse`], and writes the chosen
+//! export target to disk. All real work lives in the library so it can be
+//! tested without a process.
 
+use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use mdquiz::export::{self, canvas, markdown};
+use mdquiz::model::ItemBank;
 use mdquiz::parse;
 
 /// Author quizzes in Markdown + YAML and export them for print or Canvas.
@@ -25,16 +28,19 @@ pub(crate) struct Cli {
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Export a quiz source file to the chosen format.
+    /// Assemble a directory of question files into an item bank and export it.
     Export {
-        /// Path to the Markdown quiz source.
-        input: PathBuf,
-        /// Path to write the exported quiz to.
+        /// Directory of Markdown question files (one question per file).
+        dir: PathBuf,
+        /// Path to write the exported item bank to.
         #[arg(short, long)]
         output: PathBuf,
         /// Export format to produce.
         #[arg(short, long, value_enum)]
         format: FormatArg,
+        /// Bank name; defaults to the directory's own name.
+        #[arg(short, long)]
+        name: Option<String>,
     },
 }
 
@@ -43,7 +49,7 @@ pub(crate) enum Command {
 pub(crate) enum FormatArg {
     /// Print-ready Markdown with no answer key.
     Markdown,
-    /// Canvas New Quizzes QTI package.
+    /// Canvas New Quizzes item bank (QTI package).
     Canvas,
 }
 
@@ -61,43 +67,127 @@ impl From<FormatArg> for export::Format {
 ///
 /// # Errors
 ///
-/// Returns any error from reading the source, parsing it, exporting it, or
-/// writing the output file.
+/// Returns any error from reading the sources, parsing them, exporting the
+/// bank, or writing the output file.
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Export {
-            input,
+            dir,
             output,
             format,
+            name,
         } => {
-            let source = fs::read_to_string(&input)
-                .with_context(|| format!("reading quiz source {}", input.display()))?;
-            let quiz = parse::parse_quiz(&source)?;
-            write_export(&quiz, format.into(), &output)
+            let sources = read_question_sources(&dir)?;
+            let bank = parse::item_bank_from_sources(bank_name(&dir, name), sources)?;
+            write_export(&bank, format.into(), &output)
         }
     }
 }
 
-/// Render `quiz` in `format` and write the result to `output`.
+/// Read every `*.md` file directly in `dir` as a `(filename, content)` pair.
+///
+/// The listing is not sorted here; deterministic ordering is the library's job
+/// in [`parse::item_bank_from_sources`]. Subdirectories and non-Markdown files
+/// are skipped.
+///
+/// # Errors
+///
+/// Returns an error if the directory or any question file cannot be read.
+fn read_question_sources(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let mut sources = Vec::new();
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("reading question directory {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading an entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(OsStr::to_str) != Some("md") {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("reading question file {}", path.display()))?;
+        sources.push((entry.file_name().to_string_lossy().into_owned(), content));
+    }
+    Ok(sources)
+}
+
+/// Choose the bank name: the `--name` override, else the directory's own name.
+fn bank_name(dir: &Path, name: Option<String>) -> String {
+    name.unwrap_or_else(|| {
+        dir.file_name().map_or_else(
+            || "item-bank".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    })
+}
+
+/// Render `bank` in `format` and write the result to `output`.
 ///
 /// # Errors
 ///
 /// Returns an error if rendering fails or the output file cannot be written.
-fn write_export(
-    quiz: &mdquiz::model::Quiz,
-    format: export::Format,
-    output: &PathBuf,
-) -> anyhow::Result<()> {
+fn write_export(bank: &ItemBank, format: export::Format, output: &Path) -> anyhow::Result<()> {
     match format {
         export::Format::Markdown => {
-            let rendered = markdown::to_print_markdown(quiz);
+            let rendered = markdown::to_print_markdown(bank);
             fs::write(output, rendered)
                 .with_context(|| format!("writing Markdown to {}", output.display()))
         }
         export::Format::Canvas => {
-            let bytes = canvas::to_qti(quiz)?;
+            let bytes = canvas::to_qti(bank)?;
             fs::write(output, bytes)
                 .with_context(|| format!("writing Canvas package to {}", output.display()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    /// An explicit `--name` overrides the directory-derived default.
+    fn bank_name_prefers_explicit_override() {
+        let name = bank_name(
+            Path::new("/courses/module01"),
+            Some("Final Exam".to_owned()),
+        );
+        assert_eq!(name, "Final Exam");
+    }
+
+    #[test]
+    /// With no override the directory's own name becomes the bank name.
+    fn bank_name_defaults_to_dir_name() {
+        assert_eq!(
+            bank_name(Path::new("/courses/cs3500/module01"), None),
+            "module01"
+        );
+    }
+
+    #[test]
+    /// A path with no final component falls back to a fixed label.
+    fn bank_name_falls_back_when_no_dir_name() {
+        assert_eq!(bank_name(Path::new("/"), None), "item-bank");
+    }
+
+    #[test]
+    /// Only `*.md` files are read; other files and subdirectories are skipped.
+    fn read_question_sources_keeps_only_markdown_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::write(dir.path().join("q1.md"), "one").expect("write q1");
+        fs::write(dir.path().join("notes.txt"), "skip").expect("write notes");
+        fs::create_dir(dir.path().join("nested.md")).expect("create dir named like md");
+
+        let sources = read_question_sources(dir.path()).expect("read sources");
+        let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["q1.md"]);
+        assert_eq!(sources.first().map(|(_, c)| c.as_str()), Some("one"));
+    }
+
+    #[test]
+    /// Reading a directory that does not exist is an error, not a panic.
+    fn read_question_sources_errors_on_missing_dir() {
+        let err = read_question_sources(Path::new("/no/such/mdquiz/dir"))
+            .expect_err("missing directory must fail");
+        assert!(err.to_string().contains("reading question directory"));
     }
 }

@@ -5,3 +5,9 @@ too-many-lines-threshold = 30
 # Cognitive-complexity ceiling for a single function (clippy::cognitive_complexity,
 # part of the `nursery` group). Kept modest to reinforce the line limit above.
 cognitive-complexity-threshold = 15
+
+# The no-panic policy targets production code; a test reports failure *by*
+# panicking, so `unwrap`/`expect` are the idiomatic way to assert a `Result`.
+# These allowances are scoped to `#[cfg(test)]` and `tests/` only.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
