@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 
 use crate::Result;
-use crate::model::{Choice, Question, QuestionKind};
+use crate::model::{Blank, Choice, Question, QuestionKind};
 
 /// Render `bank` as a print-ready Markdown document with no solutions.
 ///
@@ -44,8 +44,20 @@ fn render_question(number: usize, question: &Question) -> Result<String> {
         QuestionKind::MultipleSelect(set) => {
             Ok(render_choices(number, &question.prompt, &set.choices, true))
         }
+        QuestionKind::FillInBlank(fitb) => {
+            Ok(render_fill_in_blank(number, &question.prompt, &fitb.blanks))
+        }
         other => Err(other.unsupported_by("markdown", &question.id)),
     }
+}
+
+/// Render a fill-in-the-blank item: each `{{name}}` marker becomes a blank line.
+fn render_fill_in_blank(number: usize, prompt: &str, blanks: &[Blank]) -> String {
+    let mut filled = prompt.to_owned();
+    for blank in blanks {
+        filled = filled.replace(&crate::model::blank_marker(&blank.id), "________");
+    }
+    format!("{number}. {filled}\n")
 }
 
 /// Render a true/false item: the prompt plus blank True/False checkboxes.
@@ -85,7 +97,10 @@ fn choice_label(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Choice, ChoiceSet, Feedback, ItemBank, Question, QuestionKind, TrueFalse};
+    use crate::model::{
+        Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, Question,
+        QuestionKind, TrueFalse,
+    };
 
     /// Build a one-question true/false bank for rendering tests.
     fn true_false_bank() -> ItemBank {
@@ -229,6 +244,34 @@ mod tests {
         assert!(out.contains("- [ ] A. Binary search"));
         assert!(out.contains("- [ ] B. Linear search"));
         assert!(!out.contains("[x]"));
+    }
+
+    #[test]
+    /// A fill-in-the-blank item renders each marker as a blank line, no answers.
+    fn renders_fill_in_blank_as_blank_lines() {
+        let make_blank = |id: &str, answer: &str| Blank {
+            id: id.to_owned(),
+            answers: vec![answer.to_owned()],
+            match_mode: MatchMode::CaseInsensitive,
+        };
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "fitb".to_owned(),
+                title: None,
+                prompt: "HTTP {{method}} returns {{code}}.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::FillInBlank(FillInBlank {
+                    blanks: vec![make_blank("method", "GET"), make_blank("code", "404")],
+                }),
+            }],
+        };
+        let out = to_print_markdown(&bank).expect("renders");
+        assert!(out.contains("1. HTTP ________ returns ________."));
+        assert!(!out.contains("{{"));
+        assert!(!out.contains("GET"));
     }
 
     #[test]

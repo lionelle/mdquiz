@@ -18,7 +18,10 @@ use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 use crate::Result;
-use crate::model::{Choice, ChoiceSet, Feedback, ItemBank, Question, QuestionKind, TrueFalse};
+use crate::model::{
+    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, Question, QuestionKind,
+    TrueFalse,
+};
 
 /// The `response_label` ident for the "True" choice; fills the item template.
 const TRUE_CHOICE_IDENT: &str = "true_choice";
@@ -206,6 +209,59 @@ const ITEM_FEEDBACK_TEMPLATE: &str = r#"      <itemfeedback ident="{{IDENT}}">
       </itemfeedback>
 "#;
 
+/// A fill-in-multiple-blanks QTI item; `{{RESPONSES}}` holds one `response_lid`
+/// per blank and `{{CONDITIONS}}` the per-blank partial-credit scoring.
+const FILL_IN_BLANK_ITEM_TEMPLATE: &str = r#"      <item ident="{{ITEM_IDENT}}" title="{{ITEM_TITLE}}">
+        <itemmetadata>
+          <qtimetadata>
+            <qtimetadatafield>
+              <fieldlabel>question_type</fieldlabel>
+              <fieldentry>fill_in_multiple_blanks_question</fieldentry>
+            </qtimetadatafield>
+            <qtimetadatafield>
+              <fieldlabel>points_possible</fieldlabel>
+              <fieldentry>{{POINTS}}</fieldentry>
+            </qtimetadatafield>
+          </qtimetadata>
+        </itemmetadata>
+        <presentation>
+          <material>
+            <mattext texttype="text/html">{{PROMPT}}</mattext>
+          </material>
+{{RESPONSES}}        </presentation>
+        <resprocessing>
+          <outcomes>
+            <decvar maxvalue="100" minvalue="0" varname="SCORE" vartype="Decimal"/>
+          </outcomes>
+{{CONDITIONS}}        </resprocessing>
+{{ITEMFEEDBACK}}      </item>
+"#;
+
+/// One blank's `<response_lid>`: its name plus its acceptable-answer labels.
+const BLANK_RESPONSE_TEMPLATE: &str = r#"          <response_lid ident="{{RESPONSE_IDENT}}">
+            <material>
+              <mattext>{{BLANK_NAME}}</mattext>
+            </material>
+            <render_choice>
+{{LABELS}}            </render_choice>
+          </response_lid>
+"#;
+
+/// One acceptable answer for a blank, as a `<response_label>`.
+const BLANK_ANSWER_LABEL_TEMPLATE: &str = r#"              <response_label ident="{{LABEL_IDENT}}">
+                <material><mattext texttype="text/plain">{{ANSWER}}</mattext></material>
+              </response_label>
+"#;
+
+/// One scoring condition: a matched blank answer adds its share of the score.
+const BLANK_CONDITION_TEMPLATE: &str = r#"          <respcondition continue="Yes">
+            <conditionvar>
+              <varequal respident="{{RESPONSE_IDENT}}">{{LABEL_IDENT}}</varequal>
+            </conditionvar>
+            <setvar action="Add" varname="SCORE">{{PER_BLANK}}</setvar>
+          </respcondition>
+"#;
+
 /// Render `bank` as the bytes of a Canvas New Quizzes QTI package.
 ///
 /// # Errors
@@ -221,6 +277,32 @@ pub fn to_qti(bank: &ItemBank) -> Result<Vec<u8>> {
         ("imsmanifest.xml", manifest.as_str()),
         (href.as_str(), assessment.as_str()),
     ])
+}
+
+/// Reminders about content that can't fully round-trip through the Canvas
+/// item-bank import and needs a manual fix afterward.
+///
+/// Currently this reports fill-in-the-blank blanks authored with `match: regex`:
+/// they export as literal-text blanks (Canvas can't set the regex mode on
+/// import), so the author must switch them to "Regular Expression Match" in the
+/// New Quizzes editor. Empty when nothing needs attention.
+#[must_use]
+pub fn import_reminders(bank: &ItemBank) -> Vec<String> {
+    let mut reminders = Vec::new();
+    for question in &bank.items {
+        let QuestionKind::FillInBlank(fitb) = &question.kind else {
+            continue;
+        };
+        for blank in &fitb.blanks {
+            if blank.match_mode == MatchMode::Regex {
+                reminders.push(format!(
+                    "question {:?}: set blank {:?} to \"Regular Expression Match\" in New Quizzes (it exported as literal text)",
+                    question.id, blank.id
+                ));
+            }
+        }
+    }
+    reminders
 }
 
 /// Fill the manifest template with the assessment resource ident and href.
@@ -257,6 +339,7 @@ fn item_xml(question: &Question) -> Result<String> {
         QuestionKind::TrueFalse(answer) => Ok(true_false_item_xml(question, answer)),
         QuestionKind::MultipleChoice(set) => Ok(multiple_choice_item_xml(question, set)),
         QuestionKind::MultipleSelect(set) => Ok(multiple_select_item_xml(question, set)),
+        QuestionKind::FillInBlank(fitb) => Ok(fill_in_blank_item_xml(question, fitb)),
         other => Err(other.unsupported_by("Canvas", &question.id)),
     }
 }
@@ -306,6 +389,110 @@ fn choice_presentation(question_type: &str, cardinality: &str, choices: &[Choice
         .replace("{{CHOICES}}", &choices_xml(choices))
 }
 
+/// Render a fill-in-multiple-blanks item, scored per blank.
+fn fill_in_blank_item_xml(question: &Question, fitb: &FillInBlank) -> String {
+    let ordered = fitb.ordered(&question.prompt);
+    fill_item_header(FILL_IN_BLANK_ITEM_TEMPLATE, question)
+        .replace("{{RESPONSES}}", &blank_responses_xml(&ordered))
+        .replace(
+            "{{CONDITIONS}}",
+            &blank_conditions_xml(&ordered, &question.feedback),
+        )
+        .replace(
+            "{{ITEMFEEDBACK}}",
+            &general_itemfeedback_xml(&question.feedback),
+        )
+        // `{{PROMPT}}` is filled last so authored text is never re-scanned.
+        .replace("{{PROMPT}}", &blank_prompt_html(&question.prompt, &ordered))
+}
+
+/// The QTI response identifier for a blank named `id`.
+fn response_ident(id: &str) -> String {
+    sanitize_ident(&format!("response_{id}"))
+}
+
+/// The QTI label identifier for the `index`th answer of blank `id`.
+fn answer_ident(id: &str, index: usize) -> String {
+    sanitize_ident(&format!("{id}_answer_{index}"))
+}
+
+/// Render the prompt HTML, rewriting each `{{name}}` marker to Canvas's
+/// `[name]` blank reference.
+fn blank_prompt_html(prompt: &str, blanks: &[&Blank]) -> String {
+    let mut html = escaped_html(prompt);
+    for blank in blanks {
+        let reference = ["[", &blank.id, "]"].concat();
+        html = html.replace(&crate::model::blank_marker(&blank.id), &reference);
+    }
+    html
+}
+
+/// Render one `<response_lid>` per blank, each listing its answer labels.
+fn blank_responses_xml(blanks: &[&Blank]) -> String {
+    let mut out = String::new();
+    for blank in blanks {
+        out.push_str(
+            &BLANK_RESPONSE_TEMPLATE
+                .replace("{{RESPONSE_IDENT}}", &response_ident(&blank.id))
+                .replace("{{BLANK_NAME}}", &escape_xml(&blank.id))
+                .replace("{{LABELS}}", &blank_labels_xml(blank)),
+        );
+    }
+    out
+}
+
+/// Render one `<response_label>` per acceptable answer of `blank`.
+fn blank_labels_xml(blank: &Blank) -> String {
+    let mut out = String::new();
+    for (index, answer) in blank.answers.iter().enumerate() {
+        out.push_str(
+            &BLANK_ANSWER_LABEL_TEMPLATE
+                .replace("{{LABEL_IDENT}}", &answer_ident(&blank.id, index))
+                .replace("{{ANSWER}}", &escape_xml(answer)),
+        );
+    }
+    out
+}
+
+/// Render the scoring conditions: general feedback plus per-blank partial credit.
+fn blank_conditions_xml(blanks: &[&Blank], feedback: &Feedback) -> String {
+    let mut out = general_condition_xml(feedback);
+    let per_blank = per_blank_score(blanks.len());
+    for blank in blanks {
+        for index in 0..blank.answers.len() {
+            out.push_str(
+                &BLANK_CONDITION_TEMPLATE
+                    .replace("{{RESPONSE_IDENT}}", &response_ident(&blank.id))
+                    .replace("{{LABEL_IDENT}}", &answer_ident(&blank.id, index))
+                    .replace("{{PER_BLANK}}", &per_blank),
+            );
+        }
+    }
+    out
+}
+
+/// The percentage each blank contributes, split evenly across the blanks.
+///
+/// Clamped to at least one blank so the divisor is never zero (an empty or
+/// absurdly large blank set falls back to full credit).
+fn per_blank_score(count: usize) -> String {
+    let count = u16::try_from(count).map_or(1.0, f64::from).max(1.0);
+    format!("{:.2}", 100.0 / count)
+}
+
+/// Render the general-feedback `<itemfeedback>` block, if any.
+///
+/// Fill-in-the-blank only wires general feedback: Canvas keeps answer-level
+/// (correct/incorrect) feedback for multiple choice only.
+fn general_itemfeedback_xml(feedback: &Feedback) -> String {
+    feedback
+        .general
+        .as_deref()
+        .map_or_else(String::new, |text| {
+            itemfeedback_block(GENERAL_FB_IDENT, text)
+        })
+}
+
 /// Fill the shared item shell (metadata, scoring, feedback, prompt) around a
 /// per-type presentation.
 ///
@@ -319,18 +506,24 @@ fn fill_item_shell(
     correct_cv: &str,
     incorrect_cv: &str,
 ) -> String {
-    let title = question.title.as_deref().unwrap_or(&question.id);
     let feedback = &question.feedback;
-    template
-        .replace("{{ITEM_IDENT}}", &sanitize_ident(&question.id))
-        .replace("{{ITEM_TITLE}}", &escape_xml(title))
-        .replace("{{POINTS}}", &question.points.to_string())
+    fill_item_header(template, question)
         .replace(
             "{{RESPROCESSING}}",
             &resprocessing_xml(correct_cv, incorrect_cv, feedback),
         )
         .replace("{{ITEMFEEDBACK}}", &itemfeedback_xml(feedback))
         .replace("{{PROMPT}}", &escaped_html(&question.prompt))
+}
+
+/// Substitute the item-header fields (ident, title, points) shared by every
+/// item template. Callers fill in the remaining per-type placeholders.
+fn fill_item_header(template: &str, question: &Question) -> String {
+    let title = question.title.as_deref().unwrap_or(&question.id);
+    template
+        .replace("{{ITEM_IDENT}}", &sanitize_ident(&question.id))
+        .replace("{{ITEM_TITLE}}", &escape_xml(title))
+        .replace("{{POINTS}}", &question.points.to_string())
 }
 
 /// The generated `response_label` ident for the choice at `index`.
@@ -407,12 +600,7 @@ fn correctness_terms(choices: &[Choice]) -> String {
 /// wrong answer; the incorrect arm is emitted only when incorrect feedback is
 /// present.
 fn resprocessing_xml(correct_cv: &str, incorrect_cv: &str, feedback: &Feedback) -> String {
-    let mut conditions = String::new();
-    if feedback.general.is_some() {
-        conditions.push_str(
-            &GENERAL_CONDITION.replace("{{FEEDBACK}}", &display_feedback(GENERAL_FB_IDENT)),
-        );
-    }
+    let mut conditions = general_condition_xml(feedback);
     let correct_feedback = if feedback.correct.is_some() {
         display_feedback(CORRECT_FB_IDENT)
     } else {
@@ -453,14 +641,28 @@ fn itemfeedback_xml(feedback: &Feedback) -> String {
     let mut out = String::new();
     for (ident, text) in entries {
         if let Some(text) = text {
-            out.push_str(
-                &ITEM_FEEDBACK_TEMPLATE
-                    .replace("{{IDENT}}", ident)
-                    .replace("{{HTML}}", &escaped_html(text)),
-            );
+            out.push_str(&itemfeedback_block(ident, text));
         }
     }
     out
+}
+
+/// One `<itemfeedback>` block holding `text` (rendered from Markdown) under
+/// `ident`.
+fn itemfeedback_block(ident: &str, text: &str) -> String {
+    ITEM_FEEDBACK_TEMPLATE
+        .replace("{{IDENT}}", ident)
+        .replace("{{HTML}}", &escaped_html(text))
+}
+
+/// The always-shown condition that displays general feedback, or empty when
+/// there is none.
+fn general_condition_xml(feedback: &Feedback) -> String {
+    if feedback.general.is_some() {
+        GENERAL_CONDITION.replace("{{FEEDBACK}}", &display_feedback(GENERAL_FB_IDENT))
+    } else {
+        String::new()
+    }
 }
 
 /// Render a Markdown prompt to HTML for embedding in a `text/html` mattext.
@@ -661,6 +863,165 @@ mod tests {
         assert!(xml.contains(r#"<varequal respident="response1">choice_0</varequal>"#));
         assert!(xml.contains(r#"<varequal respident="response1">choice_1</varequal>"#));
         assert!(!xml.contains("<not>"));
+    }
+
+    /// Build a two-blank fill-in-the-blank bank with the given feedback.
+    fn fill_in_blank_bank(feedback: Feedback) -> ItemBank {
+        let mk_blank = |id: &str, answers: &[&str]| Blank {
+            id: id.to_owned(),
+            answers: answers.iter().map(|answer| (*answer).to_owned()).collect(),
+            match_mode: MatchMode::CaseInsensitive,
+        };
+        ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "fitb".to_owned(),
+                title: None,
+                prompt: "HTTP {{method}} returns {{code}}.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback,
+                kind: QuestionKind::FillInBlank(FillInBlank {
+                    blanks: vec![
+                        mk_blank("method", &["GET"]),
+                        mk_blank("code", &["404", "Not Found"]),
+                    ],
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    /// Fill-in-the-blank renders one response per blank, inline `[name]`
+    /// markers, and per-blank partial-credit scoring.
+    fn fill_in_blank_renders_blanks_and_scoring() {
+        let xml = assessment_xml("a", &fill_in_blank_bank(Feedback::default())).expect("renders");
+        assert!(xml.contains("fill_in_multiple_blanks_question"));
+        // Markers rewritten from {{name}} to Canvas's [name].
+        assert!(xml.contains("[method]"));
+        assert!(xml.contains("[code]"));
+        assert!(!xml.contains("{{method}}"));
+        assert!(xml.contains(r#"<response_lid ident="response_method">"#));
+        assert!(xml.contains(r#"<response_lid ident="response_code">"#));
+        assert!(xml.contains("Not Found"));
+        // Two blanks -> 50.00 each, added on a matching answer.
+        assert!(xml.contains(r#"<setvar action="Add" varname="SCORE">50.00</setvar>"#));
+        assert!(xml.contains(r#"<varequal respident="response_code">code_answer_1</varequal>"#));
+    }
+
+    #[test]
+    /// Blanks are emitted in prompt order, not the model's storage order.
+    fn fill_in_blank_orders_responses_by_prompt() {
+        let mk_blank = |id: &str| Blank {
+            id: id.to_owned(),
+            answers: vec!["x".to_owned()],
+            match_mode: MatchMode::CaseInsensitive,
+        };
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "fitb".to_owned(),
+                title: None,
+                prompt: "First {{alpha}} then {{beta}}.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                // Stored in the reverse of prompt order.
+                kind: QuestionKind::FillInBlank(FillInBlank {
+                    blanks: vec![mk_blank("beta"), mk_blank("alpha")],
+                }),
+            }],
+        };
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.find("response_alpha") < xml.find("response_beta"));
+    }
+
+    #[test]
+    /// Per-blank credit splits 100% evenly across the blanks.
+    fn per_blank_score_splits_evenly() {
+        assert_eq!(per_blank_score(1), "100.00");
+        assert_eq!(per_blank_score(2), "50.00");
+        assert_eq!(per_blank_score(3), "33.33");
+    }
+
+    #[test]
+    /// XML-special characters in a blank answer are escaped, not emitted raw.
+    fn fill_in_blank_escapes_answer_text() {
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "fitb".to_owned(),
+                title: None,
+                prompt: "Value is {{v}}.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::FillInBlank(FillInBlank {
+                    blanks: vec![Blank {
+                        id: "v".to_owned(),
+                        answers: vec!["a < b & c".to_owned()],
+                        match_mode: MatchMode::CaseInsensitive,
+                    }],
+                }),
+            }],
+        };
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("&lt;"));
+        assert!(xml.contains("&amp;"));
+        assert!(!xml.contains("a < b"));
+    }
+
+    #[test]
+    /// A regex blank exports as literal text and yields a manual-fix reminder.
+    fn regex_blank_exports_literal_and_warns() {
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "fitb".to_owned(),
+                title: None,
+                prompt: "A 3-digit code: {{n}}.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::FillInBlank(FillInBlank {
+                    blanks: vec![Blank {
+                        id: "n".to_owned(),
+                        answers: vec![r"\d{3}".to_owned()],
+                        match_mode: MatchMode::Regex,
+                    }],
+                }),
+            }],
+        };
+        // Exports as a standard fill-in-blank carrying the pattern as literal text.
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("fill_in_multiple_blanks_question"));
+        assert!(xml.contains(r"\d{3}"));
+        // And it surfaces a manual-fix reminder naming the question and blank.
+        let reminders = import_reminders(&bank);
+        assert_eq!(reminders.len(), 1);
+        let note = reminders.first().expect("one reminder");
+        assert!(note.contains("fitb") && note.contains("\"n\""));
+        // A non-regex fill-in-blank bank produces no reminders.
+        assert!(import_reminders(&fill_in_blank_bank(Feedback::default())).is_empty());
+    }
+
+    #[test]
+    /// A bank with no fill-in-the-blank questions yields no import reminders.
+    fn non_fitb_bank_has_no_reminders() {
+        assert!(import_reminders(&true_false_bank(true, "Q?")).is_empty());
+    }
+
+    #[test]
+    /// Fill-in-the-blank carries general feedback (answer-level is MC-only).
+    fn fill_in_blank_general_feedback_is_emitted() {
+        let feedback = Feedback {
+            general: Some("Recall HTTP semantics.".to_owned()),
+            correct: None,
+            incorrect: None,
+        };
+        let xml = assessment_xml("a", &fill_in_blank_bank(feedback)).expect("renders");
+        assert!(xml.contains(r#"<itemfeedback ident="general_fb">"#));
+        assert!(xml.contains(r#"linkrefid="general_fb""#));
     }
 
     #[test]

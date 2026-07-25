@@ -79,8 +79,24 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let sources = read_question_sources(&dir)?;
             let bank = parse::item_bank_from_sources(bank_name(&dir, name), sources)?;
-            write_export(&bank, format.into(), &output)
+            let reminders = write_export(&bank, format.into(), &output)?;
+            print_import_reminders(&reminders);
+            Ok(())
         }
+    }
+}
+
+/// Print any post-import manual-fix reminders to stderr after a Canvas export.
+fn print_import_reminders(reminders: &[String]) {
+    if reminders.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\nAfter importing into Canvas, fix {} item(s) manually:",
+        reminders.len()
+    );
+    for reminder in reminders {
+        eprintln!("  - {reminder}");
     }
 }
 
@@ -122,20 +138,29 @@ fn bank_name(dir: &Path, name: Option<String>) -> String {
 
 /// Render `bank` in `format` and write the result to `output`.
 ///
+/// Returns any post-import manual-fix reminders for the chosen format (empty
+/// for the print sheet; the Canvas caveats for a QTI export).
+///
 /// # Errors
 ///
 /// Returns an error if rendering fails or the output file cannot be written.
-fn write_export(bank: &ItemBank, format: export::Format, output: &Path) -> anyhow::Result<()> {
+fn write_export(
+    bank: &ItemBank,
+    format: export::Format,
+    output: &Path,
+) -> anyhow::Result<Vec<String>> {
     match format {
         export::Format::Markdown => {
             let rendered = markdown::to_print_markdown(bank)?;
             fs::write(output, rendered)
-                .with_context(|| format!("writing Markdown to {}", output.display()))
+                .with_context(|| format!("writing Markdown to {}", output.display()))?;
+            Ok(Vec::new())
         }
         export::Format::Canvas => {
             let bytes = canvas::to_qti(bank)?;
             fs::write(output, bytes)
-                .with_context(|| format!("writing Canvas package to {}", output.display()))
+                .with_context(|| format!("writing Canvas package to {}", output.display()))?;
+            Ok(canvas::import_reminders(bank))
         }
     }
 }

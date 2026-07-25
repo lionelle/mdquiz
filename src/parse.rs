@@ -7,14 +7,17 @@
 //! shape), and the body becomes the prompt. A directory of such files is
 //! assembled into one [`ItemBank`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
 use crate::Result;
-use crate::model::{Choice, ChoiceSet, Feedback, ItemBank, Question, QuestionKind, TrueFalse};
+use crate::model::{
+    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, Question, QuestionKind,
+    TrueFalse, blank_markers,
+};
 
 /// The metadata every question shares, flattened into each [`QuestionSpec`].
 #[derive(Debug, Deserialize)]
@@ -60,6 +63,46 @@ struct ChoiceSpec {
     correct: bool,
 }
 
+/// The authored value for one fill-in-the-blank blank.
+///
+/// Accepts either a bare list of acceptable answers (case-insensitive), or a
+/// map with `answers` plus a `match` mode (`case_insensitive`/`exact`/`regex`).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BlankSpec {
+    /// Shorthand: a list of acceptable answers, matched case-insensitively.
+    Answers(Vec<String>),
+    /// Expanded form: acceptable answers plus a `match` mode.
+    Detailed {
+        /// Acceptable answers (or regex patterns when `match` is `regex`).
+        answers: Vec<String>,
+        /// How responses are matched; defaults to case-insensitive.
+        #[serde(rename = "match", default)]
+        match_mode: MatchMode,
+    },
+}
+
+impl BlankSpec {
+    /// Build the model [`Blank`] for marker `id` from this authored value.
+    fn into_blank(self, id: String) -> Blank {
+        match self {
+            Self::Answers(answers) => Blank {
+                id,
+                answers,
+                match_mode: MatchMode::CaseInsensitive,
+            },
+            Self::Detailed {
+                answers,
+                match_mode,
+            } => Blank {
+                id,
+                answers,
+                match_mode,
+            },
+        }
+    }
+}
+
 /// The authored YAML shape, tagged by `kind`, before the prompt is attached.
 ///
 /// This is deliberately separate from [`QuestionKind`]: the prompt lives in the
@@ -91,6 +134,14 @@ enum QuestionSpec {
         /// The options, in presentation order.
         choices: Vec<ChoiceSpec>,
     },
+    /// A fill-in-the-blank question with inline `{{name}}` blanks.
+    FillInBlank {
+        /// The shared question metadata.
+        #[serde(flatten)]
+        common: CommonSpec,
+        /// Acceptable answers keyed by blank name.
+        blanks: BTreeMap<String, BlankSpec>,
+    },
 }
 
 /// The default point value when a question omits `points`.
@@ -111,6 +162,9 @@ impl QuestionSpec {
             Self::MultipleSelect { common, choices } => {
                 common.into_question(prompt, QuestionKind::MultipleSelect(choice_set(choices)))
             }
+            Self::FillInBlank { common, blanks } => {
+                common.into_question(prompt, QuestionKind::FillInBlank(fill_in_blank(blanks)))
+            }
         }
     }
 }
@@ -125,6 +179,18 @@ fn choice_set(choices: Vec<ChoiceSpec>) -> ChoiceSet {
         })
         .collect();
     ChoiceSet { choices }
+}
+
+/// Convert the authored blank map into a [`FillInBlank`] payload.
+///
+/// Blanks are stored sorted by name (the [`BTreeMap`] order); presentation
+/// order is recovered from the prompt markers by the exporters.
+fn fill_in_blank(blanks: BTreeMap<String, BlankSpec>) -> FillInBlank {
+    let blanks = blanks
+        .into_iter()
+        .map(|(id, spec)| spec.into_blank(id))
+        .collect();
+    FillInBlank { blanks }
 }
 
 /// Parse the full text of one question source into a [`Question`].
@@ -166,8 +232,49 @@ fn validate_question(question: &Question) -> Result<()> {
     match &question.kind {
         QuestionKind::MultipleChoice(set) => validate_choices(&question.id, &set.choices, false),
         QuestionKind::MultipleSelect(set) => validate_choices(&question.id, &set.choices, true),
+        QuestionKind::FillInBlank(fitb) => {
+            validate_blanks(&question.id, &question.prompt, &fitb.blanks)
+        }
         _ => Ok(()),
     }
+}
+
+/// Validate a fill-in-the-blank question: markers and blank definitions must
+/// agree, there must be at least one blank, and each must have an answer.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming `id` when the rules fail.
+fn validate_blanks(id: &str, prompt: &str, blanks: &[Blank]) -> Result<()> {
+    if blanks.is_empty() {
+        return Err(crate::Error::InvalidQuestion(format!(
+            "question {id:?} has no blanks; mark one inline with {{{{name}}}}"
+        )));
+    }
+    let defined: HashSet<&str> = blanks.iter().map(|blank| blank.id.as_str()).collect();
+    let marked: HashSet<String> = blank_markers(prompt).into_iter().collect();
+    for blank in blanks {
+        if !marked.contains(&blank.id) {
+            return Err(crate::Error::InvalidQuestion(format!(
+                "question {id:?} defines blank {:?} that never appears in the prompt",
+                blank.id
+            )));
+        }
+        if blank.answers.is_empty() {
+            return Err(crate::Error::InvalidQuestion(format!(
+                "question {id:?} blank {:?} has no answers",
+                blank.id
+            )));
+        }
+    }
+    for name in &marked {
+        if !defined.contains(name.as_str()) {
+            return Err(crate::Error::InvalidQuestion(format!(
+                "question {id:?} uses blank {name:?} with no answers defined"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a choice list: at least two options and the right number correct.
@@ -439,6 +546,109 @@ mod tests {
         let source = "---\nid: q\nkind: multiple_select\nchoices:\n  - text: A\n  - text: B\n\
             ---\n\nSelect all.\n";
         let err = parse_question(source).expect_err("no correct choice");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    /// A fill-in-the-blank source: a shorthand list blank and a detailed blank.
+    const FILL_IN_BLANK_SOURCE: &str = "---\nid: fitb-http\nkind: fill_in_blank\nblanks:\n\
+        \x20 method: [GET, get]\n  code:\n    answers: [\"404\", \"Not Found\"]\n    match: exact\n\
+        ---\n\nAn HTTP {{method}} request that fails returns status {{code}}.\n";
+
+    #[test]
+    /// A fill-in-the-blank source captures each blank's answers and match mode.
+    fn parses_fill_in_blank() {
+        let question = parse_question(FILL_IN_BLANK_SOURCE).expect("valid source");
+        assert!(matches!(&question.kind, QuestionKind::FillInBlank(_)));
+        if let QuestionKind::FillInBlank(fitb) = &question.kind {
+            assert_eq!(fitb.blanks.len(), 2);
+            let code = fitb
+                .blanks
+                .iter()
+                .find(|b| b.id == "code")
+                .expect("code blank");
+            assert_eq!(code.answers, ["404", "Not Found"]);
+            assert_eq!(code.match_mode, MatchMode::Exact);
+            let method = fitb
+                .blanks
+                .iter()
+                .find(|b| b.id == "method")
+                .expect("method blank");
+            assert_eq!(method.answers, ["GET", "get"]);
+            assert_eq!(method.match_mode, MatchMode::CaseInsensitive);
+        }
+    }
+
+    #[test]
+    /// A detailed blank with no `match:` key defaults to case-insensitive.
+    fn detailed_blank_defaults_to_case_insensitive() {
+        let source = "---\nid: q\nkind: fill_in_blank\nblanks:\n  a:\n    answers: [x]\n\
+            ---\n\nHas {{a}}.\n";
+        let question = parse_question(source).expect("valid source");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::FillInBlank(fitb)
+                if fitb.blanks.first().is_some_and(|b| b.match_mode == MatchMode::CaseInsensitive)
+        ));
+    }
+
+    #[test]
+    /// A `match: regex` blank parses to the regex match mode.
+    fn parses_regex_blank() {
+        let source = "---\nid: q\nkind: fill_in_blank\nblanks:\n  n:\n    answers: ['\\\\d{3}']\n\
+            \x20   match: regex\n---\n\nEnter a 3-digit number: {{n}}.\n";
+        let question = parse_question(source).expect("valid source");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::FillInBlank(fitb)
+                if fitb.blanks.first().is_some_and(|b| b.match_mode == MatchMode::Regex)
+        ));
+    }
+
+    #[test]
+    /// `blank_markers` returns marker names in order, de-duplicated.
+    fn blank_markers_are_ordered_and_deduped() {
+        assert_eq!(
+            blank_markers("a {{one}} b {{two}} c {{one}}"),
+            ["one", "two"]
+        );
+        assert!(blank_markers("no markers here").is_empty());
+        // Unclosed marker and empty/whitespace markers yield nothing.
+        assert!(blank_markers("a {{open").is_empty());
+        assert!(blank_markers("x {{}} y").is_empty());
+        assert!(blank_markers("x {{   }} y").is_empty());
+    }
+
+    #[test]
+    /// A fill-in-the-blank question with no blanks at all is rejected.
+    fn fill_in_blank_with_no_blanks_is_rejected() {
+        let source = "---\nid: q\nkind: fill_in_blank\nblanks: {}\n---\n\nNothing to fill.\n";
+        let err = parse_question(source).expect_err("no blanks");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// A prompt marker with no defined answers is rejected.
+    fn fill_in_blank_marker_without_answers_is_rejected() {
+        let source =
+            "---\nid: q\nkind: fill_in_blank\nblanks:\n  a: [x]\n---\n\n{{a}} and {{b}}.\n";
+        let err = parse_question(source).expect_err("marker b undefined");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// A defined blank that never appears in the prompt is rejected.
+    fn fill_in_blank_orphan_blank_is_rejected() {
+        let source =
+            "---\nid: q\nkind: fill_in_blank\nblanks:\n  a: [x]\n  b: [y]\n---\n\n{{a}} only.\n";
+        let err = parse_question(source).expect_err("blank b never used");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// A blank with an empty answer list is rejected.
+    fn fill_in_blank_empty_answers_is_rejected() {
+        let source = "---\nid: q\nkind: fill_in_blank\nblanks:\n  a: []\n---\n\nHas {{a}}.\n";
+        let err = parse_question(source).expect_err("empty answers");
         assert!(matches!(err, crate::Error::InvalidQuestion(_)));
     }
 

@@ -140,8 +140,57 @@ Select all algorithms that require sorted input.
 
 Rules: at least two choices, and **at least one** marked `correct`.
 
-Remaining types (fill in the blank, matching, ordering) are rolled out one at a
-time; each will get its own samples folder here as it lands.
+### Fill in the blank (`kind: fill_in_blank`)
+
+One or more **inline** blanks, marked `{{name}}` in the prompt. Each name has an
+entry under `blanks` listing its acceptable answers. Shorthand is a bare list;
+the expanded form adds `exact: true` for case-sensitive matching:
+
+```markdown
+---
+id: fitb-http-status
+kind: fill_in_blank
+blanks:
+  method: [GET, get]
+  code:
+    answers: ["404", "Not Found"]
+    exact: true
+---
+
+An HTTP {{method}} request for a missing resource returns status {{code}}.
+```
+
+Rules: every `{{name}}` must have a `blanks` entry and vice versa, and each
+blank needs at least one answer. Scored as partial credit per blank. On the
+print sheet each blank becomes a fill-in line.
+
+The expanded form takes a `match` mode:
+
+| `match`            | Meaning                                                        |
+|--------------------|----------------------------------------------------------------|
+| `case_insensitive` | Default. `get` matches `GET`.                                  |
+| `exact`            | Case-sensitive exact match.                                    |
+| `regex`            | Answers are regex patterns (see caveats).                      |
+
+```yaml
+blanks:
+  hex:
+    match: regex
+    answers: ['#[0-9A-Fa-f]{6}']
+```
+
+**Canvas caveats:** exports as `fill_in_multiple_blanks_question` (Open Entry
+text blanks). New Quizzes' **dropdown** and **word bank** answer types, and the
+**contains / close-enough** match modes, have no classic-QTI representation and
+are not exported. Canvas fill-in-the-blank matches **case-insensitively**, so
+the `exact` mode is recorded but may not be enforced on import. A **`regex`**
+blank exports as a *literal-text* blank (Canvas can't set the regex mode via
+import) — after importing, `mdquiz` reminds you which blanks to switch to
+"Regular Expression Match" in the New Quizzes editor. Only `general` feedback is
+wired (answer-level feedback is multiple-choice only).
+
+Remaining types (matching, ordering) are rolled out one at a time; each will get
+its own samples folder here as it lands.
 
 ## Canvas caveats
 
