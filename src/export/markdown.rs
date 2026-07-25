@@ -6,7 +6,7 @@
 use std::fmt::Write as _;
 
 use crate::Result;
-use crate::model::{Blank, Choice, Question, QuestionKind};
+use crate::model::{Blank, Choice, Matching, Question, QuestionKind};
 
 /// Render `bank` as a print-ready Markdown document with no solutions.
 ///
@@ -47,8 +47,27 @@ fn render_question(number: usize, question: &Question) -> Result<String> {
         QuestionKind::FillInBlank(fitb) => {
             Ok(render_fill_in_blank(number, &question.prompt, &fitb.blanks))
         }
+        QuestionKind::Matching(matching) => Ok(render_matching(number, &question.prompt, matching)),
         other => Err(other.unsupported_by("markdown", &question.id)),
     }
+}
+
+/// Render a matching item: numbered left prompts, then lettered right options
+/// (all options, sorted so they do not line up with the prompts), no key.
+fn render_matching(number: usize, prompt: &str, matching: &Matching) -> String {
+    let mut out = format!("{number}. {prompt}\n");
+    for (index, pair) in matching.pairs.iter().enumerate() {
+        // Writing to a `String` is infallible, so the result is discarded.
+        let _ = write!(out, "\n   {}. {}", index + 1, pair.left);
+    }
+    out.push('\n');
+    let mut options = matching.options();
+    options.sort_unstable();
+    for (index, right) in options.iter().enumerate() {
+        let _ = write!(out, "\n   {}. {right}", choice_label(index));
+    }
+    out.push('\n');
+    out
 }
 
 /// Render a fill-in-the-blank item: each `{{name}}` marker becomes a blank line.
@@ -98,8 +117,8 @@ fn choice_label(index: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::{
-        Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MultipleSelect,
-        Question, QuestionKind, ScoringMode, TrueFalse,
+        Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
+        MultipleSelect, Question, QuestionKind, ScoringMode, TrueFalse,
     };
 
     /// Build a one-question true/false bank for rendering tests.
@@ -276,6 +295,39 @@ mod tests {
     }
 
     #[test]
+    /// A matching item renders numbered prompts and lettered options, no key.
+    fn renders_matching_without_answer_key() {
+        let pair = |left: &str, right: &str| MatchPair {
+            left: left.to_owned(),
+            right: right.to_owned(),
+        };
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "mt".to_owned(),
+                title: None,
+                prompt: "Match each type to its size.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::Matching(Matching {
+                    pairs: vec![pair("char", "1 byte"), pair("int", "4 bytes")],
+                    distractors: vec!["8 bytes".to_owned()],
+                }),
+            }],
+        };
+        let out = to_print_markdown(&bank).expect("renders");
+        assert!(out.contains("1. Match each type to its size."));
+        assert!(out.contains("   1. char"));
+        assert!(out.contains("   2. int"));
+        // Right options are lettered, sorted, and include the distractor.
+        assert!(out.contains("A. 1 byte"));
+        assert!(out.contains("C. 8 bytes"));
+        // No answer key: no pairing (e.g. "left = right") is written out.
+        assert!(!out.contains('='));
+    }
+
+    #[test]
     /// Choice labels are letters up to Z, then fall back to 1-based numbers.
     fn choice_labels_letter_then_number() {
         assert_eq!(choice_label(0), "A");
@@ -295,10 +347,10 @@ mod tests {
                 points: 1.0,
                 tags: Vec::new(),
                 feedback: Feedback::default(),
-                kind: QuestionKind::Matching,
+                kind: QuestionKind::Ordering,
             }],
         };
-        let err = to_print_markdown(&bank).expect_err("matching is unsupported");
+        let err = to_print_markdown(&bank).expect_err("ordering is unsupported");
         assert!(matches!(err, crate::Error::Export(_)));
     }
 }

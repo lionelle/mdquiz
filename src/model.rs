@@ -88,7 +88,7 @@ pub enum QuestionKind {
     /// mode, regex patterns).
     FillInBlank(FillInBlank),
     /// Match items in one column to items in another.
-    Matching,
+    Matching(Matching),
     /// Put items into the correct order.
     Ordering,
 }
@@ -102,7 +102,7 @@ impl QuestionKind {
             Self::MultipleChoice(_) => "multiple choice",
             Self::MultipleSelect(_) => "multiple select",
             Self::FillInBlank(_) => "fill in the blank",
-            Self::Matching => "matching",
+            Self::Matching(_) => "matching",
             Self::Ordering => "ordering",
         }
     }
@@ -252,6 +252,46 @@ pub(crate) fn blank_markers(text: &str) -> Vec<String> {
     names
 }
 
+/// The payload for a [`QuestionKind::Matching`] question.
+///
+/// Each [`MatchPair`] links a left prompt to its correct right answer;
+/// `distractors` are extra right-hand options that match no left.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Matching {
+    /// The left-to-right pairs, in presentation order.
+    pub pairs: Vec<MatchPair>,
+    /// Extra right-hand options that are not the answer to any pair.
+    pub distractors: Vec<String>,
+}
+
+/// One left prompt and its correct right-hand answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchPair {
+    /// The left-hand prompt.
+    pub left: String,
+    /// The correct right-hand answer for [`MatchPair::left`].
+    pub right: String,
+}
+
+impl Matching {
+    /// The distinct right-hand options (pair answers then distractors), in
+    /// order. These become the shared choice list every left selects from.
+    pub(crate) fn options(&self) -> Vec<&str> {
+        let mut options: Vec<&str> = Vec::new();
+        let rights = self
+            .pairs
+            .iter()
+            .map(|pair| pair.right.as_str())
+            .chain(self.distractors.iter().map(String::as_str));
+        for right in rights {
+            if !options.contains(&right) {
+                options.push(right);
+            }
+        }
+        options
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,40 +299,55 @@ mod tests {
     #[test]
     /// Every kind reports its documented human-readable label.
     fn label_names_each_kind() {
-        assert_eq!(
-            QuestionKind::TrueFalse(TrueFalse { answer: true }).label(),
-            "true/false"
-        );
-        assert_eq!(
-            QuestionKind::MultipleChoice(ChoiceSet {
-                choices: Vec::new()
-            })
-            .label(),
-            "multiple choice"
-        );
-        assert_eq!(
-            QuestionKind::MultipleSelect(MultipleSelect {
-                choices: Vec::new(),
-                scoring: ScoringMode::AllOrNothing,
-            })
-            .label(),
-            "multiple select"
-        );
-        assert_eq!(
-            QuestionKind::FillInBlank(FillInBlank { blanks: Vec::new() }).label(),
-            "fill in the blank"
-        );
-        assert_eq!(QuestionKind::Matching.label(), "matching");
-        assert_eq!(QuestionKind::Ordering.label(), "ordering");
+        let tf = QuestionKind::TrueFalse(TrueFalse { answer: true });
+        let mc = QuestionKind::MultipleChoice(ChoiceSet {
+            choices: Vec::new(),
+        });
+        let ms = QuestionKind::MultipleSelect(MultipleSelect {
+            choices: Vec::new(),
+            scoring: ScoringMode::AllOrNothing,
+        });
+        let fitb = QuestionKind::FillInBlank(FillInBlank { blanks: Vec::new() });
+        let matching = QuestionKind::Matching(Matching {
+            pairs: Vec::new(),
+            distractors: Vec::new(),
+        });
+        let cases = [
+            (tf, "true/false"),
+            (mc, "multiple choice"),
+            (ms, "multiple select"),
+            (fitb, "fill in the blank"),
+            (matching, "matching"),
+            (QuestionKind::Ordering, "ordering"),
+        ];
+        for (kind, label) in cases {
+            assert_eq!(kind.label(), label);
+        }
+    }
+
+    #[test]
+    /// `options` lists pair answers first then distractors, deduplicated by
+    /// value while preserving that order.
+    fn matching_options_orders_and_dedups() {
+        let pair = |right: &str| MatchPair {
+            left: "l".to_owned(),
+            right: right.to_owned(),
+        };
+        let matching = Matching {
+            // "X" repeats across pairs; the "Y" distractor duplicates a pair.
+            pairs: vec![pair("X"), pair("Y"), pair("X")],
+            distractors: vec!["Y".to_owned(), "Z".to_owned()],
+        };
+        assert_eq!(matching.options(), ["X", "Y", "Z"]);
     }
 
     #[test]
     /// The unsupported-kind error names the target format, kind, and question.
     fn unsupported_by_message_names_target_kind_and_id() {
-        let err = QuestionKind::Matching.unsupported_by("Canvas", "q7");
+        let err = QuestionKind::Ordering.unsupported_by("Canvas", "q7");
         let message = err.to_string();
         assert!(message.contains("Canvas"));
-        assert!(message.contains("matching"));
+        assert!(message.contains("ordering"));
         assert!(message.contains("q7"));
     }
 }

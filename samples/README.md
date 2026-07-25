@@ -203,8 +203,33 @@ import) — after importing, `mdquiz` reminds you which blanks to switch to
 "Regular Expression Match" in the New Quizzes editor. Only `general` feedback is
 wired (answer-level feedback is multiple-choice only).
 
-Remaining types (matching, ordering) are rolled out one at a time; each will get
-its own samples folder here as it lands.
+### Matching (`kind: matching`)
+
+Pair each left-hand prompt with its correct right-hand answer. Optional
+`distractors` add extra right-hand options that match no prompt:
+
+```markdown
+---
+id: mt-c-types
+kind: matching
+pairs:
+  - left: char
+    right: 1 byte
+  - left: int
+    right: 4 bytes
+distractors: [8 bytes]
+---
+
+Match each C type to its size.
+```
+
+Rules: at least two pairs, each side non-empty. Scored partial credit per pair.
+The print sheet lists the prompts numbered and all options lettered (sorted, so
+they don't line up with the prompts). Exports as Canvas `matching_question`
+(verified against Canvas's own export structure). Left/right cells are plain
+text.
+
+The last type (ordering) is rolled out next.
 
 ## Images
 

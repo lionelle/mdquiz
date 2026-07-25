@@ -15,8 +15,8 @@ use serde::Deserialize;
 
 use crate::Result;
 use crate::model::{
-    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MultipleSelect, Question,
-    QuestionKind, ScoringMode, TrueFalse, blank_markers,
+    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
+    MultipleSelect, Question, QuestionKind, ScoringMode, TrueFalse, blank_markers,
 };
 
 /// The metadata every question shares, flattened into each [`QuestionSpec`].
@@ -145,6 +145,17 @@ enum QuestionSpec {
         /// Acceptable answers keyed by blank name.
         blanks: BTreeMap<String, BlankSpec>,
     },
+    /// A matching question: left prompts paired with right answers.
+    Matching {
+        /// The shared question metadata.
+        #[serde(flatten)]
+        common: CommonSpec,
+        /// The left-to-right pairs, in presentation order.
+        pairs: Vec<MatchPair>,
+        /// Extra right-hand options that match no left.
+        #[serde(default)]
+        distractors: Vec<String>,
+    },
 }
 
 /// The default point value when a question omits `points`.
@@ -176,6 +187,14 @@ impl QuestionSpec {
             Self::FillInBlank { common, blanks } => {
                 common.into_question(prompt, QuestionKind::FillInBlank(fill_in_blank(blanks)))
             }
+            Self::Matching {
+                common,
+                pairs,
+                distractors,
+            } => common.into_question(
+                prompt,
+                QuestionKind::Matching(Matching { pairs, distractors }),
+            ),
         }
     }
 }
@@ -252,8 +271,30 @@ fn validate_question(question: &Question) -> Result<()> {
         QuestionKind::FillInBlank(fitb) => {
             validate_blanks(&question.id, &question.prompt, &fitb.blanks)
         }
+        QuestionKind::Matching(matching) => validate_matching(&question.id, matching),
         _ => Ok(()),
     }
+}
+
+/// Validate a matching question: at least two pairs, each with non-empty text.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming `id` when the rules fail.
+fn validate_matching(id: &str, matching: &Matching) -> Result<()> {
+    if matching.pairs.len() < 2 {
+        return Err(crate::Error::InvalidQuestion(format!(
+            "question {id:?} needs at least two matching pairs"
+        )));
+    }
+    for pair in &matching.pairs {
+        if pair.left.trim().is_empty() || pair.right.trim().is_empty() {
+            return Err(crate::Error::InvalidQuestion(format!(
+                "question {id:?} has a matching pair with an empty side"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a fill-in-the-blank question: markers and blank definitions must
@@ -568,6 +609,42 @@ mod tests {
             &question.kind,
             QuestionKind::MultipleSelect(select) if select.scoring == ScoringMode::Partial
         ));
+    }
+
+    /// A matching source with two pairs and one distractor.
+    const MATCHING_SOURCE: &str = "---\nid: mt\nkind: matching\npairs:\n\
+        \x20 - left: char\n    right: 1 byte\n  - left: int\n    right: 4 bytes\n\
+        distractors: [8 bytes]\n---\n\nMatch each type to its size.\n";
+
+    #[test]
+    /// A matching source captures ordered pairs and distractors.
+    fn parses_matching() {
+        let question = parse_question(MATCHING_SOURCE).expect("valid source");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::Matching(matching)
+                if matching.pairs.len() == 2
+                    && matching.distractors == ["8 bytes"]
+                    && matching.pairs.first().is_some_and(|p| p.left == "char" && p.right == "1 byte")
+        ));
+    }
+
+    #[test]
+    /// A matching question with fewer than two pairs is rejected.
+    fn matching_needs_two_pairs() {
+        let source = "---\nid: q\nkind: matching\npairs:\n  - left: a\n    right: b\n\
+            ---\n\nMatch.\n";
+        let err = parse_question(source).expect_err("one pair");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// A matching pair with an empty side is rejected.
+    fn matching_rejects_empty_side() {
+        let source = "---\nid: q\nkind: matching\npairs:\n  - left: a\n    right: b\n\
+            \x20 - left: c\n    right: \"\"\n---\n\nMatch.\n";
+        let err = parse_question(source).expect_err("empty right");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
     }
 
     #[test]

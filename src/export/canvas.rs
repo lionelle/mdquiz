@@ -19,8 +19,8 @@ use zip::write::SimpleFileOptions;
 
 use crate::Result;
 use crate::model::{
-    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MultipleSelect, Question,
-    QuestionKind, ScoringMode, TrueFalse,
+    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
+    MultipleSelect, Question, QuestionKind, ScoringMode, TrueFalse,
 };
 
 /// The `response_label` ident for the "True" choice; fills the item template.
@@ -176,6 +176,10 @@ const PARTIAL_CONDITION: &str = r#"          <respcondition continue="Yes">
 const MC_QUESTION_TYPE: &str = "multiple_choice_question";
 /// The Canvas question type for a multiple-answer item.
 const MS_QUESTION_TYPE: &str = "multiple_answers_question";
+/// The Canvas question type for a fill-in-multiple-blanks item.
+const FITB_QUESTION_TYPE: &str = "fill_in_multiple_blanks_question";
+/// The Canvas question type for a matching item.
+const MATCHING_QUESTION_TYPE: &str = "matching_question";
 /// The `rcardinality` for a single-answer response.
 const CARDINALITY_SINGLE: &str = "Single";
 /// The `rcardinality` for a multiple-answer response.
@@ -233,14 +237,15 @@ const ITEM_FEEDBACK_TEMPLATE: &str = r#"      <itemfeedback ident="{{IDENT}}">
       </itemfeedback>
 "#;
 
-/// A fill-in-multiple-blanks QTI item; `{{RESPONSES}}` holds one `response_lid`
-/// per blank and `{{CONDITIONS}}` the per-blank partial-credit scoring.
-const FILL_IN_BLANK_ITEM_TEMPLATE: &str = r#"      <item ident="{{ITEM_IDENT}}" title="{{ITEM_TITLE}}">
+/// A `response_lid`-based QTI item (fill-in-the-blank or matching);
+/// `{{QUESTION_TYPE}}` selects the kind, `{{RESPONSES}}` holds one `response_lid`
+/// per blank or left prompt, and `{{CONDITIONS}}` the per-item partial scoring.
+const RESPONSE_ITEM_TEMPLATE: &str = r#"      <item ident="{{ITEM_IDENT}}" title="{{ITEM_TITLE}}">
         <itemmetadata>
           <qtimetadata>
             <qtimetadatafield>
               <fieldlabel>question_type</fieldlabel>
-              <fieldentry>fill_in_multiple_blanks_question</fieldentry>
+              <fieldentry>{{QUESTION_TYPE}}</fieldentry>
             </qtimetadatafield>
             <qtimetadatafield>
               <fieldlabel>points_possible</fieldlabel>
@@ -277,13 +282,30 @@ const BLANK_ANSWER_LABEL_TEMPLATE: &str = r#"              <response_label ident
               </response_label>
 "#;
 
-/// One scoring condition: a matched blank answer adds its share of the score.
-const BLANK_CONDITION_TEMPLATE: &str = r#"          <respcondition continue="Yes">
+/// One scoring condition: selecting `{{IDENT}}` for `{{RESPIDENT}}` adds its
+/// `{{VALUE}}` share of the score. Shared by fill-in-the-blank and matching.
+const ADD_CONDITION_TEMPLATE: &str = r#"          <respcondition continue="Yes">
             <conditionvar>
-              <varequal respident="{{RESPONSE_IDENT}}">{{LABEL_IDENT}}</varequal>
+              <varequal respident="{{RESPIDENT}}">{{IDENT}}</varequal>
             </conditionvar>
-            <setvar action="Add" varname="SCORE">{{PER_BLANK}}</setvar>
+            <setvar action="Add" varname="SCORE">{{VALUE}}</setvar>
           </respcondition>
+"#;
+
+/// One left prompt's `<response_lid>`: its text plus the shared right options.
+const MATCH_RESPONSE_TEMPLATE: &str = r#"          <response_lid ident="{{RESPONSE_IDENT}}">
+            <material>
+              <mattext texttype="text/plain">{{LEFT}}</mattext>
+            </material>
+            <render_choice>
+{{OPTIONS}}            </render_choice>
+          </response_lid>
+"#;
+
+/// One right-hand option, shared across every left prompt's `render_choice`.
+const MATCH_OPTION_TEMPLATE: &str = r#"              <response_label ident="{{OPTION_IDENT}}">
+                <material><mattext>{{RIGHT}}</mattext></material>
+              </response_label>
 "#;
 
 /// Render `bank` as the bytes of a Canvas New Quizzes QTI package.
@@ -387,6 +409,7 @@ fn item_xml(question: &Question) -> Result<String> {
         QuestionKind::MultipleChoice(set) => Ok(multiple_choice_item_xml(question, set)),
         QuestionKind::MultipleSelect(set) => Ok(multiple_select_item_xml(question, set)),
         QuestionKind::FillInBlank(fitb) => Ok(fill_in_blank_item_xml(question, fitb)),
+        QuestionKind::Matching(matching) => Ok(matching_item_xml(question, matching)),
         other => Err(other.unsupported_by("Canvas", &question.id)),
     }
 }
@@ -469,21 +492,39 @@ fn choice_presentation(question_type: &str, cardinality: &str, choices: &[Choice
         .replace("{{CHOICES}}", &choices_xml(choices))
 }
 
-/// Render a fill-in-multiple-blanks item, scored per blank.
-fn fill_in_blank_item_xml(question: &Question, fitb: &FillInBlank) -> String {
-    let ordered = fitb.ordered(&question.prompt);
-    fill_item_header(FILL_IN_BLANK_ITEM_TEMPLATE, question)
-        .replace("{{RESPONSES}}", &blank_responses_xml(&ordered))
-        .replace(
-            "{{CONDITIONS}}",
-            &blank_conditions_xml(&ordered, &question.feedback),
-        )
+/// Fill the shared `response_lid` item body (metadata, scoring, feedback, and
+/// prompt) around a per-type set of responses and scoring conditions.
+///
+/// `prompt_html` is passed pre-rendered and substituted last so authored text
+/// is never re-scanned for placeholders.
+fn fill_response_item(
+    question_type: &str,
+    question: &Question,
+    responses: &str,
+    conditions: &str,
+    prompt_html: &str,
+) -> String {
+    fill_item_header(RESPONSE_ITEM_TEMPLATE, question)
+        .replace("{{QUESTION_TYPE}}", question_type)
+        .replace("{{RESPONSES}}", responses)
+        .replace("{{CONDITIONS}}", conditions)
         .replace(
             "{{ITEMFEEDBACK}}",
             &general_itemfeedback_xml(&question.feedback),
         )
-        // `{{PROMPT}}` is filled last so authored text is never re-scanned.
-        .replace("{{PROMPT}}", &blank_prompt_html(&question.prompt, &ordered))
+        .replace("{{PROMPT}}", prompt_html)
+}
+
+/// Render a fill-in-multiple-blanks item, scored per blank.
+fn fill_in_blank_item_xml(question: &Question, fitb: &FillInBlank) -> String {
+    let ordered = fitb.ordered(&question.prompt);
+    fill_response_item(
+        FITB_QUESTION_TYPE,
+        question,
+        &blank_responses_xml(&ordered),
+        &blank_conditions_xml(&ordered, &question.feedback),
+        &blank_prompt_html(&question.prompt, &ordered),
+    )
 }
 
 /// The QTI response identifier for a blank named `id`.
@@ -541,10 +582,10 @@ fn blank_conditions_xml(blanks: &[&Blank], feedback: &Feedback) -> String {
     for blank in blanks {
         for index in 0..blank.answers.len() {
             out.push_str(
-                &BLANK_CONDITION_TEMPLATE
-                    .replace("{{RESPONSE_IDENT}}", &response_ident(&blank.id))
-                    .replace("{{LABEL_IDENT}}", &answer_ident(&blank.id, index))
-                    .replace("{{PER_BLANK}}", &per_blank),
+                &ADD_CONDITION_TEMPLATE
+                    .replace("{{RESPIDENT}}", &response_ident(&blank.id))
+                    .replace("{{IDENT}}", &answer_ident(&blank.id, index))
+                    .replace("{{VALUE}}", &per_blank),
             );
         }
     }
@@ -572,6 +613,75 @@ fn general_itemfeedback_xml(feedback: &Feedback) -> String {
         .map_or_else(String::new, |text| {
             itemfeedback_block(GENERAL_FB_IDENT, text)
         })
+}
+
+/// Render a matching item: one response per left prompt, scored per pair.
+fn matching_item_xml(question: &Question, matching: &Matching) -> String {
+    let options = matching.options();
+    let options_xml = match_options_xml(&options);
+    fill_response_item(
+        MATCHING_QUESTION_TYPE,
+        question,
+        &match_responses_xml(&matching.pairs, &options_xml),
+        &match_conditions_xml(matching, &options, &question.feedback),
+        &escaped_html(&question.prompt),
+    )
+}
+
+/// The response identifier for the left prompt at `index`.
+fn match_response_ident(index: usize) -> String {
+    format!("response_{index}")
+}
+
+/// The option identifier for the right-hand option at `index`.
+fn match_option_ident(index: usize) -> String {
+    format!("answer_{index}")
+}
+
+/// Render the shared right-hand options (used in every left's `render_choice`).
+fn match_options_xml(options: &[&str]) -> String {
+    let mut out = String::new();
+    for (index, right) in options.iter().enumerate() {
+        out.push_str(
+            &MATCH_OPTION_TEMPLATE
+                .replace("{{OPTION_IDENT}}", &match_option_ident(index))
+                .replace("{{RIGHT}}", &escape_xml(right)),
+        );
+    }
+    out
+}
+
+/// Render one `<response_lid>` per left prompt, each offering all options.
+fn match_responses_xml(pairs: &[MatchPair], options_xml: &str) -> String {
+    let mut out = String::new();
+    for (index, pair) in pairs.iter().enumerate() {
+        out.push_str(
+            &MATCH_RESPONSE_TEMPLATE
+                .replace("{{RESPONSE_IDENT}}", &match_response_ident(index))
+                .replace("{{LEFT}}", &escape_xml(&pair.left))
+                .replace("{{OPTIONS}}", options_xml),
+        );
+    }
+    out
+}
+
+/// Render the scoring conditions: general feedback plus per-pair partial credit.
+fn match_conditions_xml(matching: &Matching, options: &[&str], feedback: &Feedback) -> String {
+    let mut out = general_condition_xml(feedback);
+    let value = even_share_score(matching.pairs.len());
+    for (index, pair) in matching.pairs.iter().enumerate() {
+        let correct = options
+            .iter()
+            .position(|right| *right == pair.right)
+            .unwrap_or(0);
+        out.push_str(
+            &ADD_CONDITION_TEMPLATE
+                .replace("{{RESPIDENT}}", &match_response_ident(index))
+                .replace("{{IDENT}}", &match_option_ident(correct))
+                .replace("{{VALUE}}", &value),
+        );
+    }
+    out
 }
 
 /// Fill the shared item shell (metadata, scoring, feedback, prompt) around a
@@ -1264,6 +1374,103 @@ mod tests {
         let xml = assessment_xml("a", &fill_in_blank_bank(feedback)).expect("renders");
         assert!(xml.contains(r#"<itemfeedback ident="general_fb">"#));
         assert!(xml.contains(r#"linkrefid="general_fb""#));
+    }
+
+    #[test]
+    /// Matching renders one response per left, shared options, and per-pair
+    /// partial-credit scoring pairing each left with its correct option.
+    fn matching_renders_responses_and_scoring() {
+        let pair = |left: &str, right: &str| MatchPair {
+            left: left.to_owned(),
+            right: right.to_owned(),
+        };
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "mt".to_owned(),
+                title: None,
+                prompt: "Match.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::Matching(Matching {
+                    pairs: vec![pair("char", "1 byte"), pair("int", "4 bytes")],
+                    distractors: vec!["8 bytes".to_owned()],
+                }),
+            }],
+        };
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("matching_question"));
+        // One response per left prompt, each offering all three options.
+        assert!(xml.contains(r#"<response_lid ident="response_0">"#));
+        assert!(xml.contains(r#"<response_lid ident="response_1">"#));
+        assert!(xml.contains("char") && xml.contains("8 bytes"));
+        // Two pairs -> 50.00 each; left 1 (int -> 4 bytes) pairs with option 1.
+        assert!(xml.contains(r#"<setvar action="Add" varname="SCORE">50.00</setvar>"#));
+        assert!(xml.contains(r#"<varequal respident="response_0">answer_0</varequal>"#));
+        assert!(xml.contains(r#"<varequal respident="response_1">answer_1</varequal>"#));
+    }
+
+    #[test]
+    /// A right reused across pairs (or shared with a distractor) collapses to one
+    /// option, so a later pair scores against an earlier, non-identity option.
+    fn matching_dedups_options_and_pairs_by_value() {
+        let pair = |left: &str, right: &str| MatchPair {
+            left: left.to_owned(),
+            right: right.to_owned(),
+        };
+        let matching = Matching {
+            // "cat" repeats and the distractor duplicates "dog".
+            pairs: vec![pair("a", "cat"), pair("b", "dog"), pair("c", "cat")],
+            distractors: vec!["dog".to_owned()],
+        };
+        let bank = matching_bank(matching, Feedback::default());
+        let xml = assessment_xml("a", &bank).expect("renders");
+        // Two distinct options only: answer_0/answer_1, never answer_2.
+        assert!(xml.contains("answer_1") && !xml.contains("answer_2"));
+        // Three pairs -> 33.33 each; pair "c" maps back to option 0, not 2.
+        assert!(xml.contains(r#"<setvar action="Add" varname="SCORE">33.33</setvar>"#));
+        assert!(xml.contains(r#"<varequal respident="response_2">answer_0</varequal>"#));
+    }
+
+    #[test]
+    /// Matching wires general feedback and XML-escapes left/right cell text.
+    fn matching_wires_feedback_and_escapes_cells() {
+        let pair = |left: &str, right: &str| MatchPair {
+            left: left.to_owned(),
+            right: right.to_owned(),
+        };
+        let matching = Matching {
+            pairs: vec![pair("a < b", "x & y"), pair("c", "z")],
+            distractors: Vec::new(),
+        };
+        let feedback = Feedback {
+            general: Some("Recall the ordering.".to_owned()),
+            correct: Some("nice".to_owned()),
+            incorrect: Some("nope".to_owned()),
+        };
+        let xml = assessment_xml("a", &matching_bank(matching, feedback)).expect("renders");
+        assert!(xml.contains("a &lt; b") && xml.contains("x &amp; y"));
+        assert!(!xml.contains("a < b") && !xml.contains("x & y"));
+        // General feedback is wired; answer-level feedback is not (matching-only).
+        assert!(xml.contains(r#"<itemfeedback ident="general_fb">"#));
+        assert!(!xml.contains(r#"ident="correct_fb""#) && !xml.contains(r#"ident="incorrect_fb""#));
+    }
+
+    /// A one-item bank wrapping `matching` with the given `feedback`.
+    fn matching_bank(matching: Matching, feedback: Feedback) -> ItemBank {
+        ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "mt".to_owned(),
+                title: None,
+                prompt: "Match.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback,
+                kind: QuestionKind::Matching(matching),
+            }],
+        }
     }
 
     #[test]
