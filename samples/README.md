@@ -206,6 +206,26 @@ wired (answer-level feedback is multiple-choice only).
 Remaining types (matching, ordering) are rolled out one at a time; each will get
 its own samples folder here as it lands.
 
+## Images
+
+Prompts are full Markdown, so images use standard `![alt](src)` syntax:
+
+- **External URLs** (`![](https://…/x.png)`) pass through unchanged and render
+  in both exports.
+- **Local files** (`![](diagram.png)`, resolved relative to the question
+  directory) are **bundled into the Canvas package** under `web_resources/` and
+  rewritten to Canvas's `$IMS-CC-FILEBASE$` reference so they resolve on import.
+  A referenced file that is missing is skipped with a warning.
+
+```markdown
+The tree below is balanced ![tree](binary-tree.png), unlike ![this one](https://ex.com/skew.png).
+```
+
+See [`images/`](images/) for a runnable example (`binary-tree.png` is bundled;
+the Rust-logo URL is passed through). Local-image bundling follows Canvas's
+Common Cartridge format; if an item-bank import doesn't show a bundled image,
+host it and use a URL instead.
+
 ## Canvas caveats
 
 - **True/false feedback:** New Quizzes only keeps *answer-level* feedback for

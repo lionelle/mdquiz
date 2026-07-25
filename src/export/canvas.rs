@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 use std::io::{Cursor, Write};
 
-use pulldown_cmark::{Parser, html};
+use pulldown_cmark::{Event, Parser, Tag, html};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -46,8 +46,18 @@ const MANIFEST_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <resource identifier="{{RESOURCE_IDENT}}" type="imsqti_xmlv1p2/imscc_xmlv1p1/assessment" href="{{HREF}}">
       <file href="{{HREF}}"/>
     </resource>
-  </resources>
+{{IMAGE_RESOURCES}}  </resources>
 </manifest>
+"#;
+
+/// The package directory bundled local images live in; the manifest href and
+/// the zip entry path must both use it.
+const WEB_RESOURCES_DIR: &str = "web_resources";
+
+/// One bundled-image web-content resource in the manifest.
+const IMAGE_RESOURCE_TEMPLATE: &str = r#"    <resource identifier="{{IDENT}}" type="webcontent" href="{{DIR}}/{{PATH}}">
+      <file href="{{DIR}}/{{PATH}}"/>
+    </resource>
 "#;
 
 /// The QTI 1.2 assessment wrapper; `{{ITEMS}}` holds the rendered items.
@@ -278,19 +288,31 @@ const BLANK_CONDITION_TEMPLATE: &str = r#"          <respcondition continue="Yes
 
 /// Render `bank` as the bytes of a Canvas New Quizzes QTI package.
 ///
+/// `images` supplies the bytes for local images referenced by the questions
+/// (see [`local_image_paths`]); each is bundled under `web_resources/` and
+/// referenced via `$IMS-CC-FILEBASE$`. Pass an empty slice for none.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::Export`] if the bank contains an unsupported
 /// question type or the zip package cannot be built.
-pub fn to_qti(bank: &ItemBank) -> Result<Vec<u8>> {
+pub fn to_qti(bank: &ItemBank, images: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let assessment_ident = format!("assessment_{}", sanitize_ident(&bank.name));
     let href = format!("{assessment_ident}/{assessment_ident}.xml");
     let assessment = assessment_xml(&assessment_ident, bank)?;
-    let manifest = manifest_xml(&assessment_ident, &href);
-    zip_package(&[
-        ("imsmanifest.xml", manifest.as_str()),
-        (href.as_str(), assessment.as_str()),
-    ])
+    let manifest = manifest_xml(&assessment_ident, &href, images);
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        ("imsmanifest.xml".to_owned(), manifest.into_bytes()),
+        (href, assessment.into_bytes()),
+    ];
+    for (path, bytes) in images {
+        files.push((format!("{WEB_RESOURCES_DIR}/{path}"), bytes.clone()));
+    }
+    let entries: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    zip_package(&entries)
 }
 
 /// Reminders about content that can't fully round-trip through the Canvas
@@ -319,10 +341,21 @@ pub fn import_reminders(bank: &ItemBank) -> Vec<String> {
     reminders
 }
 
-/// Fill the manifest template with the assessment resource ident and href.
-fn manifest_xml(resource_ident: &str, href: &str) -> String {
+/// Fill the manifest with the assessment resource and any bundled-image
+/// resources.
+fn manifest_xml(resource_ident: &str, href: &str, images: &[(String, Vec<u8>)]) -> String {
+    let mut image_resources = String::new();
+    for (path, _) in images {
+        image_resources.push_str(
+            &IMAGE_RESOURCE_TEMPLATE
+                .replace("{{IDENT}}", &sanitize_ident(&format!("res_{path}")))
+                .replace("{{DIR}}", WEB_RESOURCES_DIR)
+                .replace("{{PATH}}", &escape_xml(path)),
+        );
+    }
     MANIFEST_TEMPLATE
         .replace("{{RESOURCE_IDENT}}", &escape_xml(resource_ident))
+        .replace("{{IMAGE_RESOURCES}}", &image_resources)
         .replace("{{HREF}}", &escape_xml(href))
 }
 
@@ -729,10 +762,90 @@ fn general_condition_xml(feedback: &Feedback) -> String {
 }
 
 /// Render a Markdown prompt to HTML for embedding in a `text/html` mattext.
+///
+/// Local image references are rewritten to Canvas's `$IMS-CC-FILEBASE$` form so
+/// they resolve to the files bundled under `web_resources/`; absolute URLs
+/// (`http(s)://`, `//`, `data:`, root-relative) are left untouched.
 fn prompt_html(markdown: &str) -> String {
     let mut rendered = String::new();
-    html::push_html(&mut rendered, Parser::new(markdown));
+    let parser = Parser::new(markdown).map(rewrite_local_image);
+    html::push_html(&mut rendered, parser);
     rendered.trim().to_owned()
+}
+
+/// Rewrite a local image event's URL to its bundled `$IMS-CC-FILEBASE$` form.
+fn rewrite_local_image(event: Event) -> Event {
+    match event {
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) if is_local_image(&dest_url) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: canvas_image_ref(&dest_url).into(),
+            title,
+            id,
+        }),
+        other => other,
+    }
+}
+
+/// Whether an image URL is a local file path (rather than an absolute URL).
+fn is_local_image(url: &str) -> bool {
+    !(url.contains("://")
+        || url.starts_with("//")
+        || url.starts_with('/')
+        || url.starts_with("data:"))
+}
+
+/// The `$IMS-CC-FILEBASE$` reference for a bundled local image `path`.
+fn canvas_image_ref(path: &str) -> String {
+    format!(
+        "$IMS-CC-FILEBASE$/{}?canvas_download=1",
+        percent_encode_path(path)
+    )
+}
+
+/// Percent-encode a path for a URL, keeping `/` and the unreserved characters.
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(char::from(byte));
+        } else {
+            // Writing to a `String` is infallible, so the result is discarded.
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// The distinct local-image paths referenced by any question in `bank`.
+///
+/// The exporter bundles these under `web_resources/`; the CLI resolves them to
+/// bytes relative to the question directory.
+#[must_use]
+pub fn local_image_paths(bank: &ItemBank) -> Vec<String> {
+    let mut paths = Vec::new();
+    for question in &bank.items {
+        for url in image_urls(&question.prompt) {
+            if is_local_image(&url) && !paths.contains(&url) {
+                paths.push(url);
+            }
+        }
+    }
+    paths
+}
+
+/// The image URLs referenced by a Markdown `prompt`, in order.
+fn image_urls(prompt: &str) -> Vec<String> {
+    Parser::new(prompt)
+        .filter_map(|event| match event {
+            Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// XML-escape the five predefined entities, `&` first to avoid double-escaping.
@@ -763,19 +876,19 @@ fn sanitize_ident(raw: &str) -> String {
     }
 }
 
-/// Zip the `(path, content)` files into a package byte payload.
+/// Zip the `(path, bytes)` files into a package byte payload.
 ///
 /// # Errors
 ///
 /// Returns [`crate::Error::Export`] if the zip archive cannot be written.
-fn zip_package(files: &[(&str, &str)]) -> Result<Vec<u8>> {
+fn zip_package(files: &[(&str, &[u8])]) -> Result<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut writer = ZipWriter::new(&mut cursor);
         let options = SimpleFileOptions::default();
         for (path, content) in files {
             writer.start_file(*path, options).map_err(|e| zip_err(&e))?;
-            writer.write_all(content.as_bytes())?;
+            writer.write_all(content)?;
         }
         writer.finish().map_err(|e| zip_err(&e))?;
     }
@@ -1202,7 +1315,7 @@ mod tests {
     #[test]
     /// A multiple-choice bank exports as a valid two-file zip package.
     fn multiple_choice_exports_valid_zip() {
-        let bytes = to_qti(&multiple_choice_bank(0, Feedback::default())).expect("export");
+        let bytes = to_qti(&multiple_choice_bank(0, Feedback::default()), &[]).expect("export");
         let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
         assert_eq!(archive.len(), 2);
     }
@@ -1210,7 +1323,7 @@ mod tests {
     #[test]
     /// The package is a zip holding the manifest and one assessment file.
     fn package_is_zip_with_manifest_and_assessment() {
-        let bytes = to_qti(&true_false_bank(true, "Q?")).expect("export succeeds");
+        let bytes = to_qti(&true_false_bank(true, "Q?"), &[]).expect("export succeeds");
         let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
         let names: Vec<&str> = archive.file_names().collect();
         assert_eq!(names.len(), 2);
@@ -1270,9 +1383,73 @@ mod tests {
     #[test]
     /// The manifest wires the resource ident and href into the resource nodes.
     fn manifest_references_assessment_resource() {
-        let xml = manifest_xml("assessment_m", "assessment_m/assessment_m.xml");
+        let xml = manifest_xml("assessment_m", "assessment_m/assessment_m.xml", &[]);
         assert!(xml.contains(r#"identifier="assessment_m""#));
         assert!(xml.contains(r#"href="assessment_m/assessment_m.xml""#));
+    }
+
+    /// Build a one-question bank whose prompt is `prompt`.
+    fn image_bank(prompt: &str) -> ItemBank {
+        ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: prompt.to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            }],
+        }
+    }
+
+    #[test]
+    /// A local image URL is rewritten to `$IMS-CC-FILEBASE$`; external URLs stay.
+    fn local_image_rewritten_external_untouched() {
+        let bank = image_bank("See ![d](diagram.png) and ![x](https://ex.com/x.png).");
+        assert_eq!(local_image_paths(&bank), ["diagram.png"]);
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("$IMS-CC-FILEBASE$/diagram.png?canvas_download=1"));
+        assert!(xml.contains("https://ex.com/x.png"));
+        // The bare local src must not survive.
+        assert!(!xml.contains("src=&quot;diagram.png&quot;"));
+    }
+
+    #[test]
+    /// Supplied image bytes are bundled and declared in the manifest.
+    fn images_are_bundled_and_declared() {
+        let bank = image_bank("![d](sub/diagram.png)");
+        let images = vec![("sub/diagram.png".to_owned(), vec![1_u8, 2, 3])];
+        let bytes = to_qti(&bank, &images).expect("export");
+        let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
+        let names: Vec<&str> = archive.file_names().collect();
+        assert!(names.contains(&"web_resources/sub/diagram.png"));
+        let manifest = manifest_xml("a", "a/a.xml", &images);
+        assert!(manifest.contains(r#"href="web_resources/sub/diagram.png""#));
+        assert!(manifest.contains("webcontent"));
+    }
+
+    #[test]
+    /// Path percent-encoding keeps `/` but escapes spaces.
+    fn percent_encode_keeps_slash_escapes_space() {
+        assert_eq!(percent_encode_path("a b/c.png"), "a%20b/c.png");
+    }
+
+    #[test]
+    /// Only relative paths count as local; every URL scheme is rejected.
+    fn is_local_image_rejects_urls_accepts_relative() {
+        for url in [
+            "http://x/y.png",
+            "https://x/y.png",
+            "//x/y.png",
+            "/root/y.png",
+            "data:image/png;base64,AAAA",
+        ] {
+            assert!(!is_local_image(url), "{url} should be non-local");
+        }
+        assert!(is_local_image("diagram.png"));
+        assert!(is_local_image("sub/diagram.png"));
     }
 
     #[test]
@@ -1389,7 +1566,7 @@ mod tests {
                 kind: QuestionKind::Ordering,
             }],
         };
-        let err = to_qti(&bank).expect_err("ordering is unsupported");
+        let err = to_qti(&bank, &[]).expect_err("ordering is unsupported");
         assert!(matches!(err, crate::Error::Export(_)));
     }
 

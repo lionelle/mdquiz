@@ -79,11 +79,33 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let sources = read_question_sources(&dir)?;
             let bank = parse::item_bank_from_sources(bank_name(&dir, name), sources)?;
-            let reminders = write_export(&bank, format.into(), &output)?;
+            // Local images are only bundled into the Canvas package.
+            let images = match format {
+                FormatArg::Canvas => load_images(&dir, &bank),
+                FormatArg::Markdown => Vec::new(),
+            };
+            let reminders = write_export(&bank, format.into(), &output, &images)?;
             print_import_reminders(&reminders);
             Ok(())
         }
     }
+}
+
+/// Load the bytes of every local image referenced by the bank, resolved
+/// relative to `dir`. Missing or unsafe paths are skipped with a warning.
+fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
+    let mut images = Vec::new();
+    for path in canvas::local_image_paths(bank) {
+        if path.split('/').any(|part| part == "..") {
+            eprintln!("warning: skipping image outside the question directory: {path}");
+            continue;
+        }
+        match fs::read(dir.join(&path)) {
+            Ok(bytes) => images.push((path, bytes)),
+            Err(error) => eprintln!("warning: cannot read image {path} ({error}); skipping"),
+        }
+    }
+    images
 }
 
 /// Print any post-import manual-fix reminders to stderr after a Canvas export.
@@ -148,6 +170,7 @@ fn write_export(
     bank: &ItemBank,
     format: export::Format,
     output: &Path,
+    images: &[(String, Vec<u8>)],
 ) -> anyhow::Result<Vec<String>> {
     match format {
         export::Format::Markdown => {
@@ -157,7 +180,7 @@ fn write_export(
             Ok(Vec::new())
         }
         export::Format::Canvas => {
-            let bytes = canvas::to_qti(bank)?;
+            let bytes = canvas::to_qti(bank, images)?;
             fs::write(output, bytes)
                 .with_context(|| format!("writing Canvas package to {}", output.display()))?;
             Ok(canvas::import_reminders(bank))
@@ -247,11 +270,61 @@ mod tests {
     }
 
     #[test]
+    /// `load_images` reads present images and skips missing/unsafe ones.
+    fn load_images_reads_present_skips_others() {
+        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("here.png"), b"png-bytes").expect("write image");
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: "![a](here.png) ![b](missing.png) ![c](../escape.png)".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            }],
+        };
+        let images = load_images(dir.path(), &bank);
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images.first().map(|(path, _)| path.as_str()),
+            Some("here.png")
+        );
+    }
+
+    #[test]
+    /// A `..` image path is refused by the guard even when the target exists.
+    fn load_images_refuses_parent_escape() {
+        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
+        let root = tempfile::tempdir().expect("temp dir");
+        fs::write(root.path().join("secret.png"), b"x").expect("write outside");
+        let qdir = root.path().join("q");
+        fs::create_dir(&qdir).expect("qdir");
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: "![e](../secret.png)".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            }],
+        };
+        // The file exists outside `qdir`, so only the `..` guard can skip it.
+        assert!(load_images(&qdir, &bank).is_empty());
+    }
+
+    #[test]
     /// Markdown export writes a text sheet headed by the bank name.
     fn write_export_writes_markdown() {
         let dir = tempfile::tempdir().expect("temp dir");
         let out = dir.path().join("quiz.md");
-        write_export(&true_false_bank(), export::Format::Markdown, &out).expect("write");
+        write_export(&true_false_bank(), export::Format::Markdown, &out, &[]).expect("write");
         let text = fs::read_to_string(&out).expect("read back");
         assert!(text.starts_with("# M"));
     }
@@ -261,7 +334,7 @@ mod tests {
     fn write_export_writes_canvas_zip() {
         let dir = tempfile::tempdir().expect("temp dir");
         let out = dir.path().join("quiz.zip");
-        write_export(&true_false_bank(), export::Format::Canvas, &out).expect("write");
+        write_export(&true_false_bank(), export::Format::Canvas, &out, &[]).expect("write");
         let bytes = fs::read(&out).expect("read back");
         assert!(bytes.starts_with(b"PK"));
     }
