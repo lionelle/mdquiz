@@ -6,8 +6,7 @@
 //! onto a Canvas *New Quizzes* item bank.
 //!
 //! Each [`QuestionKind`] carries its own type-specific payload (choices,
-//! blanks, …) as it is rolled out; the types still awaiting implementation stay
-//! unit-typed. See CLAUDE.md for the roll-out order.
+//! blanks, …). See CLAUDE.md for the roll-out order.
 //!
 //! # Growth path
 //!
@@ -69,10 +68,9 @@ pub struct Feedback {
 
 /// The supported question types, following the Canvas *New Quizzes* model.
 ///
-/// Each variant carries its type-specific payload as it is implemented;
-/// not-yet-rolled-out variants stay unit-typed. The roll-out order is the order
-/// listed here. This serde shape is *not* the authored format — questions are
-/// parsed via `parse::QuestionSpec`, which reads the flat `kind:` YAML tag.
+/// Each variant carries its type-specific payload; the roll-out order is the
+/// order listed here. This serde shape is *not* the authored format — questions
+/// are parsed via `parse::QuestionSpec`, which reads the flat `kind:` YAML tag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -90,7 +88,7 @@ pub enum QuestionKind {
     /// Match items in one column to items in another.
     Matching(Matching),
     /// Put items into the correct order.
-    Ordering,
+    Ordering(Ordering),
 }
 
 impl QuestionKind {
@@ -103,19 +101,8 @@ impl QuestionKind {
             Self::MultipleSelect(_) => "multiple select",
             Self::FillInBlank(_) => "fill in the blank",
             Self::Matching(_) => "matching",
-            Self::Ordering => "ordering",
+            Self::Ordering(_) => "ordering",
         }
-    }
-
-    /// Build the "not supported yet" export error for this kind.
-    ///
-    /// Shared by every exporter's reject arm so the message stays consistent
-    /// and names both the target format and the offending question.
-    pub(crate) fn unsupported_by(&self, target: &str, id: &str) -> crate::Error {
-        crate::Error::Export(format!(
-            "{target} export does not support {} questions yet (question {id:?})",
-            self.label()
-        ))
     }
 }
 
@@ -292,6 +279,28 @@ impl Matching {
     }
 }
 
+/// The payload for a [`QuestionKind::Ordering`] question.
+///
+/// `items` are authored in the *correct* order; the exporters shuffle them for
+/// display (see [`Ordering::display_order`]) so the shown sequence is not the
+/// answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ordering {
+    /// The items to arrange, listed in their correct order.
+    pub items: Vec<String>,
+}
+
+impl Ordering {
+    /// The item indices in display order: sorted by text so the presented
+    /// sequence never hands the student the correct order.
+    pub(crate) fn display_order(&self) -> Vec<usize> {
+        let mut indexed: Vec<(usize, &str)> =
+            self.items.iter().map(String::as_str).enumerate().collect();
+        indexed.sort_by(|left, right| left.1.cmp(right.1));
+        indexed.into_iter().map(|(index, _)| index).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,7 +327,10 @@ mod tests {
             (ms, "multiple select"),
             (fitb, "fill in the blank"),
             (matching, "matching"),
-            (QuestionKind::Ordering, "ordering"),
+            (
+                QuestionKind::Ordering(Ordering { items: Vec::new() }),
+                "ordering",
+            ),
         ];
         for (kind, label) in cases {
             assert_eq!(kind.label(), label);
@@ -342,12 +354,14 @@ mod tests {
     }
 
     #[test]
-    /// The unsupported-kind error names the target format, kind, and question.
-    fn unsupported_by_message_names_target_kind_and_id() {
-        let err = QuestionKind::Ordering.unsupported_by("Canvas", "q7");
-        let message = err.to_string();
-        assert!(message.contains("Canvas"));
-        assert!(message.contains("ordering"));
-        assert!(message.contains("q7"));
+    /// `display_order` presents items sorted by text, not in their (correct)
+    /// authored order.
+    fn ordering_display_order_sorts_by_text() {
+        let ordering = Ordering {
+            items: vec!["gamma".to_owned(), "alpha".to_owned(), "beta".to_owned()],
+        };
+        // Authored order is 0,1,2 (gamma, alpha, beta); sorted is alpha, beta,
+        // gamma -> original indices 1,2,0.
+        assert_eq!(ordering.display_order(), [1, 2, 0]);
     }
 }

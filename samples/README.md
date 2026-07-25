@@ -229,7 +229,33 @@ they don't line up with the prompts). Exports as Canvas `matching_question`
 (verified against Canvas's own export structure). Left/right cells are plain
 text.
 
-The last type (ordering) is rolled out next.
+### Ordering (`kind: ordering`)
+
+List the `items` in their **correct** order; mdquiz shuffles them for display so
+the shown sequence is never the answer:
+
+```markdown
+---
+id: ord-alloc
+kind: ordering
+items:
+  - Declare a pointer
+  - Call malloc
+  - Check for NULL
+  - Use the memory
+  - Call free
+---
+
+# Heap allocation lifecycle
+
+Put the steps of a typical C heap allocation in the order they should happen.
+```
+
+Rules: at least two items, each non-empty. Scored **all-or-nothing** — full
+marks only when the entire sequence is correct (matching Canvas's own
+`ordering_question`, verified against its export structure). On the print sheet
+the items are listed sorted, each with a write-in blank for its position. Only
+`general` feedback is wired.
 
 ## Images
 

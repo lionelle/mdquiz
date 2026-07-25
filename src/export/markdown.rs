@@ -6,18 +6,16 @@
 use std::fmt::Write as _;
 
 use crate::Result;
-use crate::model::{Blank, Choice, Matching, Question, QuestionKind};
+use crate::model::{Blank, Choice, Matching, Ordering, Question, QuestionKind};
 
 /// Render `bank` as a print-ready Markdown document with no solutions.
 ///
-/// Questions are numbered from one under the bank name. Only rolled-out
-/// question types render; others report a typed error rather than emitting a
-/// silently wrong sheet.
+/// Questions are numbered from one under the bank name.
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Export`] if the bank contains a question type this
-/// exporter does not support yet.
+/// Currently infallible; the `Result` is retained because [`render_question`]
+/// keeps a fallible signature for future `#[non_exhaustive]` question kinds.
 pub fn to_print_markdown(bank: &crate::model::ItemBank) -> Result<String> {
     let mut out = format!("# {}\n", bank.name);
     for (index, question) in bank.items.iter().enumerate() {
@@ -31,7 +29,13 @@ pub fn to_print_markdown(bank: &crate::model::ItemBank) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Export`] for a question type not yet supported here.
+/// Currently infallible; the `Result` is retained because [`QuestionKind`] is
+/// `#[non_exhaustive]`, so a future kind this sheet cannot represent can be
+/// rejected as a new arm without a signature change rippling to every caller.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "fallible signature reserved for future non_exhaustive QuestionKind variants"
+)]
 fn render_question(number: usize, question: &Question) -> Result<String> {
     match &question.kind {
         QuestionKind::TrueFalse(_) => Ok(render_true_false(number, &question.prompt)),
@@ -48,8 +52,22 @@ fn render_question(number: usize, question: &Question) -> Result<String> {
             Ok(render_fill_in_blank(number, &question.prompt, &fitb.blanks))
         }
         QuestionKind::Matching(matching) => Ok(render_matching(number, &question.prompt, matching)),
-        other => Err(other.unsupported_by("markdown", &question.id)),
+        QuestionKind::Ordering(ordering) => Ok(render_ordering(number, &question.prompt, ordering)),
     }
+}
+
+/// Render an ordering item: the items shown sorted (never in the correct order),
+/// each with a blank to write its position, no key.
+fn render_ordering(number: usize, prompt: &str, ordering: &Ordering) -> String {
+    let mut out = format!("{number}. {prompt}\n");
+    for index in ordering.display_order() {
+        if let Some(item) = ordering.items.get(index) {
+            // Writing to a `String` is infallible, so the result is discarded.
+            let _ = write!(out, "\n   ____ {item}");
+        }
+    }
+    out.push('\n');
+    out
 }
 
 /// Render a matching item: numbered left prompts, then lettered right options
@@ -336,21 +354,30 @@ mod tests {
     }
 
     #[test]
-    /// An unsupported question type reports a typed export error.
-    fn unsupported_kind_errors() {
+    /// An ordering item lists its options sorted (never in the correct order),
+    /// each with a write-in blank, and no answer key.
+    fn renders_ordering_without_answer_key() {
         let bank = ItemBank {
-            name: "m".to_owned(),
+            name: "M".to_owned(),
             items: vec![Question {
-                id: "q".to_owned(),
+                id: "ord".to_owned(),
                 title: None,
-                prompt: "p".to_owned(),
+                prompt: "Order the phases.".to_owned(),
                 points: 1.0,
                 tags: Vec::new(),
                 feedback: Feedback::default(),
-                kind: QuestionKind::Ordering,
+                // Authored (correct) order; display sorts to Compile, Link, Run.
+                kind: QuestionKind::Ordering(Ordering {
+                    items: vec!["Run".to_owned(), "Compile".to_owned(), "Link".to_owned()],
+                }),
             }],
         };
-        let err = to_print_markdown(&bank).expect_err("ordering is unsupported");
-        assert!(matches!(err, crate::Error::Export(_)));
+        let out = to_print_markdown(&bank).expect("renders");
+        assert!(out.contains("1. Order the phases."));
+        // Sorted display order, not the authored order, with write-in blanks.
+        let items = out.find("____ Compile").expect("compile listed");
+        let link = out.find("____ Link").expect("link listed");
+        let run = out.find("____ Run").expect("run listed");
+        assert!(items < link && link < run);
     }
 }

@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::Result;
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
-    MultipleSelect, Question, QuestionKind, ScoringMode, TrueFalse, blank_markers,
+    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse, blank_markers,
 };
 
 /// The metadata every question shares, flattened into each [`QuestionSpec`].
@@ -156,6 +156,14 @@ enum QuestionSpec {
         #[serde(default)]
         distractors: Vec<String>,
     },
+    /// An ordering question: items to arrange in a correct sequence.
+    Ordering {
+        /// The shared question metadata.
+        #[serde(flatten)]
+        common: CommonSpec,
+        /// The items, authored in their correct order.
+        items: Vec<String>,
+    },
 }
 
 /// The default point value when a question omits `points`.
@@ -177,13 +185,10 @@ impl QuestionSpec {
                 common,
                 choices,
                 scoring,
-            } => {
-                let select = MultipleSelect {
-                    choices: choices_vec(choices),
-                    scoring,
-                };
-                common.into_question(prompt, QuestionKind::MultipleSelect(select))
-            }
+            } => common.into_question(
+                prompt,
+                QuestionKind::MultipleSelect(multiple_select(choices, scoring)),
+            ),
             Self::FillInBlank { common, blanks } => {
                 common.into_question(prompt, QuestionKind::FillInBlank(fill_in_blank(blanks)))
             }
@@ -195,6 +200,9 @@ impl QuestionSpec {
                 prompt,
                 QuestionKind::Matching(Matching { pairs, distractors }),
             ),
+            Self::Ordering { common, items } => {
+                common.into_question(prompt, QuestionKind::Ordering(Ordering { items }))
+            }
         }
     }
 }
@@ -214,6 +222,14 @@ fn choices_vec(choices: Vec<ChoiceSpec>) -> Vec<Choice> {
 fn choice_set(choices: Vec<ChoiceSpec>) -> ChoiceSet {
     ChoiceSet {
         choices: choices_vec(choices),
+    }
+}
+
+/// Convert authored [`ChoiceSpec`]s and a scoring mode into a [`MultipleSelect`].
+fn multiple_select(choices: Vec<ChoiceSpec>, scoring: ScoringMode) -> MultipleSelect {
+    MultipleSelect {
+        choices: choices_vec(choices),
+        scoring,
     }
 }
 
@@ -272,6 +288,7 @@ fn validate_question(question: &Question) -> Result<()> {
             validate_blanks(&question.id, &question.prompt, &fitb.blanks)
         }
         QuestionKind::Matching(matching) => validate_matching(&question.id, matching),
+        QuestionKind::Ordering(ordering) => validate_ordering(&question.id, ordering),
         _ => Ok(()),
     }
 }
@@ -293,6 +310,25 @@ fn validate_matching(id: &str, matching: &Matching) -> Result<()> {
                 "question {id:?} has a matching pair with an empty side"
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate an ordering question: at least two items, each with non-empty text.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming `id` when the rules fail.
+fn validate_ordering(id: &str, ordering: &Ordering) -> Result<()> {
+    if ordering.items.len() < 2 {
+        return Err(crate::Error::InvalidQuestion(format!(
+            "question {id:?} needs at least two items to order"
+        )));
+    }
+    if ordering.items.iter().any(|item| item.trim().is_empty()) {
+        return Err(crate::Error::InvalidQuestion(format!(
+            "question {id:?} has an empty ordering item"
+        )));
     }
     Ok(())
 }
@@ -644,6 +680,42 @@ mod tests {
         let source = "---\nid: q\nkind: matching\npairs:\n  - left: a\n    right: b\n\
             \x20 - left: c\n    right: \"\"\n---\n\nMatch.\n";
         let err = parse_question(source).expect_err("empty right");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// An ordering source captures its items in authored (correct) order.
+    fn parses_ordering() {
+        let source = "---\nid: ord\nkind: ordering\nitems:\n  - Compile\n  - Link\n  - Run\n\
+            ---\n\nOrder the build phases.\n";
+        let question = parse_question(source).expect("valid source");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::Ordering(ordering)
+                if ordering.items == ["Compile", "Link", "Run"]
+        ));
+    }
+
+    #[test]
+    /// Exactly two items is the accepted minimum (guards the `< 2` boundary).
+    fn ordering_accepts_exactly_two_items() {
+        let source = "---\nid: q\nkind: ordering\nitems:\n  - a\n  - b\n---\n\nOrder.\n";
+        assert!(parse_question(source).is_ok());
+    }
+
+    #[test]
+    /// An ordering question with fewer than two items is rejected.
+    fn ordering_needs_two_items() {
+        let source = "---\nid: q\nkind: ordering\nitems:\n  - only\n---\n\nOrder.\n";
+        let err = parse_question(source).expect_err("one item");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// An ordering question with an empty item is rejected.
+    fn ordering_rejects_empty_item() {
+        let source = "---\nid: q\nkind: ordering\nitems:\n  - a\n  - \"\"\n---\n\nOrder.\n";
+        let err = parse_question(source).expect_err("empty item");
         assert!(matches!(err, crate::Error::InvalidQuestion(_)));
     }
 

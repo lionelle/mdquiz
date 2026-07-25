@@ -20,7 +20,7 @@ use zip::write::SimpleFileOptions;
 use crate::Result;
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
-    MultipleSelect, Question, QuestionKind, ScoringMode, TrueFalse,
+    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse,
 };
 
 /// The `response_label` ident for the "True" choice; fills the item template.
@@ -308,6 +308,74 @@ const MATCH_OPTION_TEMPLATE: &str = r#"              <response_label ident="{{OP
               </response_label>
 "#;
 
+/// An ordering QTI item. `{{ANSWER_IDS}}` lists every option ident in display
+/// order, `{{OPTIONS}}` the shuffled draggable labels, and `{{CONDITIONS}}` the
+/// single all-or-nothing correct-order condition.
+const ORDERING_ITEM_TEMPLATE: &str = r#"      <item ident="{{ITEM_IDENT}}" title="{{ITEM_TITLE}}">
+        <itemmetadata>
+          <qtimetadata>
+            <qtimetadatafield>
+              <fieldlabel>question_type</fieldlabel>
+              <fieldentry>ordering_question</fieldentry>
+            </qtimetadatafield>
+            <qtimetadatafield>
+              <fieldlabel>points_possible</fieldlabel>
+              <fieldentry>{{POINTS}}</fieldentry>
+            </qtimetadatafield>
+            <qtimetadatafield>
+              <fieldlabel>original_answer_ids</fieldlabel>
+              <fieldentry>{{ANSWER_IDS}}</fieldentry>
+            </qtimetadatafield>
+          </qtimetadata>
+        </itemmetadata>
+        <presentation>
+          <material>
+            <mattext texttype="text/html">{{PROMPT}}</mattext>
+          </material>
+          <response_lid ident="response1" rcardinality="Ordered">
+            <render_extension>
+              <material position="top">
+                <mattext/>
+              </material>
+              <ims_render_object shuffle="No">
+                <flow_label>
+{{OPTIONS}}                </flow_label>
+              </ims_render_object>
+              <material position="bottom">
+                <mattext/>
+              </material>
+            </render_extension>
+          </response_lid>
+        </presentation>
+        <resprocessing>
+          <outcomes>
+            <decvar defaultval="1" varname="ORDERSCORE" vartype="Integer"/>
+          </outcomes>
+{{CONDITIONS}}        </resprocessing>
+{{ITEMFEEDBACK}}      </item>
+"#;
+
+/// One draggable ordering option, rendered as HTML like a choice label.
+const ORDER_OPTION_TEMPLATE: &str = r#"                <response_label ident="{{OPTION_IDENT}}">
+                  <material>
+                    <mattext texttype="text/html">{{TEXT}}</mattext>
+                  </material>
+                </response_label>
+"#;
+
+/// One position in the correct-order condition: option `{{OPTION_IDENT}}`.
+const ORDER_VAREQUAL_TEMPLATE: &str =
+    "              <varequal respident=\"response1\">{{OPTION_IDENT}}</varequal>\n";
+
+/// The all-or-nothing correct-order condition: every option in authored order
+/// scores full marks. `{{VAREQUALS}}` is the ordered `varequal` list.
+const ORDER_CONDITION_TEMPLATE: &str = r#"          <respcondition continue="No">
+            <conditionvar>
+{{VAREQUALS}}            </conditionvar>
+            <setvar action="Set" varname="SCORE">100</setvar>
+          </respcondition>
+"#;
+
 /// Render `bank` as the bytes of a Canvas New Quizzes QTI package.
 ///
 /// `images` supplies the bytes for local images referenced by the questions
@@ -316,8 +384,7 @@ const MATCH_OPTION_TEMPLATE: &str = r#"              <response_label ident="{{OP
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Export`] if the bank contains an unsupported
-/// question type or the zip package cannot be built.
+/// Returns [`crate::Error::Export`] if the zip package cannot be built.
 pub fn to_qti(bank: &ItemBank, images: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let assessment_ident = format!("assessment_{}", sanitize_ident(&bank.name));
     let href = format!("{assessment_ident}/{assessment_ident}.xml");
@@ -385,7 +452,8 @@ fn manifest_xml(resource_ident: &str, href: &str, images: &[(String, Vec<u8>)]) 
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Export`] for a question type not yet supported.
+/// Currently infallible; the `Result` is retained because [`item_xml`] keeps a
+/// fallible signature for future `#[non_exhaustive]` [`QuestionKind`] variants.
 fn assessment_xml(ident: &str, bank: &ItemBank) -> Result<String> {
     let mut items = String::new();
     for question in &bank.items {
@@ -402,7 +470,13 @@ fn assessment_xml(ident: &str, bank: &ItemBank) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Export`] for a question type not yet supported.
+/// Currently infallible; the `Result` is retained because [`QuestionKind`] is
+/// `#[non_exhaustive]`, so a future kind this exporter cannot yet represent can
+/// be rejected as a new arm without a signature change rippling to every caller.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "fallible signature reserved for future non_exhaustive QuestionKind variants"
+)]
 fn item_xml(question: &Question) -> Result<String> {
     match &question.kind {
         QuestionKind::TrueFalse(answer) => Ok(true_false_item_xml(question, answer)),
@@ -410,7 +484,7 @@ fn item_xml(question: &Question) -> Result<String> {
         QuestionKind::MultipleSelect(set) => Ok(multiple_select_item_xml(question, set)),
         QuestionKind::FillInBlank(fitb) => Ok(fill_in_blank_item_xml(question, fitb)),
         QuestionKind::Matching(matching) => Ok(matching_item_xml(question, matching)),
-        other => Err(other.unsupported_by("Canvas", &question.id)),
+        QuestionKind::Ordering(ordering) => Ok(ordering_item_xml(question, ordering)),
     }
 }
 
@@ -682,6 +756,60 @@ fn match_conditions_xml(matching: &Matching, options: &[&str], feedback: &Feedba
         );
     }
     out
+}
+
+/// Render an ordering item: draggable options scored only when fully in order.
+fn ordering_item_xml(question: &Question, ordering: &Ordering) -> String {
+    let (options, answer_ids) = order_options_xml(ordering);
+    fill_item_header(ORDERING_ITEM_TEMPLATE, question)
+        .replace("{{ANSWER_IDS}}", &answer_ids)
+        .replace("{{OPTIONS}}", &options)
+        .replace(
+            "{{CONDITIONS}}",
+            &order_conditions_xml(ordering, &question.feedback),
+        )
+        .replace(
+            "{{ITEMFEEDBACK}}",
+            &general_itemfeedback_xml(&question.feedback),
+        )
+        // `{{PROMPT}}` is filled last so authored text is never re-scanned.
+        .replace("{{PROMPT}}", &escaped_html(&question.prompt))
+}
+
+/// The response identifier for the ordering option authored at `index`.
+fn order_answer_ident(index: usize) -> String {
+    format!("answer_{index}")
+}
+
+/// Render the draggable options in display order, returning the `response_label`
+/// XML and the matching comma-separated `original_answer_ids` in that order.
+fn order_options_xml(ordering: &Ordering) -> (String, String) {
+    let mut options = String::new();
+    let mut ids: Vec<String> = Vec::new();
+    for index in ordering.display_order() {
+        let ident = order_answer_ident(index);
+        let text = ordering.items.get(index).map_or("", String::as_str);
+        options.push_str(
+            &ORDER_OPTION_TEMPLATE
+                .replace("{{OPTION_IDENT}}", &ident)
+                .replace("{{TEXT}}", &escaped_html(text)),
+        );
+        ids.push(ident);
+    }
+    (options, ids.join(","))
+}
+
+/// Render the scoring conditions: any general feedback, then the single
+/// all-or-nothing condition listing every option in authored (correct) order.
+fn order_conditions_xml(ordering: &Ordering, feedback: &Feedback) -> String {
+    let mut varequals = String::new();
+    for index in 0..ordering.items.len() {
+        varequals.push_str(
+            &ORDER_VAREQUAL_TEMPLATE.replace("{{OPTION_IDENT}}", &order_answer_ident(index)),
+        );
+    }
+    let condition = ORDER_CONDITION_TEMPLATE.replace("{{VAREQUALS}}", &varequals);
+    format!("{}{condition}", general_condition_xml(feedback))
 }
 
 /// Fill the shared item shell (metadata, scoring, feedback, prompt) around a
@@ -1759,22 +1887,57 @@ mod tests {
     }
 
     #[test]
-    /// An unsupported question type reports a typed export error.
-    fn unsupported_kind_errors() {
-        let bank = ItemBank {
-            name: "m".to_owned(),
+    /// Ordering shuffles options for display (sorted, so not the answer) yet
+    /// scores the single correct sequence in authored order, all-or-nothing.
+    fn ordering_renders_shuffled_options_and_correct_order() {
+        // Authored (correct) order; sorted display is Alloc, Free, Init, Use.
+        let items = ["Alloc", "Init", "Use", "Free"].map(str::to_owned).to_vec();
+        let xml = assessment_xml("a", &ordering_bank(items, Feedback::default())).expect("renders");
+        assert!(xml.contains("ordering_question"));
+        assert!(xml.contains(r#"<response_lid ident="response1" rcardinality="Ordered">"#));
+        // Display order is sorted by text: Alloc(0), Free(3), Init(1), Use(2).
+        assert!(xml.contains("<fieldentry>answer_0,answer_3,answer_1,answer_2</fieldentry>"));
+        // The scoring condition lists options in authored (correct) order.
+        assert!(xml.contains(concat!(
+            "<varequal respident=\"response1\">answer_0</varequal>\n",
+            "              <varequal respident=\"response1\">answer_1</varequal>\n",
+            "              <varequal respident=\"response1\">answer_2</varequal>\n",
+            "              <varequal respident=\"response1\">answer_3</varequal>"
+        )));
+        assert!(xml.contains(r#"<setvar action="Set" varname="SCORE">100</setvar>"#));
+    }
+
+    #[test]
+    /// Ordering wires general feedback and XML-escapes option text.
+    fn ordering_wires_feedback_and_escapes() {
+        let items = vec!["a < b".to_owned(), "c & d".to_owned()];
+        let feedback = Feedback {
+            general: Some("Think about precedence.".to_owned()),
+            correct: Some("yes".to_owned()),
+            incorrect: Some("no".to_owned()),
+        };
+        let xml = assessment_xml("a", &ordering_bank(items, feedback)).expect("renders");
+        assert!(xml.contains("a &amp;lt; b") && xml.contains("c &amp;amp; d"));
+        assert!(!xml.contains("a < b") && !xml.contains("c & d"));
+        // General feedback is wired; answer-level feedback is not.
+        assert!(xml.contains(r#"<itemfeedback ident="general_fb">"#));
+        assert!(!xml.contains(r#"ident="correct_fb""#) && !xml.contains(r#"ident="incorrect_fb""#));
+    }
+
+    /// A one-item bank wrapping an ordering question over `items` (correct order).
+    fn ordering_bank(items: Vec<String>, feedback: Feedback) -> ItemBank {
+        ItemBank {
+            name: "M".to_owned(),
             items: vec![Question {
-                id: "q".to_owned(),
+                id: "ord".to_owned(),
                 title: None,
-                prompt: "p".to_owned(),
+                prompt: "Order.".to_owned(),
                 points: 1.0,
                 tags: Vec::new(),
-                feedback: Feedback::default(),
-                kind: QuestionKind::Ordering,
+                feedback,
+                kind: QuestionKind::Ordering(Ordering { items }),
             }],
-        };
-        let err = to_qti(&bank, &[]).expect_err("ordering is unsupported");
-        assert!(matches!(err, crate::Error::Export(_)));
+        }
     }
 
     #[test]
