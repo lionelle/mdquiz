@@ -3,8 +3,10 @@
 //! This target is for paper distribution, so it deliberately omits the answer
 //! key and any per-question scoring hints.
 
+use std::fmt::Write as _;
+
 use crate::Result;
-use crate::model::{Question, QuestionKind};
+use crate::model::{Choice, Question, QuestionKind};
 
 /// Render `bank` as a print-ready Markdown document with no solutions.
 ///
@@ -33,6 +35,15 @@ pub fn to_print_markdown(bank: &crate::model::ItemBank) -> Result<String> {
 fn render_question(number: usize, question: &Question) -> Result<String> {
     match &question.kind {
         QuestionKind::TrueFalse(_) => Ok(render_true_false(number, &question.prompt)),
+        QuestionKind::MultipleChoice(set) => Ok(render_choices(
+            number,
+            &question.prompt,
+            &set.choices,
+            false,
+        )),
+        QuestionKind::MultipleSelect(set) => {
+            Ok(render_choices(number, &question.prompt, &set.choices, true))
+        }
         other => Err(other.unsupported_by("markdown", &question.id)),
     }
 }
@@ -42,10 +53,39 @@ fn render_true_false(number: usize, prompt: &str) -> String {
     format!("{number}. {prompt}\n\n   - [ ] True\n   - [ ] False\n")
 }
 
+/// Render a choice-based item: the prompt then lettered options, no key.
+///
+/// With `multiple`, options carry a blank checkbox to signal that more than one
+/// may be selected; otherwise they are a plain lettered list.
+fn render_choices(number: usize, prompt: &str, choices: &[Choice], multiple: bool) -> String {
+    let mut out = format!("{number}. {prompt}\n");
+    for (index, choice) in choices.iter().enumerate() {
+        let label = choice_label(index);
+        // Writing to a `String` is infallible, so the result is discarded.
+        if multiple {
+            let _ = write!(out, "\n   - [ ] {label}. {}", choice.text);
+        } else {
+            let _ = write!(out, "\n   {label}. {}", choice.text);
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// The letter label for a choice at `index`: `A`..`Z`, then a 1-based number.
+fn choice_label(index: usize) -> String {
+    if let Ok(offset) = u8::try_from(index)
+        && offset < 26
+    {
+        return char::from(b'A' + offset).to_string();
+    }
+    (index + 1).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Feedback, ItemBank, Question, QuestionKind, TrueFalse};
+    use crate::model::{Choice, ChoiceSet, Feedback, ItemBank, Question, QuestionKind, TrueFalse};
 
     /// Build a one-question true/false bank for rendering tests.
     fn true_false_bank() -> ItemBank {
@@ -124,6 +164,79 @@ mod tests {
         assert!(!out.contains("SECRET-TITLE"));
         assert!(!out.contains("SECRET-TAG"));
         assert!(!out.contains("-FB"));
+    }
+
+    #[test]
+    /// A multiple-choice item renders lettered options with no answer marked.
+    fn renders_multiple_choice_without_answer() {
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "mc".to_owned(),
+                title: None,
+                prompt: "Which is O(1)?".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::MultipleChoice(ChoiceSet {
+                    choices: vec![
+                        Choice {
+                            text: "Hash lookup".to_owned(),
+                            correct: true,
+                        },
+                        Choice {
+                            text: "Linear scan".to_owned(),
+                            correct: false,
+                        },
+                    ],
+                }),
+            }],
+        };
+        let out = to_print_markdown(&bank).expect("renders");
+        assert!(out.contains("1. Which is O(1)?"));
+        assert!(out.contains("A. Hash lookup"));
+        assert!(out.contains("B. Linear scan"));
+        // No answer key: correctness must not leak into the sheet.
+        assert!(!out.contains("correct"));
+        assert!(!out.contains("[x]"));
+    }
+
+    #[test]
+    /// A multiple-select item renders blank checkboxes, one per option, no key.
+    fn renders_multiple_select_with_checkboxes() {
+        let choice = |text: &str, correct: bool| Choice {
+            text: text.to_owned(),
+            correct,
+        };
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "ms".to_owned(),
+                title: None,
+                prompt: "Select all sorted-input algorithms.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::MultipleSelect(ChoiceSet {
+                    choices: vec![
+                        choice("Binary search", true),
+                        choice("Linear search", false),
+                    ],
+                }),
+            }],
+        };
+        let out = to_print_markdown(&bank).expect("renders");
+        assert!(out.contains("- [ ] A. Binary search"));
+        assert!(out.contains("- [ ] B. Linear search"));
+        assert!(!out.contains("[x]"));
+    }
+
+    #[test]
+    /// Choice labels are letters up to Z, then fall back to 1-based numbers.
+    fn choice_labels_letter_then_number() {
+        assert_eq!(choice_label(0), "A");
+        assert_eq!(choice_label(25), "Z");
+        assert_eq!(choice_label(26), "27");
     }
 
     #[test]

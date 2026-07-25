@@ -89,6 +89,64 @@ answer: true
 Binary search requires its input array to be sorted.
 ```
 
-More types (multiple choice, multiple select, fill in the blank, matching,
-ordering) are rolled out one at a time; each will get its own samples folder
-here as it lands.
+### Multiple choice (`kind: multiple_choice`)
+
+A single-answer question. List the options under `choices` (order is preserved),
+and mark the one correct option with `correct: true`:
+
+```markdown
+---
+id: mc-binary-search-complexity
+title: Binary search complexity
+kind: multiple_choice
+choices:
+  - text: O(log n)
+    correct: true
+  - text: O(n)
+  - text: O(1)
+feedback:
+  correct: Right — each comparison halves the range.
+  incorrect: How much of the array is discarded per comparison?
+---
+
+What is the worst-case time complexity of binary search?
+```
+
+Rules (checked at parse time): at least two choices, and **exactly one** marked
+`correct`. Unlike true/false, Canvas New Quizzes *does* keep answer-level
+feedback for multiple choice, so `correct:`/`incorrect:` messages survive the
+item-bank import.
+
+### Multiple select (`kind: multiple_select`)
+
+"Choose all that apply" — the exact same `choices` shape as multiple choice, but
+**one or more** may be marked `correct`. Scored all-or-nothing in Canvas: the
+student must select every correct option and no incorrect one.
+
+```markdown
+---
+id: ms-sorted-input
+kind: multiple_select
+choices:
+  - text: Binary search
+    correct: true
+  - text: Linear search
+  - text: Interpolation search
+    correct: true
+---
+
+Select all algorithms that require sorted input.
+```
+
+Rules: at least two choices, and **at least one** marked `correct`.
+
+Remaining types (fill in the blank, matching, ordering) are rolled out one at a
+time; each will get its own samples folder here as it lands.
+
+## Canvas caveats
+
+- **True/false feedback:** New Quizzes only keeps *answer-level* feedback for
+  multiple choice. For true/false, `correct:`/`incorrect:` are dropped on
+  item-bank import (a Canvas limitation); only `general:` may survive.
+- **Tags** are for mdquiz-side organization only — they are never written into
+  the QTI, and Canvas would not import them anyway.

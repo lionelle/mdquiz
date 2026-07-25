@@ -82,9 +82,9 @@ pub enum QuestionKind {
     /// True/false question.
     TrueFalse(TrueFalse),
     /// Single-answer multiple choice.
-    MultipleChoice,
+    MultipleChoice(ChoiceSet),
     /// Multiple-answer ("select all that apply") multiple choice.
-    MultipleSelect,
+    MultipleSelect(ChoiceSet),
     /// Fill in the blank, matched by literal text or regular expression.
     FillInBlank,
     /// Match items in one column to items in another.
@@ -99,8 +99,8 @@ impl QuestionKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::TrueFalse(_) => "true/false",
-            Self::MultipleChoice => "multiple choice",
-            Self::MultipleSelect => "multiple select",
+            Self::MultipleChoice(_) => "multiple choice",
+            Self::MultipleSelect(_) => "multiple select",
             Self::FillInBlank => "fill in the blank",
             Self::Matching => "matching",
             Self::Ordering => "ordering",
@@ -126,6 +126,31 @@ pub struct TrueFalse {
     pub answer: bool,
 }
 
+/// One selectable option in a choice-based question.
+///
+/// The same shape backs both single-answer [`QuestionKind::MultipleChoice`] and
+/// multiple-answer [`QuestionKind::MultipleSelect`]; only how many choices may
+/// be `correct` differs between them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Choice {
+    /// The option's text, as authored Markdown.
+    pub text: String,
+    /// Whether selecting this option counts as a correct answer.
+    pub correct: bool,
+}
+
+/// The payload shared by the choice-based question types.
+///
+/// Backs both [`QuestionKind::MultipleChoice`] (single answer) and
+/// [`QuestionKind::MultipleSelect`] (choose all that apply); the choices are
+/// presented in order. How many may be `correct` is enforced when parsing:
+/// exactly one for multiple choice, one or more for multiple select.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceSet {
+    /// The options, in presentation order.
+    pub choices: Vec<Choice>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,8 +162,20 @@ mod tests {
             QuestionKind::TrueFalse(TrueFalse { answer: true }).label(),
             "true/false"
         );
-        assert_eq!(QuestionKind::MultipleChoice.label(), "multiple choice");
-        assert_eq!(QuestionKind::MultipleSelect.label(), "multiple select");
+        assert_eq!(
+            QuestionKind::MultipleChoice(ChoiceSet {
+                choices: Vec::new()
+            })
+            .label(),
+            "multiple choice"
+        );
+        assert_eq!(
+            QuestionKind::MultipleSelect(ChoiceSet {
+                choices: Vec::new()
+            })
+            .label(),
+            "multiple select"
+        );
         assert_eq!(QuestionKind::FillInBlank.label(), "fill in the blank");
         assert_eq!(QuestionKind::Matching.label(), "matching");
         assert_eq!(QuestionKind::Ordering.label(), "ordering");

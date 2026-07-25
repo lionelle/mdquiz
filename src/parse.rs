@@ -14,7 +14,51 @@ use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 use serde::Deserialize;
 
 use crate::Result;
-use crate::model::{Feedback, ItemBank, Question, QuestionKind, TrueFalse};
+use crate::model::{Choice, ChoiceSet, Feedback, ItemBank, Question, QuestionKind, TrueFalse};
+
+/// The metadata every question shares, flattened into each [`QuestionSpec`].
+#[derive(Debug, Deserialize)]
+struct CommonSpec {
+    /// Stable identifier, unique within the bank.
+    id: String,
+    /// Optional instructor-facing title (question name).
+    #[serde(default)]
+    title: Option<String>,
+    /// Points for a correct answer; defaults to one.
+    #[serde(default = "default_points")]
+    points: f64,
+    /// Optional organizational tags.
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Optional post-answer feedback.
+    #[serde(default)]
+    feedback: Feedback,
+}
+
+impl CommonSpec {
+    /// Attach the shared metadata to a `prompt` and `kind` to form a question.
+    fn into_question(self, prompt: String, kind: QuestionKind) -> Question {
+        Question {
+            id: self.id,
+            title: self.title,
+            prompt,
+            points: self.points,
+            tags: self.tags,
+            feedback: self.feedback,
+            kind,
+        }
+    }
+}
+
+/// One authored choice for a choice-based question.
+#[derive(Debug, Deserialize)]
+struct ChoiceSpec {
+    /// The option text, as authored Markdown.
+    text: String,
+    /// Whether this option is correct; defaults to false.
+    #[serde(default)]
+    correct: bool,
+}
 
 /// The authored YAML shape, tagged by `kind`, before the prompt is attached.
 ///
@@ -25,22 +69,27 @@ use crate::model::{Feedback, ItemBank, Question, QuestionKind, TrueFalse};
 enum QuestionSpec {
     /// A true/false question.
     TrueFalse {
-        /// Stable identifier, unique within the bank.
-        id: String,
-        /// Optional instructor-facing title (question name).
-        #[serde(default)]
-        title: Option<String>,
-        /// Points for a correct answer; defaults to one.
-        #[serde(default = "default_points")]
-        points: f64,
-        /// Optional organizational tags.
-        #[serde(default)]
-        tags: Vec<String>,
-        /// Optional post-answer feedback.
-        #[serde(default)]
-        feedback: Feedback,
+        /// The shared question metadata.
+        #[serde(flatten)]
+        common: CommonSpec,
         /// Whether the correct answer is "true".
         answer: bool,
+    },
+    /// A single-answer multiple-choice question.
+    MultipleChoice {
+        /// The shared question metadata.
+        #[serde(flatten)]
+        common: CommonSpec,
+        /// The options, in presentation order.
+        choices: Vec<ChoiceSpec>,
+    },
+    /// A multiple-answer ("select all that apply") question.
+    MultipleSelect {
+        /// The shared question metadata.
+        #[serde(flatten)]
+        common: CommonSpec,
+        /// The options, in presentation order.
+        choices: Vec<ChoiceSpec>,
     },
 }
 
@@ -53,24 +102,29 @@ impl QuestionSpec {
     /// Combine the YAML spec with its Markdown `prompt` into a [`Question`].
     fn into_question(self, prompt: String) -> Question {
         match self {
-            Self::TrueFalse {
-                id,
-                title,
-                points,
-                tags,
-                feedback,
-                answer,
-            } => Question {
-                id,
-                title,
-                prompt,
-                points,
-                tags,
-                feedback,
-                kind: QuestionKind::TrueFalse(TrueFalse { answer }),
-            },
+            Self::TrueFalse { common, answer } => {
+                common.into_question(prompt, QuestionKind::TrueFalse(TrueFalse { answer }))
+            }
+            Self::MultipleChoice { common, choices } => {
+                common.into_question(prompt, QuestionKind::MultipleChoice(choice_set(choices)))
+            }
+            Self::MultipleSelect { common, choices } => {
+                common.into_question(prompt, QuestionKind::MultipleSelect(choice_set(choices)))
+            }
         }
     }
+}
+
+/// Convert authored [`ChoiceSpec`]s into the model's [`ChoiceSet`].
+fn choice_set(choices: Vec<ChoiceSpec>) -> ChoiceSet {
+    let choices = choices
+        .into_iter()
+        .map(|choice| Choice {
+            text: choice.text,
+            correct: choice.correct,
+        })
+        .collect();
+    ChoiceSet { choices }
 }
 
 /// Parse the full text of one question source into a [`Question`].
@@ -97,7 +151,56 @@ pub fn parse_question(source: &str) -> Result<Question> {
             question.id
         )));
     }
+    validate_question(&question)?;
     Ok(question)
+}
+
+/// Check a parsed question against its kind's semantic rules.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] when a question is structurally
+/// valid but semantically incomplete (e.g. a multiple-choice item without
+/// exactly one correct choice).
+fn validate_question(question: &Question) -> Result<()> {
+    match &question.kind {
+        QuestionKind::MultipleChoice(set) => validate_choices(&question.id, &set.choices, false),
+        QuestionKind::MultipleSelect(set) => validate_choices(&question.id, &set.choices, true),
+        _ => Ok(()),
+    }
+}
+
+/// Validate a choice list: at least two options and the right number correct.
+///
+/// With `allow_multiple`, one or more choices may be correct; otherwise exactly
+/// one must be. Shared by multiple-choice and multiple-select.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming `id` when the rules fail.
+fn validate_choices(id: &str, choices: &[Choice], allow_multiple: bool) -> Result<()> {
+    if choices.len() < 2 {
+        return Err(crate::Error::InvalidQuestion(format!(
+            "question {id:?} needs at least two choices"
+        )));
+    }
+    let correct = choices.iter().filter(|choice| choice.correct).count();
+    let ok = if allow_multiple {
+        correct >= 1
+    } else {
+        correct == 1
+    };
+    if ok {
+        return Ok(());
+    }
+    let need = if allow_multiple {
+        "at least one correct choice"
+    } else {
+        "exactly one correct choice"
+    };
+    Err(crate::Error::InvalidQuestion(format!(
+        "question {id:?} needs {need}, found {correct}"
+    )))
 }
 
 /// Split a leading level-1 ATX heading (`# ...`) off the front of `prompt`.
@@ -268,6 +371,76 @@ mod tests {
     /// A well-formed true/false source: YAML front-matter then the prompt.
     const TRUE_FALSE_SOURCE: &str = "---\nid: tf-binary-search\nkind: true_false\nanswer: true\n\
         ---\n\nBinary search needs a sorted array.\n";
+
+    /// A well-formed single-answer multiple-choice source.
+    const MULTIPLE_CHOICE_SOURCE: &str = "---\nid: mc-q\nkind: multiple_choice\nchoices:\n\
+        \x20 - text: Right\n    correct: true\n  - text: Wrong\n  - text: Also wrong\n\
+        ---\n\nWhich one?\n";
+
+    #[test]
+    /// A multiple-choice source captures the ordered choices and the answer.
+    fn parses_multiple_choice() {
+        let question = parse_question(MULTIPLE_CHOICE_SOURCE).expect("valid source");
+        assert_eq!(question.id, "mc-q");
+        assert_eq!(question.prompt, "Which one?");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::MultipleChoice(mc)
+                if mc.choices.len() == 3
+                    && mc.choices.iter().filter(|choice| choice.correct).count() == 1
+                    && mc.choices.first().is_some_and(|choice| choice.correct)
+        ));
+    }
+
+    #[test]
+    /// A multiple-choice question with no correct choice is rejected.
+    fn multiple_choice_needs_a_correct_choice() {
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n  - text: A\n  - text: B\n\
+            ---\n\nPick?\n";
+        let err = parse_question(source).expect_err("no correct choice");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// A single-answer question with two correct choices is rejected.
+    fn multiple_choice_rejects_two_correct() {
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - text: A\n    correct: true\n  - text: B\n    correct: true\n---\n\nPick?\n";
+        let err = parse_question(source).expect_err("two correct choices");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// A multiple-choice question with fewer than two choices is rejected.
+    fn multiple_choice_needs_two_choices() {
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n  - text: Only\n    correct: true\n\
+            ---\n\nPick?\n";
+        let err = parse_question(source).expect_err("one choice");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    #[test]
+    /// A multiple-select source allows more than one correct choice.
+    fn parses_multiple_select_with_two_correct() {
+        let source = "---\nid: ms-q\nkind: multiple_select\nchoices:\n\
+            \x20 - text: A\n    correct: true\n  - text: B\n    correct: true\n  - text: C\n\
+            ---\n\nSelect all.\n";
+        let question = parse_question(source).expect("valid source");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::MultipleSelect(set)
+                if set.choices.iter().filter(|choice| choice.correct).count() == 2
+        ));
+    }
+
+    #[test]
+    /// A multiple-select question with no correct choice is rejected.
+    fn multiple_select_needs_a_correct_choice() {
+        let source = "---\nid: q\nkind: multiple_select\nchoices:\n  - text: A\n  - text: B\n\
+            ---\n\nSelect all.\n";
+        let err = parse_question(source).expect_err("no correct choice");
+        assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
 
     #[test]
     /// A true/false source yields the prompt, id, default points, and answer.

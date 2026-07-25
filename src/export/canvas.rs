@@ -10,6 +10,7 @@
 //! substitution; all authored text is escaped (prompts are first rendered from
 //! Markdown to HTML, then XML-escaped for embedding).
 
+use std::fmt::Write as _;
 use std::io::{Cursor, Write};
 
 use pulldown_cmark::{Parser, html};
@@ -17,7 +18,7 @@ use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
 use crate::Result;
-use crate::model::{Feedback, ItemBank, Question, QuestionKind, TrueFalse};
+use crate::model::{Choice, ChoiceSet, Feedback, ItemBank, Question, QuestionKind, TrueFalse};
 
 /// The `response_label` ident for the "True" choice; fills the item template.
 const TRUE_CHOICE_IDENT: &str = "true_choice";
@@ -105,22 +106,89 @@ const GENERAL_CONDITION: &str = r#"          <respcondition continue="Yes">
 {{FEEDBACK}}          </respcondition>
 "#;
 
-/// The scoring condition; `{{CORRECT_FEEDBACK}}` is a display line or empty.
+/// The scoring condition; `{{CONDITIONVAR}}` is the correct-answer match and
+/// `{{CORRECT_FEEDBACK}}` is a display line or empty.
 const SCORING_CONDITION: &str = r#"          <respcondition continue="No">
-            <conditionvar>
-              <varequal respident="response1">{{CORRECT}}</varequal>
-            </conditionvar>
-            <setvar action="Set" varname="SCORE">100</setvar>
+{{CONDITIONVAR}}            <setvar action="Set" varname="SCORE">100</setvar>
 {{CORRECT_FEEDBACK}}          </respcondition>
 "#;
 
-/// The condition that shows incorrect feedback on the wrong choice;
-/// `{{FEEDBACK}}` is a display-link line built from the ident const.
-const INCORRECT_CONDITION: &str = r#"          <respcondition continue="No">
-            <conditionvar>
-              <varequal respident="response1">{{INCORRECT}}</varequal>
+/// A feedback-only condition; `{{CONDITIONVAR}}` is the match and `{{FEEDBACK}}`
+/// a display-link line. Used for the incorrect-answer arm.
+const FEEDBACK_CONDITION: &str = r#"          <respcondition continue="No">
+{{CONDITIONVAR}}{{FEEDBACK}}          </respcondition>
+"#;
+
+/// A `<conditionvar>` matching a single response ident (`{{IDENT}}`).
+const VAREQUAL_CONDITIONVAR: &str = r#"            <conditionvar>
+              <varequal respident="response1">{{IDENT}}</varequal>
             </conditionvar>
-{{FEEDBACK}}          </respcondition>
+"#;
+
+/// A `<conditionvar>` matching anything *but* a single response ident.
+const NOT_VAREQUAL_CONDITIONVAR: &str = r#"            <conditionvar>
+              <not>
+                <varequal respident="response1">{{IDENT}}</varequal>
+              </not>
+            </conditionvar>
+"#;
+
+/// A `<conditionvar>` matching the exact multi-answer set (`{{TERMS}}`).
+const AND_CONDITIONVAR: &str = r"            <conditionvar>
+              <and>
+{{TERMS}}              </and>
+            </conditionvar>
+";
+
+/// A `<conditionvar>` matching anything *but* the exact multi-answer set.
+const NOT_AND_CONDITIONVAR: &str = r"            <conditionvar>
+              <not>
+                <and>
+{{TERMS}}                </and>
+              </not>
+            </conditionvar>
+";
+
+/// The Canvas question type for a single-answer multiple-choice item.
+const MC_QUESTION_TYPE: &str = "multiple_choice_question";
+/// The Canvas question type for a multiple-answer item.
+const MS_QUESTION_TYPE: &str = "multiple_answers_question";
+/// The `rcardinality` for a single-answer response.
+const CARDINALITY_SINGLE: &str = "Single";
+/// The `rcardinality` for a multiple-answer response.
+const CARDINALITY_MULTIPLE: &str = "Multiple";
+
+/// A choice-based QTI item shared by multiple choice and multiple select;
+/// `{{QUESTION_TYPE}}`, `{{RCARDINALITY}}`, and `{{CHOICES}}` are per-type.
+const CHOICE_ITEM_TEMPLATE: &str = r#"      <item ident="{{ITEM_IDENT}}" title="{{ITEM_TITLE}}">
+        <itemmetadata>
+          <qtimetadata>
+            <qtimetadatafield>
+              <fieldlabel>question_type</fieldlabel>
+              <fieldentry>{{QUESTION_TYPE}}</fieldentry>
+            </qtimetadatafield>
+            <qtimetadatafield>
+              <fieldlabel>points_possible</fieldlabel>
+              <fieldentry>{{POINTS}}</fieldentry>
+            </qtimetadatafield>
+          </qtimetadata>
+        </itemmetadata>
+        <presentation>
+          <material>
+            <mattext texttype="text/html">{{PROMPT}}</mattext>
+          </material>
+          <response_lid ident="response1" rcardinality="{{RCARDINALITY}}">
+            <render_choice>
+{{CHOICES}}            </render_choice>
+          </response_lid>
+        </presentation>
+{{RESPROCESSING}}{{ITEMFEEDBACK}}      </item>
+"#;
+
+/// One `<response_label>` option in a choice-based question.
+const RESPONSE_LABEL_TEMPLATE: &str = r#"              <response_label ident="{{CHOICE_IDENT}}">
+                <material><mattext texttype="text/html">{{CHOICE_TEXT}}</mattext></material>
+              </response_label>
 "#;
 
 /// A single feedback display link; `{{IDENT}}` names the `<itemfeedback>` it
@@ -187,6 +255,8 @@ fn assessment_xml(ident: &str, bank: &ItemBank) -> Result<String> {
 fn item_xml(question: &Question) -> Result<String> {
     match &question.kind {
         QuestionKind::TrueFalse(answer) => Ok(true_false_item_xml(question, answer)),
+        QuestionKind::MultipleChoice(set) => Ok(multiple_choice_item_xml(question, set)),
+        QuestionKind::MultipleSelect(set) => Ok(multiple_select_item_xml(question, set)),
         other => Err(other.unsupported_by("Canvas", &question.id)),
     }
 }
@@ -198,25 +268,145 @@ fn true_false_item_xml(question: &Question, answer: &TrueFalse) -> String {
     } else {
         (FALSE_CHOICE_IDENT, TRUE_CHOICE_IDENT)
     };
+    let presentation = TRUE_FALSE_ITEM_TEMPLATE
+        .replace("{{TRUE_IDENT}}", TRUE_CHOICE_IDENT)
+        .replace("{{FALSE_IDENT}}", FALSE_CHOICE_IDENT);
+    // The wrong answer is the single other choice.
+    let correct_cv = varequal_conditionvar(correct);
+    let incorrect_cv = varequal_conditionvar(incorrect);
+    fill_item_shell(&presentation, question, &correct_cv, &incorrect_cv)
+}
+
+/// Render a single-answer multiple-choice item.
+fn multiple_choice_item_xml(question: &Question, set: &ChoiceSet) -> String {
+    let correct = correct_choice_ident(&set.choices);
+    let presentation = choice_presentation(MC_QUESTION_TYPE, CARDINALITY_SINGLE, &set.choices);
+    // Anything other than the correct choice is wrong.
+    let correct_cv = varequal_conditionvar(&correct);
+    let incorrect_cv = not_varequal_conditionvar(&correct);
+    fill_item_shell(&presentation, question, &correct_cv, &incorrect_cv)
+}
+
+/// Render a multiple-answer item, scored all-or-nothing on the exact set.
+fn multiple_select_item_xml(question: &Question, set: &ChoiceSet) -> String {
+    let presentation = choice_presentation(MS_QUESTION_TYPE, CARDINALITY_MULTIPLE, &set.choices);
+    // A correct answer selects every correct option and no incorrect one.
+    let correct_cv = and_conditionvar(&set.choices);
+    let incorrect_cv = not_and_conditionvar(&set.choices);
+    fill_item_shell(&presentation, question, &correct_cv, &incorrect_cv)
+}
+
+/// Fill the shared choice-item template with its per-type presentation fields.
+fn choice_presentation(question_type: &str, cardinality: &str, choices: &[Choice]) -> String {
+    CHOICE_ITEM_TEMPLATE
+        .replace("{{QUESTION_TYPE}}", question_type)
+        .replace("{{RCARDINALITY}}", cardinality)
+        // `{{CHOICES}}` is filled last so choice text cannot collide with a
+        // placeholder above.
+        .replace("{{CHOICES}}", &choices_xml(choices))
+}
+
+/// Fill the shared item shell (metadata, scoring, feedback, prompt) around a
+/// per-type presentation.
+///
+/// `correct_cv`/`incorrect_cv` are the `<conditionvar>` blocks for a right and
+/// wrong answer. The presentation-specific placeholders are already resolved in
+/// `template`; `{{PROMPT}}` is substituted last so authored text is not
+/// re-scanned.
+fn fill_item_shell(
+    template: &str,
+    question: &Question,
+    correct_cv: &str,
+    incorrect_cv: &str,
+) -> String {
     let title = question.title.as_deref().unwrap_or(&question.id);
     let feedback = &question.feedback;
-    // `{{PROMPT}}` is substituted last so authored text is never re-scanned.
-    TRUE_FALSE_ITEM_TEMPLATE
-        .replace("{{TRUE_IDENT}}", TRUE_CHOICE_IDENT)
-        .replace("{{FALSE_IDENT}}", FALSE_CHOICE_IDENT)
+    template
         .replace("{{ITEM_IDENT}}", &sanitize_ident(&question.id))
         .replace("{{ITEM_TITLE}}", &escape_xml(title))
         .replace("{{POINTS}}", &question.points.to_string())
         .replace(
             "{{RESPROCESSING}}",
-            &resprocessing_xml(correct, incorrect, feedback),
+            &resprocessing_xml(correct_cv, incorrect_cv, feedback),
         )
         .replace("{{ITEMFEEDBACK}}", &itemfeedback_xml(feedback))
         .replace("{{PROMPT}}", &escaped_html(&question.prompt))
 }
 
+/// The generated `response_label` ident for the choice at `index`.
+fn choice_ident(index: usize) -> String {
+    format!("choice_{index}")
+}
+
+/// The ident of the first correct choice, for scoring (falls back to `choice_0`).
+fn correct_choice_ident(choices: &[Choice]) -> String {
+    let index = choices
+        .iter()
+        .position(|choice| choice.correct)
+        .unwrap_or(0);
+    choice_ident(index)
+}
+
+/// Render the `<response_label>` list for a choice-based question.
+fn choices_xml(choices: &[Choice]) -> String {
+    let mut out = String::new();
+    for (index, choice) in choices.iter().enumerate() {
+        out.push_str(
+            &RESPONSE_LABEL_TEMPLATE
+                .replace("{{CHOICE_IDENT}}", &choice_ident(index))
+                .replace("{{CHOICE_TEXT}}", &escaped_html(&choice.text)),
+        );
+    }
+    out
+}
+
+/// A `<conditionvar>` matching a single response ident.
+fn varequal_conditionvar(ident: &str) -> String {
+    VAREQUAL_CONDITIONVAR.replace("{{IDENT}}", ident)
+}
+
+/// A `<conditionvar>` matching anything but a single response ident.
+fn not_varequal_conditionvar(ident: &str) -> String {
+    NOT_VAREQUAL_CONDITIONVAR.replace("{{IDENT}}", ident)
+}
+
+/// A `<conditionvar>` matching the exact set of correct/incorrect choices.
+fn and_conditionvar(choices: &[Choice]) -> String {
+    AND_CONDITIONVAR.replace("{{TERMS}}", &correctness_terms(choices))
+}
+
+/// A `<conditionvar>` matching anything but the exact correct/incorrect set.
+fn not_and_conditionvar(choices: &[Choice]) -> String {
+    NOT_AND_CONDITIONVAR.replace("{{TERMS}}", &correctness_terms(choices))
+}
+
+/// One `<varequal>`/`<not>` term per choice: selected iff correct.
+fn correctness_terms(choices: &[Choice]) -> String {
+    let mut out = String::new();
+    for (index, choice) in choices.iter().enumerate() {
+        let ident = choice_ident(index);
+        // Writing to a `String` is infallible, so the result is discarded.
+        let _ = if choice.correct {
+            writeln!(
+                out,
+                "                <varequal respident=\"response1\">{ident}</varequal>"
+            )
+        } else {
+            writeln!(
+                out,
+                "                <not><varequal respident=\"response1\">{ident}</varequal></not>"
+            )
+        };
+    }
+    out
+}
+
 /// Build the resprocessing block: scoring plus any feedback display arms.
-fn resprocessing_xml(correct: &str, incorrect: &str, feedback: &Feedback) -> String {
+///
+/// `correct_cv`/`incorrect_cv` are the `<conditionvar>` blocks for a right and
+/// wrong answer; the incorrect arm is emitted only when incorrect feedback is
+/// present.
+fn resprocessing_xml(correct_cv: &str, incorrect_cv: &str, feedback: &Feedback) -> String {
     let mut conditions = String::new();
     if feedback.general.is_some() {
         conditions.push_str(
@@ -230,13 +420,13 @@ fn resprocessing_xml(correct: &str, incorrect: &str, feedback: &Feedback) -> Str
     };
     conditions.push_str(
         &SCORING_CONDITION
-            .replace("{{CORRECT}}", correct)
+            .replace("{{CONDITIONVAR}}", correct_cv)
             .replace("{{CORRECT_FEEDBACK}}", &correct_feedback),
     );
     if feedback.incorrect.is_some() {
         conditions.push_str(
-            &INCORRECT_CONDITION
-                .replace("{{INCORRECT}}", incorrect)
+            &FEEDBACK_CONDITION
+                .replace("{{CONDITIONVAR}}", incorrect_cv)
                 .replace("{{FEEDBACK}}", &display_feedback(INCORRECT_FB_IDENT)),
         );
     }
@@ -351,6 +541,180 @@ mod tests {
                 kind: QuestionKind::TrueFalse(TrueFalse { answer }),
             }],
         }
+    }
+
+    /// Build a one-question multiple-choice bank; `correct` marks which of the
+    /// three options is right.
+    fn multiple_choice_bank(correct: usize, feedback: Feedback) -> ItemBank {
+        let choices = (0..3usize)
+            .map(|index| Choice {
+                text: format!("Option {index}"),
+                correct: index == correct,
+            })
+            .collect();
+        ItemBank {
+            name: "Module 1".to_owned(),
+            items: vec![Question {
+                id: "mc-1".to_owned(),
+                title: None,
+                prompt: "Pick one.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback,
+                kind: QuestionKind::MultipleChoice(ChoiceSet { choices }),
+            }],
+        }
+    }
+
+    #[test]
+    /// A multiple-choice item renders single-select choices and scores the mark.
+    fn multiple_choice_renders_and_scores_marked_choice() {
+        let xml = assessment_xml("a", &multiple_choice_bank(2, Feedback::default()))
+            .expect("assessment renders");
+        assert!(xml.contains("multiple_choice_question"));
+        assert!(xml.contains(r#"rcardinality="Single""#));
+        assert!(xml.contains(r#"<response_label ident="choice_0">"#));
+        assert!(xml.contains(r#"<response_label ident="choice_2">"#));
+        assert!(xml.contains("Option 1"));
+        // The correct choice (index 2) is the 100-point response.
+        assert!(xml.contains(r#"<varequal respident="response1">choice_2</varequal>"#));
+        // No incorrect feedback here, so no `<not>` arm is emitted.
+        assert!(!xml.contains("<not>"));
+    }
+
+    #[test]
+    /// A multiple-select item uses Multiple cardinality and all-or-nothing
+    /// scoring: select every correct option and no incorrect one.
+    fn multiple_select_uses_multiple_cardinality_and_and_scoring() {
+        let choice = |text: &str, correct: bool| Choice {
+            text: text.to_owned(),
+            correct,
+        };
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "ms".to_owned(),
+                title: None,
+                prompt: "Select all.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::MultipleSelect(ChoiceSet {
+                    choices: vec![choice("A", true), choice("B", false), choice("C", true)],
+                }),
+            }],
+        };
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("multiple_answers_question"));
+        assert!(xml.contains(r#"rcardinality="Multiple""#));
+        assert!(xml.contains("<and>"));
+        assert!(xml.contains(r#"<varequal respident="response1">choice_0</varequal>"#));
+        assert!(xml.contains(r#"<varequal respident="response1">choice_2</varequal>"#));
+        assert!(xml.contains(r#"<not><varequal respident="response1">choice_1</varequal></not>"#));
+    }
+
+    /// Build a multiple-select bank from `(text, correct)` pairs and feedback.
+    fn multiple_select_bank(choices: &[(&str, bool)], feedback: Feedback) -> ItemBank {
+        let choices = choices
+            .iter()
+            .map(|(text, correct)| Choice {
+                text: (*text).to_owned(),
+                correct: *correct,
+            })
+            .collect();
+        ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "ms".to_owned(),
+                title: None,
+                prompt: "Select all.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback,
+                kind: QuestionKind::MultipleSelect(ChoiceSet { choices }),
+            }],
+        }
+    }
+
+    #[test]
+    /// Multiple-select incorrect feedback wraps the exact set in `<not><and>`.
+    fn multiple_select_incorrect_feedback_uses_not_and_condition() {
+        let feedback = Feedback {
+            general: Some("Recall which need ordering.".to_owned()),
+            correct: Some("Yes.".to_owned()),
+            incorrect: Some("No.".to_owned()),
+        };
+        let bank = multiple_select_bank(&[("A", true), ("B", false), ("C", true)], feedback);
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("<not>"));
+        assert!(xml.contains("<and>"));
+        assert!(xml.contains(r#"linkrefid="incorrect_fb""#));
+        assert!(xml.contains(r#"<itemfeedback ident="correct_fb">"#));
+        assert!(xml.contains(r#"<itemfeedback ident="general_fb">"#));
+    }
+
+    #[test]
+    /// An all-correct multiple-select emits only `<varequal>` terms, no `<not>`.
+    fn multiple_select_all_correct_has_no_not_terms() {
+        let bank = multiple_select_bank(&[("A", true), ("B", true)], Feedback::default());
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains(r#"<varequal respident="response1">choice_0</varequal>"#));
+        assert!(xml.contains(r#"<varequal respident="response1">choice_1</varequal>"#));
+        assert!(!xml.contains("<not>"));
+    }
+
+    #[test]
+    /// XML-special characters in choice text are escaped, not emitted raw.
+    fn multiple_choice_escapes_choice_text() {
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "mc".to_owned(),
+                title: None,
+                prompt: "Pick.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::MultipleChoice(ChoiceSet {
+                    choices: vec![
+                        Choice {
+                            text: "a < b & c".to_owned(),
+                            correct: true,
+                        },
+                        Choice {
+                            text: "plain".to_owned(),
+                            correct: false,
+                        },
+                    ],
+                }),
+            }],
+        };
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("&lt;"));
+        assert!(xml.contains("&amp;"));
+        assert!(!xml.contains("a < b"));
+    }
+
+    #[test]
+    /// Incorrect feedback on a multiple-choice item uses a `<not>` condition.
+    fn multiple_choice_incorrect_feedback_uses_not_condition() {
+        let feedback = Feedback {
+            general: None,
+            correct: Some("Yes.".to_owned()),
+            incorrect: Some("No.".to_owned()),
+        };
+        let xml = assessment_xml("a", &multiple_choice_bank(1, feedback)).expect("renders");
+        assert!(xml.contains("<not>"));
+        assert!(xml.contains(r#"linkrefid="incorrect_fb""#));
+        assert!(xml.contains(r#"<itemfeedback ident="correct_fb">"#));
+    }
+
+    #[test]
+    /// A multiple-choice bank exports as a valid two-file zip package.
+    fn multiple_choice_exports_valid_zip() {
+        let bytes = to_qti(&multiple_choice_bank(0, Feedback::default())).expect("export");
+        let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
+        assert_eq!(archive.len(), 2);
     }
 
     #[test]
@@ -491,7 +855,8 @@ mod tests {
             correct: None,
             incorrect: None,
         };
-        let xml = resprocessing_xml(TRUE_CHOICE_IDENT, FALSE_CHOICE_IDENT, &feedback);
+        // No incorrect feedback, so the incorrect conditionvar is unused (empty).
+        let xml = resprocessing_xml(&varequal_conditionvar(TRUE_CHOICE_IDENT), "", &feedback);
         assert!(xml.contains(r#"continue="Yes""#));
         assert!(xml.contains("<other/>"));
         assert!(xml.contains(r#"linkrefid="general_fb""#));
@@ -503,13 +868,16 @@ mod tests {
     /// A false answer attaches correct feedback to the false choice, and the
     /// incorrect arm to the true choice.
     fn false_answer_swaps_feedback_choices() {
-        let feedback = Feedback {
-            general: None,
-            correct: Some("Right.".to_owned()),
-            incorrect: Some("Wrong.".to_owned()),
-        };
-        // answer == false => (correct, incorrect) = (false_choice, true_choice).
-        let xml = resprocessing_xml(FALSE_CHOICE_IDENT, TRUE_CHOICE_IDENT, &feedback);
+        let mut bank = true_false_bank(false, "Q?");
+        if let Some(item) = bank.items.first_mut() {
+            item.feedback = Feedback {
+                general: None,
+                correct: Some("Right.".to_owned()),
+                incorrect: Some("Wrong.".to_owned()),
+            };
+        }
+        let xml = assessment_xml("a", &bank).expect("renders");
+        // answer == false => correct scores false_choice, incorrect arm hits true.
         assert!(xml.contains(r#"<varequal respident="response1">false_choice</varequal>"#));
         assert!(xml.contains(r#"<varequal respident="response1">true_choice</varequal>"#));
         assert!(xml.contains(r#"linkrefid="correct_fb""#));
