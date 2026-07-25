@@ -1,6 +1,7 @@
 ---
 id: ms-primes
 kind: multiple_select
+scoring: partial
 tags: [math]
 choices:
   - text: "2"

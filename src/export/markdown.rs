@@ -98,8 +98,8 @@ fn choice_label(index: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::{
-        Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, Question,
-        QuestionKind, TrueFalse,
+        Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MultipleSelect,
+        Question, QuestionKind, ScoringMode, TrueFalse,
     };
 
     /// Build a one-question true/false bank for rendering tests.
@@ -232,7 +232,8 @@ mod tests {
                 points: 1.0,
                 tags: Vec::new(),
                 feedback: Feedback::default(),
-                kind: QuestionKind::MultipleSelect(ChoiceSet {
+                kind: QuestionKind::MultipleSelect(MultipleSelect {
+                    scoring: ScoringMode::AllOrNothing,
                     choices: vec![
                         choice("Binary search", true),
                         choice("Linear search", false),

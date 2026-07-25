@@ -82,7 +82,7 @@ pub enum QuestionKind {
     /// Single-answer multiple choice.
     MultipleChoice(ChoiceSet),
     /// Multiple-answer ("select all that apply") multiple choice.
-    MultipleSelect(ChoiceSet),
+    MultipleSelect(MultipleSelect),
     /// Fill in the blank: one or more inline blanks, each matched against a
     /// list of acceptable answers (literal text or, per the blank's match
     /// mode, regex patterns).
@@ -139,16 +139,39 @@ pub struct Choice {
     pub correct: bool,
 }
 
-/// The payload shared by the choice-based question types.
+/// The payload for a [`QuestionKind::MultipleChoice`] question.
 ///
-/// Backs both [`QuestionKind::MultipleChoice`] (single answer) and
-/// [`QuestionKind::MultipleSelect`] (choose all that apply); the choices are
-/// presented in order. How many may be `correct` is enforced when parsing:
-/// exactly one for multiple choice, one or more for multiple select.
+/// The choices are presented in order; exactly one is `correct`, enforced when
+/// parsing. (Multiple-select uses its own [`MultipleSelect`] payload.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceSet {
     /// The options, in presentation order.
     pub choices: Vec<Choice>,
+}
+
+/// The payload for a [`QuestionKind::MultipleSelect`] question.
+///
+/// A "choose all that apply" question: one or more choices are correct, and the
+/// selection is graded per [`MultipleSelect::scoring`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipleSelect {
+    /// The options, in presentation order.
+    pub choices: Vec<Choice>,
+    /// How the selection is scored.
+    pub scoring: ScoringMode,
+}
+
+/// How a multiple-select ("choose all that apply") question is graded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringMode {
+    /// Full marks only when every correct option and no incorrect option is
+    /// selected. The default.
+    #[default]
+    AllOrNothing,
+    /// Each correct selection adds an even share of the marks; each incorrect
+    /// selection subtracts one (the total is clamped to zero).
+    Partial,
 }
 
 /// The payload for a [`QuestionKind::FillInBlank`] question.
@@ -248,8 +271,9 @@ mod tests {
             "multiple choice"
         );
         assert_eq!(
-            QuestionKind::MultipleSelect(ChoiceSet {
-                choices: Vec::new()
+            QuestionKind::MultipleSelect(MultipleSelect {
+                choices: Vec::new(),
+                scoring: ScoringMode::AllOrNothing,
             })
             .label(),
             "multiple select"

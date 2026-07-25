@@ -15,8 +15,8 @@ use serde::Deserialize;
 
 use crate::Result;
 use crate::model::{
-    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, Question, QuestionKind,
-    TrueFalse, blank_markers,
+    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MultipleSelect, Question,
+    QuestionKind, ScoringMode, TrueFalse, blank_markers,
 };
 
 /// The metadata every question shares, flattened into each [`QuestionSpec`].
@@ -133,6 +133,9 @@ enum QuestionSpec {
         common: CommonSpec,
         /// The options, in presentation order.
         choices: Vec<ChoiceSpec>,
+        /// How the selection is scored; defaults to all-or-nothing.
+        #[serde(default)]
+        scoring: ScoringMode,
     },
     /// A fill-in-the-blank question with inline `{{name}}` blanks.
     FillInBlank {
@@ -159,8 +162,16 @@ impl QuestionSpec {
             Self::MultipleChoice { common, choices } => {
                 common.into_question(prompt, QuestionKind::MultipleChoice(choice_set(choices)))
             }
-            Self::MultipleSelect { common, choices } => {
-                common.into_question(prompt, QuestionKind::MultipleSelect(choice_set(choices)))
+            Self::MultipleSelect {
+                common,
+                choices,
+                scoring,
+            } => {
+                let select = MultipleSelect {
+                    choices: choices_vec(choices),
+                    scoring,
+                };
+                common.into_question(prompt, QuestionKind::MultipleSelect(select))
             }
             Self::FillInBlank { common, blanks } => {
                 common.into_question(prompt, QuestionKind::FillInBlank(fill_in_blank(blanks)))
@@ -169,16 +180,22 @@ impl QuestionSpec {
     }
 }
 
-/// Convert authored [`ChoiceSpec`]s into the model's [`ChoiceSet`].
-fn choice_set(choices: Vec<ChoiceSpec>) -> ChoiceSet {
-    let choices = choices
+/// Convert authored [`ChoiceSpec`]s into model [`Choice`]s.
+fn choices_vec(choices: Vec<ChoiceSpec>) -> Vec<Choice> {
+    choices
         .into_iter()
         .map(|choice| Choice {
             text: choice.text,
             correct: choice.correct,
         })
-        .collect();
-    ChoiceSet { choices }
+        .collect()
+}
+
+/// Convert authored [`ChoiceSpec`]s into the model's [`ChoiceSet`].
+fn choice_set(choices: Vec<ChoiceSpec>) -> ChoiceSet {
+    ChoiceSet {
+        choices: choices_vec(choices),
+    }
 }
 
 /// Convert the authored blank map into a [`FillInBlank`] payload.
@@ -535,8 +552,21 @@ mod tests {
         let question = parse_question(source).expect("valid source");
         assert!(matches!(
             &question.kind,
-            QuestionKind::MultipleSelect(set)
-                if set.choices.iter().filter(|choice| choice.correct).count() == 2
+            QuestionKind::MultipleSelect(select)
+                if select.choices.iter().filter(|choice| choice.correct).count() == 2
+                    && select.scoring == ScoringMode::AllOrNothing
+        ));
+    }
+
+    #[test]
+    /// An explicit `scoring: partial` is captured; it otherwise defaults.
+    fn parses_multiple_select_partial_scoring() {
+        let source = "---\nid: q\nkind: multiple_select\nscoring: partial\nchoices:\n\
+            \x20 - text: A\n    correct: true\n  - text: B\n---\n\nSelect all.\n";
+        let question = parse_question(source).expect("valid source");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::MultipleSelect(select) if select.scoring == ScoringMode::Partial
         ));
     }
 

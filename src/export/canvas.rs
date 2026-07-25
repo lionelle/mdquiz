@@ -19,8 +19,8 @@ use zip::write::SimpleFileOptions;
 
 use crate::Result;
 use crate::model::{
-    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, Question, QuestionKind,
-    TrueFalse,
+    Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MultipleSelect, Question,
+    QuestionKind, ScoringMode, TrueFalse,
 };
 
 /// The `response_label` ident for the "True" choice; fills the item template.
@@ -152,6 +152,16 @@ const NOT_AND_CONDITIONVAR: &str = r"            <conditionvar>
             </conditionvar>
 ";
 
+/// One partial-credit arm: selecting choice `{{IDENT}}` adjusts the score by
+/// `{{VALUE}}` via `{{ACTION}}` (`Add` for correct, `Subtract` for incorrect).
+const PARTIAL_CONDITION: &str = r#"          <respcondition continue="Yes">
+            <conditionvar>
+              <varequal respident="response1">{{IDENT}}</varequal>
+            </conditionvar>
+            <setvar action="{{ACTION}}" varname="SCORE">{{VALUE}}</setvar>
+          </respcondition>
+"#;
+
 /// The Canvas question type for a single-answer multiple-choice item.
 const MC_QUESTION_TYPE: &str = "multiple_choice_question";
 /// The Canvas question type for a multiple-answer item.
@@ -160,6 +170,10 @@ const MS_QUESTION_TYPE: &str = "multiple_answers_question";
 const CARDINALITY_SINGLE: &str = "Single";
 /// The `rcardinality` for a multiple-answer response.
 const CARDINALITY_MULTIPLE: &str = "Multiple";
+/// The `<setvar>` action that adds to the score (correct partial-credit choice).
+const SETVAR_ADD: &str = "Add";
+/// The `<setvar>` action that subtracts (incorrect partial-credit choice).
+const SETVAR_SUBTRACT: &str = "Subtract";
 
 /// A choice-based QTI item shared by multiple choice and multiple select;
 /// `{{QUESTION_TYPE}}`, `{{RCARDINALITY}}`, and `{{CHOICES}}` are per-type.
@@ -370,13 +384,46 @@ fn multiple_choice_item_xml(question: &Question, set: &ChoiceSet) -> String {
     fill_item_shell(&presentation, question, &correct_cv, &incorrect_cv)
 }
 
-/// Render a multiple-answer item, scored all-or-nothing on the exact set.
-fn multiple_select_item_xml(question: &Question, set: &ChoiceSet) -> String {
-    let presentation = choice_presentation(MS_QUESTION_TYPE, CARDINALITY_MULTIPLE, &set.choices);
-    // A correct answer selects every correct option and no incorrect one.
-    let correct_cv = and_conditionvar(&set.choices);
-    let incorrect_cv = not_and_conditionvar(&set.choices);
-    fill_item_shell(&presentation, question, &correct_cv, &incorrect_cv)
+/// Render a multiple-answer item, scored per its [`ScoringMode`].
+fn multiple_select_item_xml(question: &Question, select: &MultipleSelect) -> String {
+    let presentation = choice_presentation(MS_QUESTION_TYPE, CARDINALITY_MULTIPLE, &select.choices);
+    match select.scoring {
+        ScoringMode::AllOrNothing => {
+            // Full marks only for the exact set: every correct, no incorrect.
+            let correct_cv = and_conditionvar(&select.choices);
+            let incorrect_cv = not_and_conditionvar(&select.choices);
+            fill_item_shell(&presentation, question, &correct_cv, &incorrect_cv)
+        }
+        ScoringMode::Partial => fill_choice_item(
+            &presentation,
+            question,
+            &partial_resprocessing_xml(&select.choices, &question.feedback),
+            &general_itemfeedback_xml(&question.feedback),
+        ),
+    }
+}
+
+/// Build partial-credit resprocessing: each correct choice adds an even share,
+/// each incorrect choice subtracts one; the outcome is clamped to zero.
+fn partial_resprocessing_xml(choices: &[Choice], feedback: &Feedback) -> String {
+    let correct = choices.iter().filter(|choice| choice.correct).count();
+    let add = even_share_score(correct);
+    let subtract = even_share_score(choices.len() - correct);
+    let mut conditions = general_condition_xml(feedback);
+    for (index, choice) in choices.iter().enumerate() {
+        let (action, value) = if choice.correct {
+            (SETVAR_ADD, &add)
+        } else {
+            (SETVAR_SUBTRACT, &subtract)
+        };
+        conditions.push_str(
+            &PARTIAL_CONDITION
+                .replace("{{IDENT}}", &choice_ident(index))
+                .replace("{{ACTION}}", action)
+                .replace("{{VALUE}}", value),
+        );
+    }
+    RESPROCESSING_TEMPLATE.replace("{{CONDITIONS}}", &conditions)
 }
 
 /// Fill the shared choice-item template with its per-type presentation fields.
@@ -457,7 +504,7 @@ fn blank_labels_xml(blank: &Blank) -> String {
 /// Render the scoring conditions: general feedback plus per-blank partial credit.
 fn blank_conditions_xml(blanks: &[&Blank], feedback: &Feedback) -> String {
     let mut out = general_condition_xml(feedback);
-    let per_blank = per_blank_score(blanks.len());
+    let per_blank = even_share_score(blanks.len());
     for blank in blanks {
         for index in 0..blank.answers.len() {
             out.push_str(
@@ -471,11 +518,12 @@ fn blank_conditions_xml(blanks: &[&Blank], feedback: &Feedback) -> String {
     out
 }
 
-/// The percentage each blank contributes, split evenly across the blanks.
+/// An even `1/count` share of 100%, as a two-decimal string.
 ///
-/// Clamped to at least one blank so the divisor is never zero (an empty or
-/// absurdly large blank set falls back to full credit).
-fn per_blank_score(count: usize) -> String {
+/// Used for per-blank fill-in-the-blank credit and per-choice partial credit.
+/// Clamped to at least one so the divisor is never zero (an empty or absurdly
+/// large `count` falls back to full credit).
+fn even_share_score(count: usize) -> String {
     let count = u16::try_from(count).map_or(1.0, f64::from).max(1.0);
     format!("{:.2}", 100.0 / count)
 }
@@ -507,12 +555,27 @@ fn fill_item_shell(
     incorrect_cv: &str,
 ) -> String {
     let feedback = &question.feedback;
+    let resprocessing = resprocessing_xml(correct_cv, incorrect_cv, feedback);
+    fill_choice_item(
+        template,
+        question,
+        &resprocessing,
+        &itemfeedback_xml(feedback),
+    )
+}
+
+/// Fill the shared choice-item body: resprocessing, itemfeedback, then prompt.
+///
+/// `{{PROMPT}}` is substituted last so authored text is never re-scanned.
+fn fill_choice_item(
+    template: &str,
+    question: &Question,
+    resprocessing: &str,
+    itemfeedback: &str,
+) -> String {
     fill_item_header(template, question)
-        .replace(
-            "{{RESPROCESSING}}",
-            &resprocessing_xml(correct_cv, incorrect_cv, feedback),
-        )
-        .replace("{{ITEMFEEDBACK}}", &itemfeedback_xml(feedback))
+        .replace("{{RESPROCESSING}}", resprocessing)
+        .replace("{{ITEMFEEDBACK}}", itemfeedback)
         .replace("{{PROMPT}}", &escaped_html(&question.prompt))
 }
 
@@ -801,7 +864,8 @@ mod tests {
                 points: 1.0,
                 tags: Vec::new(),
                 feedback: Feedback::default(),
-                kind: QuestionKind::MultipleSelect(ChoiceSet {
+                kind: QuestionKind::MultipleSelect(MultipleSelect {
+                    scoring: ScoringMode::AllOrNothing,
                     choices: vec![choice("A", true), choice("B", false), choice("C", true)],
                 }),
             }],
@@ -816,7 +880,11 @@ mod tests {
     }
 
     /// Build a multiple-select bank from `(text, correct)` pairs and feedback.
-    fn multiple_select_bank(choices: &[(&str, bool)], feedback: Feedback) -> ItemBank {
+    fn multiple_select_bank(
+        choices: &[(&str, bool)],
+        feedback: Feedback,
+        scoring: ScoringMode,
+    ) -> ItemBank {
         let choices = choices
             .iter()
             .map(|(text, correct)| Choice {
@@ -833,7 +901,7 @@ mod tests {
                 points: 1.0,
                 tags: Vec::new(),
                 feedback,
-                kind: QuestionKind::MultipleSelect(ChoiceSet { choices }),
+                kind: QuestionKind::MultipleSelect(MultipleSelect { choices, scoring }),
             }],
         }
     }
@@ -846,7 +914,11 @@ mod tests {
             correct: Some("Yes.".to_owned()),
             incorrect: Some("No.".to_owned()),
         };
-        let bank = multiple_select_bank(&[("A", true), ("B", false), ("C", true)], feedback);
+        let bank = multiple_select_bank(
+            &[("A", true), ("B", false), ("C", true)],
+            feedback,
+            ScoringMode::AllOrNothing,
+        );
         let xml = assessment_xml("a", &bank).expect("renders");
         assert!(xml.contains("<not>"));
         assert!(xml.contains("<and>"));
@@ -856,9 +928,66 @@ mod tests {
     }
 
     #[test]
+    /// Partial-credit scoring adds an even share per correct choice and
+    /// subtracts per incorrect one, with no all-or-nothing `<and>` block.
+    fn multiple_select_partial_credit_adds_and_subtracts() {
+        let bank = multiple_select_bank(
+            &[("A", true), ("B", false), ("C", true)],
+            Feedback::default(),
+            ScoringMode::Partial,
+        );
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("multiple_answers_question"));
+        assert!(!xml.contains("<and>"));
+        // Two correct → +50.00 each; one incorrect → -100.00.
+        assert!(xml.contains(r#"<setvar action="Add" varname="SCORE">50.00</setvar>"#));
+        assert!(xml.contains(r#"<setvar action="Subtract" varname="SCORE">100.00</setvar>"#));
+        assert!(xml.contains(r#"<varequal respident="response1">choice_1</varequal>"#));
+    }
+
+    #[test]
+    /// Partial credit wires general feedback only (no correct/incorrect arms).
+    fn multiple_select_partial_wires_general_feedback_only() {
+        let feedback = Feedback {
+            general: Some("Recall the set.".to_owned()),
+            correct: Some("Yes.".to_owned()),
+            incorrect: Some("No.".to_owned()),
+        };
+        let bank = multiple_select_bank(
+            &[("A", true), ("B", false), ("C", true)],
+            feedback,
+            ScoringMode::Partial,
+        );
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains(r#"<itemfeedback ident="general_fb">"#));
+        assert!(xml.contains(r#"linkrefid="general_fb""#));
+        // Correct/incorrect feedback has no home under partial scoring.
+        assert!(!xml.contains(r#"ident="correct_fb""#));
+        assert!(!xml.contains(r#"ident="incorrect_fb""#));
+    }
+
+    #[test]
+    /// An all-correct partial set adds credit but emits no `Subtract` arm.
+    fn multiple_select_partial_all_correct_has_no_subtract() {
+        let bank = multiple_select_bank(
+            &[("A", true), ("B", true)],
+            Feedback::default(),
+            ScoringMode::Partial,
+        );
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains(r#"<setvar action="Add" varname="SCORE">50.00</setvar>"#));
+        assert!(!xml.contains(r#"action="Subtract""#));
+        assert!(!xml.contains("<and>"));
+    }
+
+    #[test]
     /// An all-correct multiple-select emits only `<varequal>` terms, no `<not>`.
     fn multiple_select_all_correct_has_no_not_terms() {
-        let bank = multiple_select_bank(&[("A", true), ("B", true)], Feedback::default());
+        let bank = multiple_select_bank(
+            &[("A", true), ("B", true)],
+            Feedback::default(),
+            ScoringMode::AllOrNothing,
+        );
         let xml = assessment_xml("a", &bank).expect("renders");
         assert!(xml.contains(r#"<varequal respident="response1">choice_0</varequal>"#));
         assert!(xml.contains(r#"<varequal respident="response1">choice_1</varequal>"#));
@@ -938,10 +1067,10 @@ mod tests {
 
     #[test]
     /// Per-blank credit splits 100% evenly across the blanks.
-    fn per_blank_score_splits_evenly() {
-        assert_eq!(per_blank_score(1), "100.00");
-        assert_eq!(per_blank_score(2), "50.00");
-        assert_eq!(per_blank_score(3), "33.33");
+    fn even_share_score_splits_evenly() {
+        assert_eq!(even_share_score(1), "100.00");
+        assert_eq!(even_share_score(2), "50.00");
+        assert_eq!(even_share_score(3), "33.33");
     }
 
     #[test]

@@ -140,6 +140,20 @@ Select all algorithms that require sorted input.
 
 Rules: at least two choices, and **at least one** marked `correct`.
 
+By default a multiple-select is graded **all-or-nothing** (full marks only for
+selecting every correct option and no incorrect one). Add `scoring: partial` for
+partial credit — each correct selection adds an even share of the marks and each
+incorrect one subtracts a share (clamped to zero):
+
+```yaml
+kind: multiple_select
+scoring: partial   # or all_or_nothing (the default)
+choices: [...]
+```
+
+(All-or-nothing matches Canvas's own export exactly. Partial credit uses the
+standard per-choice `Add`/`Subtract` QTI encoding.)
+
 ### Fill in the blank (`kind: fill_in_blank`)
 
 One or more **inline** blanks, marked `{{name}}` in the prompt. Each name has an
