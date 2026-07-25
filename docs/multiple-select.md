@@ -17,6 +17,7 @@ Each entry of `choices` is `text` (**required**) and `correct` (optional,
 defaults `false`) — identical to multiple choice.
 
 **Rules:** at least two choices, and **at least one** marked `correct: true`.
+A choice may use `file:` instead of `text:` — see [partials.md](partials.md).
 
 ## Scoring
 

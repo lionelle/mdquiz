@@ -20,7 +20,7 @@ use zip::write::SimpleFileOptions;
 use crate::Result;
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
-    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse,
+    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse, is_local_image,
 };
 
 /// The `response_label` ident for the "True" choice; fills the item template.
@@ -1029,14 +1029,6 @@ fn rewrite_local_image(event: Event) -> Event {
     }
 }
 
-/// Whether an image URL is a local file path (rather than an absolute URL).
-fn is_local_image(url: &str) -> bool {
-    !(url.contains("://")
-        || url.starts_with("//")
-        || url.starts_with('/')
-        || url.starts_with("data:"))
-}
-
 /// The `$IMS-CC-FILEBASE$` reference for a bundled local image `path`.
 fn canvas_image_ref(path: &str) -> String {
     format!(
@@ -1059,17 +1051,56 @@ fn percent_encode_path(path: &str) -> String {
     out
 }
 
+/// Every authored string in `question` that is rendered as rich HTML, and so
+/// may embed a local image to bundle: the prompt, choice texts, ordering items,
+/// and feedback messages.
+///
+/// This is the companion to the exporter's `escaped_html` call sites — any field
+/// rendered as `text/html` belongs here. Matching cells and blank answers are
+/// exported as plain text (`text/plain`), so they carry no images and are
+/// excluded.
+fn rich_text_fields(question: &Question) -> Vec<&str> {
+    let mut fields = vec![question.prompt.as_str()];
+    match &question.kind {
+        QuestionKind::MultipleChoice(set) => {
+            fields.extend(set.choices.iter().map(|choice| choice.text.as_str()));
+        }
+        QuestionKind::MultipleSelect(select) => {
+            fields.extend(select.choices.iter().map(|choice| choice.text.as_str()));
+        }
+        QuestionKind::Ordering(ordering) => {
+            fields.extend(ordering.items.iter().map(String::as_str));
+        }
+        // These kinds render no extra text/html fields (matching cells and blank
+        // answers are text/plain). Listed explicitly, not `_`, so a future kind
+        // with a rich-text answer must decide whether its images bundle.
+        QuestionKind::TrueFalse(_) | QuestionKind::FillInBlank(_) | QuestionKind::Matching(_) => {}
+    }
+    let feedback = &question.feedback;
+    let messages = [
+        feedback.general.as_deref(),
+        feedback.correct.as_deref(),
+        feedback.incorrect.as_deref(),
+    ];
+    fields.extend(messages.into_iter().flatten());
+    fields
+}
+
 /// The distinct local-image paths referenced by any question in `bank`.
 ///
-/// The exporter bundles these under `web_resources/`; the CLI resolves them to
-/// bytes relative to the question directory.
+/// Scans every rich-text field (see [`rich_text_fields`]), so images embedded in
+/// answers and feedback are bundled just like prompt images. The exporter
+/// bundles these under `web_resources/`; the CLI resolves them to bytes relative
+/// to the question directory.
 #[must_use]
 pub fn local_image_paths(bank: &ItemBank) -> Vec<String> {
     let mut paths = Vec::new();
     for question in &bank.items {
-        for url in image_urls(&question.prompt) {
-            if is_local_image(&url) && !paths.contains(&url) {
-                paths.push(url);
+        for field in rich_text_fields(question) {
+            for url in image_urls(field) {
+                if is_local_image(&url) && !paths.contains(&url) {
+                    paths.push(url);
+                }
             }
         }
     }
@@ -1765,26 +1796,108 @@ mod tests {
         assert!(manifest.contains("webcontent"));
     }
 
+    /// A one-question multiple-choice bank over `choices`, with `feedback`.
+    fn choice_image_bank(choices: Vec<(&str, bool)>, feedback: Feedback) -> ItemBank {
+        let choices = choices
+            .into_iter()
+            .map(|(text, correct)| Choice {
+                text: text.to_owned(),
+                correct,
+            })
+            .collect();
+        ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: "Pick one.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback,
+                kind: QuestionKind::MultipleChoice(ChoiceSet { choices }),
+            }],
+        }
+    }
+
+    #[test]
+    /// Local images in choices and feedback are collected; externals are not.
+    fn local_image_paths_scans_answers_and_feedback() {
+        let feedback = Feedback {
+            general: Some("Recall balance: ![hint](hint.png)".to_owned()),
+            correct: None,
+            incorrect: None,
+        };
+        let choices = vec![
+            ("![a](pic.png)", true),
+            ("![b](https://ex.com/y.png)", false),
+        ];
+        let bank = choice_image_bank(choices, feedback);
+        // Choice image and feedback image collected, in field order; external skipped.
+        assert_eq!(local_image_paths(&bank), ["pic.png", "hint.png"]);
+    }
+
+    #[test]
+    /// A local image referenced only in an answer is bundled into the package.
+    fn answer_image_is_bundled() {
+        let bank = choice_image_bank(
+            vec![("![a](tree.png)", true), ("Neither", false)],
+            Feedback::default(),
+        );
+        assert_eq!(local_image_paths(&bank), ["tree.png"]);
+        let images = vec![("tree.png".to_owned(), vec![9_u8, 9, 9])];
+        let bytes = to_qti(&bank, &images).expect("export");
+        let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
+        assert!(
+            archive
+                .file_names()
+                .any(|name| name == "web_resources/tree.png")
+        );
+    }
+
+    #[test]
+    /// A local image embedded in an ordering item is collected for bundling.
+    fn ordering_item_image_is_collected() {
+        let items = vec!["![step](step.png)".to_owned(), "Plain".to_owned()];
+        let bank = ordering_bank(items, Feedback::default());
+        assert_eq!(local_image_paths(&bank), ["step.png"]);
+    }
+
+    #[test]
+    /// The same local image in the prompt and a choice is bundled once.
+    fn duplicate_image_across_fields_dedups() {
+        let mut bank = choice_image_bank(
+            vec![("![a](same.png)", true), ("No", false)],
+            Feedback::default(),
+        );
+        if let Some(question) = bank.items.first_mut() {
+            question.prompt = "See ![p](same.png)".to_owned();
+        }
+        assert_eq!(local_image_paths(&bank), ["same.png"]);
+    }
+
+    #[test]
+    /// Matching cells are plain text, so an image in one is not collected.
+    fn matching_cell_image_not_collected() {
+        let matching = Matching {
+            pairs: vec![
+                MatchPair {
+                    left: "![x](m.png)".to_owned(),
+                    right: "one".to_owned(),
+                },
+                MatchPair {
+                    left: "b".to_owned(),
+                    right: "two".to_owned(),
+                },
+            ],
+            distractors: Vec::new(),
+        };
+        assert!(local_image_paths(&matching_bank(matching, Feedback::default())).is_empty());
+    }
+
     #[test]
     /// Path percent-encoding keeps `/` but escapes spaces.
     fn percent_encode_keeps_slash_escapes_space() {
         assert_eq!(percent_encode_path("a b/c.png"), "a%20b/c.png");
-    }
-
-    #[test]
-    /// Only relative paths count as local; every URL scheme is rejected.
-    fn is_local_image_rejects_urls_accepts_relative() {
-        for url in [
-            "http://x/y.png",
-            "https://x/y.png",
-            "//x/y.png",
-            "/root/y.png",
-            "data:image/png;base64,AAAA",
-        ] {
-            assert!(!is_local_image(url), "{url} should be non-local");
-        }
-        assert!(is_local_image("diagram.png"));
-        assert!(is_local_image("sub/diagram.png"));
     }
 
     #[test]

@@ -20,6 +20,9 @@ Each entry of `choices` is:
 **Rules (checked at parse time):** at least two choices, and **exactly one**
 marked `correct: true`.
 
+A choice may use `file:` instead of `text:` to pull its content from a separate
+Markdown file — see [partials.md](partials.md).
+
 ## Example
 
 ```markdown

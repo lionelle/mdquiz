@@ -75,7 +75,8 @@ feedback:
 Feedback is exported to Canvas only — the print sheet carries no answer key, so
 it is omitted there. Canvas keeps *answer-level* (`correct`/`incorrect`)
 feedback for multiple choice only; other types wire `general` only (see each
-type's caveats).
+type's caveats). Any feedback message may use `{ file: … }` to load its content
+from a separate Markdown file — see [partials.md](partials.md).
 
 ## Question types
 
@@ -88,5 +89,9 @@ type's caveats).
 | `matching`         | Matching                     | [matching.md](matching.md)                 | [`../samples/matching/`](../samples/matching/)             |
 | `ordering`         | Ordering                     | [ordering.md](ordering.md)                 | [`../samples/ordering/`](../samples/ordering/)             |
 
-See also [images.md](images.md) for adding pictures to prompts, and
-[exporting.md](exporting.md) for the CLI and the Canvas import workflow.
+See also:
+
+- [images.md](images.md) — adding pictures to prompts, answers, and feedback.
+- [partials.md](partials.md) — pointing a choice, ordering item, or feedback
+  message at a separate Markdown file (`file:`) instead of inline text.
+- [exporting.md](exporting.md) — the CLI and the Canvas import workflow.

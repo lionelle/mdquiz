@@ -17,7 +17,34 @@ use crate::Result;
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
     MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse, blank_markers,
+    is_local_image,
 };
+
+/// Reads a partial's raw Markdown given its bank-relative `path`, returning a
+/// human-readable message on failure.
+///
+/// Supplied by the caller that owns the files (the CLI), so the parse layer
+/// stays free of direct filesystem calls. The default reader
+/// ([`reject_includes`]) rejects every `file:`, so `parse_question` and
+/// `item_bank_from_sources` support inline content only; callers that can read
+/// files use the `_with` variants.
+///
+/// The failure type is a plain `String` message (not the crate [`Error`]) so
+/// callers need not depend on the crate's error type; [`read_partial`] wraps it
+/// into [`crate::Error::InvalidQuestion`] with the question's context.
+pub type PartialReader<'a> = dyn Fn(&str) -> std::result::Result<String, String> + 'a;
+
+/// A [`PartialReader`] that rejects every include, for the disk-free entry
+/// points where no directory context is available.
+///
+/// # Errors
+///
+/// Always returns a message explaining that `file:` needs a directory context.
+fn reject_includes(path: &str) -> std::result::Result<String, String> {
+    Err(format!(
+        "`file:` include {path:?} needs a directory context; export from a directory"
+    ))
+}
 
 /// The metadata every question shares, flattened into each [`QuestionSpec`].
 #[derive(Debug, Deserialize)]
@@ -35,29 +62,48 @@ struct CommonSpec {
     tags: Vec<String>,
     /// Optional post-answer feedback.
     #[serde(default)]
-    feedback: Feedback,
+    feedback: FeedbackSpec,
 }
 
 impl CommonSpec {
-    /// Attach the shared metadata to a `prompt` and `kind` to form a question.
-    fn into_question(self, prompt: String, kind: QuestionKind) -> Question {
-        Question {
+    /// Attach the shared metadata to a `prompt` and `kind` to form a question,
+    /// resolving any `file:` feedback partials via `read`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any feedback-partial resolution failure.
+    fn into_question(
+        self,
+        prompt: String,
+        kind: QuestionKind,
+        read: &PartialReader<'_>,
+    ) -> Result<Question> {
+        let feedback = self.feedback.resolve(read, &self.id)?;
+        Ok(Question {
             id: self.id,
             title: self.title,
             prompt,
             points: self.points,
             tags: self.tags,
-            feedback: self.feedback,
+            feedback,
             kind,
-        }
+        })
     }
 }
 
 /// One authored choice for a choice-based question.
+///
+/// The option content is exactly one of inline `text` or a `file` partial;
+/// resolution enforces that. `correct` marks the answer.
 #[derive(Debug, Deserialize)]
 struct ChoiceSpec {
-    /// The option text, as authored Markdown.
-    text: String,
+    /// Inline option text, as authored Markdown. Mutually exclusive with `file`.
+    #[serde(default)]
+    text: Option<String>,
+    /// A partial file whose rendered Markdown is the option, resolved relative
+    /// to the bank directory. Mutually exclusive with `text`.
+    #[serde(default)]
+    file: Option<String>,
     /// Whether this option is correct; defaults to false.
     #[serde(default)]
     correct: bool,
@@ -101,6 +147,79 @@ impl BlankSpec {
             },
         }
     }
+}
+
+/// An authored message or answer: inline Markdown text, or a `file:` partial.
+///
+/// Backs ordering items and feedback messages. (Choices carry their own
+/// `text`/`file` fields instead, because they also need a `correct` flag.)
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MessageSpec {
+    /// Inline Markdown text.
+    Text(String),
+    /// A partial file whose rendered Markdown is used in place of the message.
+    File {
+        /// The partial's path, relative to the bank directory.
+        file: String,
+    },
+}
+
+impl MessageSpec {
+    /// Resolve to final Markdown, reading and rebasing a `file:` partial.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidQuestion`] naming `id` when the partial
+    /// cannot be read.
+    fn resolve(self, read: &PartialReader<'_>, id: &str) -> Result<String> {
+        match self {
+            Self::Text(text) => Ok(text),
+            Self::File { file } => read_partial(&file, read, id),
+        }
+    }
+}
+
+/// The authored feedback block: each message is inline text or a `file:` partial.
+#[derive(Debug, Default, Deserialize)]
+struct FeedbackSpec {
+    /// Shown regardless of correctness.
+    #[serde(default)]
+    general: Option<MessageSpec>,
+    /// Shown when the answer is correct.
+    #[serde(default)]
+    correct: Option<MessageSpec>,
+    /// Shown when the answer is incorrect.
+    #[serde(default)]
+    incorrect: Option<MessageSpec>,
+}
+
+impl FeedbackSpec {
+    /// Resolve every present message into a model [`Feedback`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any partial-resolution failure (see [`MessageSpec::resolve`]).
+    fn resolve(self, read: &PartialReader<'_>, id: &str) -> Result<Feedback> {
+        Ok(Feedback {
+            general: resolve_opt(self.general, read, id)?,
+            correct: resolve_opt(self.correct, read, id)?,
+            incorrect: resolve_opt(self.incorrect, read, id)?,
+        })
+    }
+}
+
+/// Resolve an optional [`MessageSpec`], threading `read` and the question `id`.
+///
+/// # Errors
+///
+/// Propagates any partial-resolution failure (see [`MessageSpec::resolve`]).
+fn resolve_opt(
+    message: Option<MessageSpec>,
+    read: &PartialReader<'_>,
+    id: &str,
+) -> Result<Option<String>> {
+    message.map(|m| m.resolve(read, id)).transpose()
 }
 
 /// The authored YAML shape, tagged by `kind`, before the prompt is attached.
@@ -161,8 +280,8 @@ enum QuestionSpec {
         /// The shared question metadata.
         #[serde(flatten)]
         common: CommonSpec,
-        /// The items, authored in their correct order.
-        items: Vec<String>,
+        /// The items, authored in their correct order (inline text or `file:`).
+        items: Vec<MessageSpec>,
     },
 }
 
@@ -172,26 +291,32 @@ fn default_points() -> f64 {
 }
 
 impl QuestionSpec {
-    /// Combine the YAML spec with its Markdown `prompt` into a [`Question`].
-    fn into_question(self, prompt: String) -> Question {
+    /// Combine the YAML spec with its Markdown `prompt` into a [`Question`],
+    /// resolving any `file:` partials via `read`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidQuestion`] when a choice is malformed
+    /// (both or neither of `text`/`file`), or when any `file:` partial (choice,
+    /// ordering item, or feedback message) cannot be read.
+    fn into_question(self, prompt: String, read: &PartialReader<'_>) -> Result<Question> {
         match self {
             Self::TrueFalse { common, answer } => {
-                common.into_question(prompt, QuestionKind::TrueFalse(TrueFalse { answer }))
+                common.into_question(prompt, QuestionKind::TrueFalse(TrueFalse { answer }), read)
             }
             Self::MultipleChoice { common, choices } => {
-                common.into_question(prompt, QuestionKind::MultipleChoice(choice_set(choices)))
+                choice_question(common, prompt, choices, read)
             }
             Self::MultipleSelect {
                 common,
                 choices,
                 scoring,
-            } => common.into_question(
+            } => select_question(common, prompt, choices, scoring, read),
+            Self::FillInBlank { common, blanks } => common.into_question(
                 prompt,
-                QuestionKind::MultipleSelect(multiple_select(choices, scoring)),
+                QuestionKind::FillInBlank(fill_in_blank(blanks)),
+                read,
             ),
-            Self::FillInBlank { common, blanks } => {
-                common.into_question(prompt, QuestionKind::FillInBlank(fill_in_blank(blanks)))
-            }
             Self::Matching {
                 common,
                 pairs,
@@ -199,38 +324,173 @@ impl QuestionSpec {
             } => common.into_question(
                 prompt,
                 QuestionKind::Matching(Matching { pairs, distractors }),
+                read,
             ),
-            Self::Ordering { common, items } => {
-                common.into_question(prompt, QuestionKind::Ordering(Ordering { items }))
-            }
+            Self::Ordering { common, items } => ordering_question(common, prompt, items, read),
         }
     }
 }
 
-/// Convert authored [`ChoiceSpec`]s into model [`Choice`]s.
-fn choices_vec(choices: Vec<ChoiceSpec>) -> Vec<Choice> {
+/// Convert authored [`ChoiceSpec`]s into model [`Choice`]s, resolving partials.
+///
+/// # Errors
+///
+/// Propagates any choice-content resolution failure (see [`resolve_content`]).
+fn choices_vec(
+    choices: Vec<ChoiceSpec>,
+    read: &PartialReader<'_>,
+    id: &str,
+) -> Result<Vec<Choice>> {
     choices
         .into_iter()
-        .map(|choice| Choice {
-            text: choice.text,
-            correct: choice.correct,
+        .map(|choice| {
+            Ok(Choice {
+                text: resolve_content(choice.text, choice.file, read, id)?,
+                correct: choice.correct,
+            })
         })
         .collect()
 }
 
-/// Convert authored [`ChoiceSpec`]s into the model's [`ChoiceSet`].
-fn choice_set(choices: Vec<ChoiceSpec>) -> ChoiceSet {
-    ChoiceSet {
-        choices: choices_vec(choices),
+/// Build a resolved single-answer multiple-choice [`Question`].
+///
+/// Takes `common` by value so the choice partials can borrow its `id` for error
+/// context before it is consumed into the question.
+///
+/// # Errors
+///
+/// Propagates any choice-content or feedback-partial resolution failure.
+fn choice_question(
+    common: CommonSpec,
+    prompt: String,
+    choices: Vec<ChoiceSpec>,
+    read: &PartialReader<'_>,
+) -> Result<Question> {
+    let set = ChoiceSet {
+        choices: choices_vec(choices, read, &common.id)?,
+    };
+    common.into_question(prompt, QuestionKind::MultipleChoice(set), read)
+}
+
+/// Build a resolved multiple-select [`Question`] with the given scoring.
+///
+/// # Errors
+///
+/// Propagates any choice-content or feedback-partial resolution failure.
+fn select_question(
+    common: CommonSpec,
+    prompt: String,
+    choices: Vec<ChoiceSpec>,
+    scoring: ScoringMode,
+    read: &PartialReader<'_>,
+) -> Result<Question> {
+    let select = MultipleSelect {
+        choices: choices_vec(choices, read, &common.id)?,
+        scoring,
+    };
+    common.into_question(prompt, QuestionKind::MultipleSelect(select), read)
+}
+
+/// Build a resolved ordering [`Question`], resolving each item's partials.
+///
+/// # Errors
+///
+/// Propagates any item- or feedback-partial resolution failure.
+fn ordering_question(
+    common: CommonSpec,
+    prompt: String,
+    items: Vec<MessageSpec>,
+    read: &PartialReader<'_>,
+) -> Result<Question> {
+    let items = items
+        .into_iter()
+        .map(|item| item.resolve(read, &common.id))
+        .collect::<Result<Vec<_>>>()?;
+    common.into_question(prompt, QuestionKind::Ordering(Ordering { items }), read)
+}
+
+/// Resolve one choice's content: inline `text`, or a `file:` partial's rendered
+/// Markdown (with its local images rebased to the bank directory).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming `id` when both or neither of
+/// `text`/`file` are given, or when the partial cannot be read.
+fn resolve_content(
+    text: Option<String>,
+    file: Option<String>,
+    read: &PartialReader<'_>,
+    id: &str,
+) -> Result<String> {
+    match (text, file) {
+        (Some(text), None) => Ok(text),
+        (None, Some(path)) => read_partial(&path, read, id),
+        (Some(_), Some(_)) => Err(crate::Error::InvalidQuestion(format!(
+            "question {id:?} has a choice with both `text` and `file`"
+        ))),
+        (None, None) => Err(crate::Error::InvalidQuestion(format!(
+            "question {id:?} has a choice with neither `text` nor `file`"
+        ))),
     }
 }
 
-/// Convert authored [`ChoiceSpec`]s and a scoring mode into a [`MultipleSelect`].
-fn multiple_select(choices: Vec<ChoiceSpec>, scoring: ScoringMode) -> MultipleSelect {
-    MultipleSelect {
-        choices: choices_vec(choices),
-        scoring,
+/// Read partial `path` via `read` and rebase its local images to the bank root.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming `id` when `read` fails.
+fn read_partial(path: &str, read: &PartialReader<'_>, id: &str) -> Result<String> {
+    let raw = read(path).map_err(|message| {
+        crate::Error::InvalidQuestion(format!(
+            "question {id:?} cannot include {path:?}: {message}"
+        ))
+    })?;
+    Ok(rebase_images(&raw, parent_dir(path)))
+}
+
+/// The directory portion of a partial `path` (`""` when it has none).
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(index) => path.get(..index).unwrap_or(""),
+        None => "",
     }
+}
+
+/// Rewrite each local image URL in `markdown` to sit under `base` (the partial's
+/// directory), so bundling resolves it relative to the bank root. External and
+/// absolute URLs are left untouched; an empty `base` needs no rewrite.
+fn rebase_images(markdown: &str, base: &str) -> String {
+    if base.is_empty() {
+        return markdown.to_owned();
+    }
+    let mut spans = image_url_spans(markdown);
+    // Apply back-to-front so earlier byte offsets stay valid as text is spliced.
+    spans.sort_by_key(|span| std::cmp::Reverse(span.0));
+    let mut out = markdown.to_owned();
+    for (start, end, url) in spans {
+        out.replace_range(start..end, &format!("{base}/{url}"));
+    }
+    out
+}
+
+/// The `(start, end, url)` byte spans of every local image URL in `markdown`.
+fn image_url_spans(markdown: &str) -> Vec<(usize, usize, String)> {
+    let mut spans = Vec::new();
+    for (event, range) in Parser::new(markdown).into_offset_iter() {
+        let Event::Start(Tag::Image { dest_url, .. }) = event else {
+            continue;
+        };
+        if !is_local_image(&dest_url) {
+            continue;
+        }
+        if let Some(span) = markdown.get(range.clone())
+            && let Some(offset) = span.rfind(dest_url.as_ref())
+        {
+            let start = range.start + offset;
+            spans.push((start, start + dest_url.len(), dest_url.to_string()));
+        }
+    }
+    spans
 }
 
 /// Convert the authored blank map into a [`FillInBlank`] payload.
@@ -247,15 +507,29 @@ fn fill_in_blank(blanks: BTreeMap<String, BlankSpec>) -> FillInBlank {
 
 /// Parse the full text of one question source into a [`Question`].
 ///
+/// Supports inline content only; any `file:` partial is rejected. Use
+/// [`parse_question_with`] to resolve partials against a reader.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::Parse`] when the YAML front-matter is missing,
 /// [`crate::Error::Yaml`] when it is malformed, and
-/// [`crate::Error::InvalidQuestion`] when the prompt is empty.
+/// [`crate::Error::InvalidQuestion`] when the prompt is empty or a `file:`
+/// partial is used.
 pub fn parse_question(source: &str) -> Result<Question> {
+    parse_question_with(source, &reject_includes)
+}
+
+/// Parse one question source, resolving `file:` partials via `read`.
+///
+/// # Errors
+///
+/// As [`parse_question`], plus any partial-resolution failure surfaced through
+/// `read` (see [`resolve_content`]).
+pub fn parse_question_with(source: &str, read: &PartialReader<'_>) -> Result<Question> {
     let (yaml, prompt) = extract_yaml_and_prompt(source)?;
     let spec: QuestionSpec = serde_norway::from_str(&yaml)?;
-    let mut question = spec.into_question(prompt);
+    let mut question = spec.into_question(prompt, read)?;
     // A leading `# H1` names the question, but only as a shorthand: an explicit
     // `title:` field wins and leaves the body untouched.
     if question.title.is_none() {
@@ -499,9 +773,8 @@ fn remove_span(source: &str, span: Range<usize>) -> Result<String> {
 
 /// Assemble an [`ItemBank`] from `(filename, content)` source pairs.
 ///
-/// Sources are ordered by filename for a deterministic bank layout, then each
-/// is parsed via [`parse_question`]. This is the disk-free seam the CLI wires
-/// its directory walk onto, so the assembly stays testable without a process.
+/// Supports inline content only; use [`item_bank_from_sources_with`] to resolve
+/// `file:` partials against a reader.
 ///
 /// # Errors
 ///
@@ -512,14 +785,38 @@ where
     N: Into<String>,
     I: IntoIterator<Item = (String, String)>,
 {
+    item_bank_from_sources_with(name, sources, &reject_includes)
+}
+
+/// Assemble an [`ItemBank`], resolving `file:` partials via `read`.
+///
+/// Sources are ordered by filename for a deterministic bank layout, then each is
+/// parsed via [`parse_question_with`]. This is the seam the CLI wires its
+/// directory walk onto (supplying a reader rooted at the bank directory), so the
+/// assembly stays testable without a process.
+///
+/// # Errors
+///
+/// Propagates any [`parse_question_with`] failure, and returns
+/// [`crate::Error::InvalidQuestion`] if two questions share an `id`.
+pub fn item_bank_from_sources_with<N, I>(
+    name: N,
+    sources: I,
+    read: &PartialReader<'_>,
+) -> Result<ItemBank>
+where
+    N: Into<String>,
+    I: IntoIterator<Item = (String, String)>,
+{
     let mut sources: Vec<(String, String)> = sources.into_iter().collect();
     sources.sort_by(|a, b| a.0.cmp(&b.0));
     let mut items = Vec::with_capacity(sources.len());
     for (filename, content) in &sources {
-        let question = parse_question(content).map_err(|error| crate::Error::QuestionFile {
-            file: filename.clone(),
-            message: error.to_string(),
-        })?;
+        let question =
+            parse_question_with(content, read).map_err(|error| crate::Error::QuestionFile {
+                file: filename.clone(),
+                message: error.to_string(),
+            })?;
         items.push(question);
     }
     item_bank_from_questions(name, items)
@@ -618,6 +915,146 @@ mod tests {
             ---\n\nPick?\n";
         let err = parse_question(source).expect_err("one choice");
         assert!(matches!(err, crate::Error::InvalidQuestion(_)));
+    }
+
+    /// A [`PartialReader`] backed by an in-memory `(path, contents)` table.
+    fn map_reader(
+        files: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> std::result::Result<String, String> {
+        move |path| {
+            files
+                .iter()
+                .find(|(name, _)| *name == path)
+                .map(|(_, body)| (*body).to_owned())
+                .ok_or_else(|| format!("no such partial {path}"))
+        }
+    }
+
+    #[test]
+    /// A `file:` choice takes its content from the named partial.
+    fn choice_file_is_resolved_from_partial() {
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: partials/right.md\n    correct: true\n  - text: Wrong\n---\n\nPick?\n";
+        let reader = map_reader(&[("partials/right.md", "The **right** answer")]);
+        let question = parse_question_with(source, &reader).expect("valid");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::MultipleChoice(mc)
+                if mc.choices.first().is_some_and(|c| c.text == "The **right** answer" && c.correct)
+        ));
+    }
+
+    #[test]
+    /// A partial's local image is rebased to a bank-relative path; externals stay.
+    fn choice_partial_rebases_local_images() {
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: partials/a.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
+        let reader = map_reader(&[(
+            "partials/a.md",
+            "![t](pic.png) and ![x](https://ex.com/y.png)",
+        )]);
+        let question = parse_question_with(source, &reader).expect("valid");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::MultipleChoice(mc) if mc.choices.first().is_some_and(|c|
+                c.text.contains("![t](partials/pic.png)") && c.text.contains("https://ex.com/y.png"))
+        ));
+    }
+
+    #[test]
+    /// A `file:` choice whose partial cannot be read is a typed error naming it.
+    fn choice_file_missing_errors() {
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: nope.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
+        let reader = map_reader(&[]);
+        let err = parse_question_with(source, &reader).expect_err("missing partial");
+        assert!(
+            matches!(err, crate::Error::InvalidQuestion(message) if message.contains("nope.md"))
+        );
+    }
+
+    #[test]
+    /// A choice with both `text` and `file`, or neither, is rejected.
+    fn choice_text_file_are_exclusive() {
+        let both = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - text: A\n    file: a.md\n    correct: true\n  - text: B\n---\n\nPick?\n";
+        let neither = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - correct: true\n  - text: B\n---\n\nPick?\n";
+        let reader = map_reader(&[("a.md", "A")]);
+        assert!(matches!(
+            parse_question_with(both, &reader).expect_err("both"),
+            crate::Error::InvalidQuestion(_)
+        ));
+        assert!(matches!(
+            parse_question_with(neither, &reader).expect_err("neither"),
+            crate::Error::InvalidQuestion(_)
+        ));
+    }
+
+    #[test]
+    /// The disk-free `parse_question` rejects a `file:` include with a clear error.
+    fn parse_question_rejects_file_include() {
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: a.md\n    correct: true\n  - text: B\n---\n\nPick?\n";
+        let err = parse_question(source).expect_err("no reader");
+        assert!(
+            matches!(err, crate::Error::InvalidQuestion(message) if message.contains("directory context"))
+        );
+    }
+
+    #[test]
+    /// `rebase_images` prefixes only local URLs, and only when there is a base.
+    fn rebase_images_prefixes_local_only() {
+        let md = "![a](one.png) ![b](sub/two.png) ![c](https://x/y.png)";
+        let rebased = rebase_images(md, "partials");
+        assert!(rebased.contains("![a](partials/one.png)"));
+        assert!(rebased.contains("![b](partials/sub/two.png)"));
+        assert!(rebased.contains("https://x/y.png"));
+        // An empty base is a no-op.
+        assert_eq!(rebase_images(md, ""), md);
+    }
+
+    #[test]
+    /// A `file:` choice resolves and rebases through directory assembly too.
+    fn item_bank_with_reader_resolves_file_choice() {
+        let src = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: partials/a.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
+        let reader = map_reader(&[("partials/a.md", "![t](pic.png)")]);
+        let bank = item_bank_from_sources_with("m", [("q.md".to_owned(), src.to_owned())], &reader)
+            .expect("bank");
+        assert!(matches!(
+            bank.items.first().map(|q| &q.kind),
+            Some(QuestionKind::MultipleChoice(mc))
+                if mc.choices.first().is_some_and(|c| c.text.contains("![t](partials/pic.png)"))
+        ));
+    }
+
+    #[test]
+    /// A bank-root partial (no directory) leaves its local image path unchanged.
+    fn root_partial_leaves_image_unrebased() {
+        let src = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: a.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
+        let reader = map_reader(&[("a.md", "![t](pic.png)")]);
+        let question = parse_question_with(src, &reader).expect("valid");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::MultipleChoice(mc) if mc.choices.first().is_some_and(|c|
+                c.text.contains("![t](pic.png)") && !c.text.contains("/pic.png"))
+        ));
+    }
+
+    #[test]
+    /// A `file:` choice works for multiple-select too (both paths, per policy).
+    fn multiple_select_supports_file_choice() {
+        let src = "---\nid: q\nkind: multiple_select\nchoices:\n\
+            \x20 - file: partials/a.md\n    correct: true\n  - text: No\n---\n\nSelect all.\n";
+        let reader = map_reader(&[("partials/a.md", "Answer A")]);
+        let question = parse_question_with(src, &reader).expect("valid");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::MultipleSelect(ms)
+                if ms.choices.first().is_some_and(|c| c.text == "Answer A")
+        ));
     }
 
     #[test]
@@ -925,6 +1362,65 @@ mod tests {
         assert_eq!(question.feedback.general.as_deref(), Some("See chapter 3."));
         assert_eq!(question.feedback.correct, None);
         assert_eq!(question.feedback.incorrect, None);
+    }
+
+    #[test]
+    /// An ordering item can come from a `file:` partial, with images rebased.
+    fn ordering_item_from_file() {
+        let source = "---\nid: q\nkind: ordering\nitems:\n\
+            \x20 - Inline first\n  - file: steps/two.md\n---\n\nOrder.\n";
+        let reader = map_reader(&[("steps/two.md", "![d](d.png)")]);
+        let question = parse_question_with(source, &reader).expect("valid");
+        assert!(matches!(
+            &question.kind,
+            QuestionKind::Ordering(o)
+                if o.items.first().is_some_and(|i| i == "Inline first")
+                    && o.items.get(1).is_some_and(|i| i.contains("![d](steps/d.png)"))
+        ));
+    }
+
+    #[test]
+    /// A feedback message can come from a `file:` partial.
+    fn feedback_message_from_file() {
+        let source = "---\nid: q\nkind: true_false\nanswer: true\n\
+            feedback:\n  general:\n    file: fb/hint.md\n---\n\nA fact.\n";
+        let reader = map_reader(&[("fb/hint.md", "The **hint**.")]);
+        let question = parse_question_with(source, &reader).expect("valid");
+        assert_eq!(question.feedback.general.as_deref(), Some("The **hint**."));
+    }
+
+    #[test]
+    /// Each feedback field is wired to its own partial (guards field swaps).
+    fn feedback_correct_and_incorrect_from_files() {
+        let source = "---\nid: q\nkind: true_false\nanswer: true\nfeedback:\n\
+            \x20 correct:\n    file: fb/c.md\n  incorrect:\n    file: fb/i.md\n---\n\nA fact.\n";
+        let reader = map_reader(&[("fb/c.md", "Right!"), ("fb/i.md", "Wrong.")]);
+        let question = parse_question_with(source, &reader).expect("valid");
+        assert_eq!(question.feedback.correct.as_deref(), Some("Right!"));
+        assert_eq!(question.feedback.incorrect.as_deref(), Some("Wrong."));
+    }
+
+    #[test]
+    /// A missing partial in an ordering item is a typed error naming it.
+    fn ordering_item_file_missing_errors() {
+        let source = "---\nid: q\nkind: ordering\nitems:\n\
+            \x20 - First\n  - file: steps/missing.md\n---\n\nOrder.\n";
+        let reader = map_reader(&[]);
+        let err = parse_question_with(source, &reader).expect_err("missing partial");
+        assert!(
+            matches!(err, crate::Error::InvalidQuestion(message) if message.contains("missing.md"))
+        );
+    }
+
+    #[test]
+    /// The disk-free entry point rejects a `file:` feedback message too.
+    fn parse_question_rejects_feedback_file() {
+        let source = "---\nid: q\nkind: true_false\nanswer: true\n\
+            feedback:\n  general:\n    file: fb.md\n---\n\nA fact.\n";
+        let err = parse_question(source).expect_err("no reader");
+        assert!(
+            matches!(err, crate::Error::InvalidQuestion(message) if message.contains("directory context"))
+        );
     }
 
     #[test]

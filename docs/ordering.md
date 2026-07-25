@@ -13,7 +13,8 @@ Plus the [common metadata](README.md#common-metadata):
 List `items` in the order you want them graded. mdquiz shuffles them for
 display (sorted by text), so the presented sequence is never the answer.
 
-**Rules:** at least two items, and each non-empty.
+**Rules:** at least two items, and each non-empty. An item may be a
+`{ file: … }` reference instead of a bare string — see [partials.md](partials.md).
 
 ## Example
 

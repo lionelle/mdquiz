@@ -1,10 +1,29 @@
-# Images in prompts
+# Images
 
-Prompts are full Markdown, so images use the standard `![alt](src)` syntax.
-There is no image-specific `kind`; any question type can include one.
+Any authored text that Canvas renders as rich HTML can hold an image, using the
+standard Markdown `![alt](src)` syntax. There is no image-specific `kind`.
+
+Images are supported in:
+
+- **Prompts** — every question type.
+- **Answers** — multiple-choice / multiple-select `choices` and `ordering`
+  `items` (these export as rich HTML).
+- **Feedback** — `general` / `correct` / `incorrect` messages.
+
+They are **not** supported in **matching** cells or **fill-in-the-blank**
+answers: those export as plain text, so an image there would show as literal
+`![alt](src)` and its file would not bundle.
 
 ```markdown
 The tree below is balanced ![tree](binary-tree.png), unlike ![this one](https://ex.com/skew.png).
+```
+
+```yaml
+# An image inside a multiple-choice answer:
+choices:
+  - text: "![balanced tree](binary-tree.png)"
+    correct: true
+  - text: Neither
 ```
 
 ## External URLs

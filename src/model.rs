@@ -239,6 +239,18 @@ pub(crate) fn blank_markers(text: &str) -> Vec<String> {
     names
 }
 
+/// Whether an image URL is a local file path (rather than an absolute URL).
+///
+/// Shared by the parser (which rebases a partial's local images) and the Canvas
+/// exporter (which bundles them). Absolute URLs — `scheme://`, protocol-relative
+/// `//`, root-relative `/`, and `data:` — are not local.
+pub(crate) fn is_local_image(url: &str) -> bool {
+    !(url.contains("://")
+        || url.starts_with("//")
+        || url.starts_with('/')
+        || url.starts_with("data:"))
+}
+
 /// The payload for a [`QuestionKind::Matching`] question.
 ///
 /// Each [`MatchPair`] links a left prompt to its correct right answer;
@@ -304,6 +316,22 @@ impl Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    /// Only relative paths count as local; every URL scheme is rejected.
+    fn is_local_image_rejects_urls_accepts_relative() {
+        for url in [
+            "http://x/y.png",
+            "https://x/y.png",
+            "//x/y.png",
+            "/root/y.png",
+            "data:image/png;base64,AAAA",
+        ] {
+            assert!(!is_local_image(url), "{url} should be non-local");
+        }
+        assert!(is_local_image("diagram.png"));
+        assert!(is_local_image("sub/diagram.png"));
+    }
 
     #[test]
     /// Every kind reports its documented human-readable label.

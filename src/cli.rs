@@ -78,7 +78,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             name,
         } => {
             let sources = read_question_sources(&dir)?;
-            let bank = parse::item_bank_from_sources(bank_name(&dir, name), sources)?;
+            let reader = partial_reader(&dir);
+            let bank = parse::item_bank_from_sources_with(bank_name(&dir, name), sources, &reader)?;
             // Local images are only bundled into the Canvas package.
             let images = match format {
                 FormatArg::Canvas => load_images(&dir, &bank),
@@ -96,7 +97,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
 fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
     let mut images = Vec::new();
     for path in canvas::local_image_paths(bank) {
-        if path.split('/').any(|part| part == "..") {
+        if escapes_dir(&path) {
             eprintln!("warning: skipping image outside the question directory: {path}");
             continue;
         }
@@ -106,6 +107,28 @@ fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
         }
     }
     images
+}
+
+/// A [`parse::PartialReader`] that reads `file:` partials relative to `dir`.
+///
+/// Refuses any path with a `..` component so an include cannot escape the
+/// question directory; the resolved partial's local images are rebased by the
+/// parser and bundled like any other local image.
+fn partial_reader(dir: &Path) -> impl Fn(&str) -> std::result::Result<String, String> + use<'_> {
+    move |path: &str| {
+        if escapes_dir(path) {
+            return Err(format!("path {path:?} escapes the question directory"));
+        }
+        fs::read_to_string(dir.join(path)).map_err(|error| error.to_string())
+    }
+}
+
+/// Whether `path` walks out of its base directory via a `..` component.
+///
+/// The single source of truth for the path-escape rule shared by
+/// [`partial_reader`] (which errors) and [`load_images`] (which skips).
+fn escapes_dir(path: &str) -> bool {
+    path.split('/').any(|part| part == "..")
 }
 
 /// Print any post-import manual-fix reminders to stderr after a Canvas export.
@@ -317,6 +340,75 @@ mod tests {
         };
         // The file exists outside `qdir`, so only the `..` guard can skip it.
         assert!(load_images(&qdir, &bank).is_empty());
+    }
+
+    #[test]
+    /// The partial reader reads files under the directory and refuses escapes.
+    fn partial_reader_reads_and_refuses_escape() {
+        let root = tempfile::tempdir().expect("temp dir");
+        fs::create_dir(root.path().join("partials")).expect("subdir");
+        fs::write(root.path().join("partials/a.md"), "Hello").expect("write partial");
+        fs::write(root.path().join("secret.md"), "nope").expect("write secret");
+        let qdir = root.path().join("q");
+        fs::create_dir(&qdir).expect("qdir");
+        let read = partial_reader(root.path());
+        assert_eq!(read("partials/a.md").expect("reads"), "Hello");
+        assert!(read("missing.md").is_err());
+        let escaping = partial_reader(&qdir);
+        assert!(escaping("../secret.md").is_err());
+    }
+
+    #[test]
+    /// Exporting a directory resolves a `file:` choice partial end to end.
+    fn export_resolves_file_choice_partial() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir(dir.path().join("partials")).expect("subdir");
+        fs::write(dir.path().join("partials/right.md"), "The **right** one").expect("partial");
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: partials/right.md\n    correct: true\n  - text: Wrong\n---\n\nPick?\n";
+        fs::write(dir.path().join("01-q.md"), source).expect("question");
+        let sources = read_question_sources(dir.path()).expect("sources");
+        let read = partial_reader(dir.path());
+        let bank = parse::item_bank_from_sources_with("m", sources, &read).expect("bank assembles");
+        assert!(matches!(
+            bank.items.first().map(|q| &q.kind),
+            Some(mdquiz::model::QuestionKind::MultipleChoice(mc))
+                if mc.choices.first().is_some_and(|c| c.text == "The **right** one")
+        ));
+    }
+
+    #[test]
+    /// A partial's embedded image resolves on disk at its rebased bank path.
+    fn partial_image_resolves_through_load_images() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir(dir.path().join("parts")).expect("subdir");
+        fs::write(dir.path().join("parts/ans.md"), "![x](img.png)").expect("partial");
+        fs::write(dir.path().join("parts/img.png"), b"png").expect("image");
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: parts/ans.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
+        fs::write(dir.path().join("01-q.md"), source).expect("question");
+        let sources = read_question_sources(dir.path()).expect("sources");
+        let read = partial_reader(dir.path());
+        let bank = parse::item_bank_from_sources_with("m", sources, &read).expect("bank");
+        // The partial's `img.png` was rebased to `parts/img.png`, which exists.
+        let images = load_images(dir.path(), &bank);
+        assert_eq!(
+            images.first().map(|(p, _)| p.as_str()),
+            Some("parts/img.png")
+        );
+    }
+
+    #[test]
+    /// A missing partial fails assembly, naming the offending question file.
+    fn missing_partial_names_question_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: parts/nope.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
+        fs::write(dir.path().join("01-q.md"), source).expect("question");
+        let sources = read_question_sources(dir.path()).expect("sources");
+        let read = partial_reader(dir.path());
+        let err = parse::item_bank_from_sources_with("m", sources, &read).expect_err("missing");
+        assert!(err.to_string().contains("01-q.md"));
     }
 
     #[test]
