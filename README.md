@@ -5,9 +5,9 @@ into an **item bank** and export it to either a **print-ready Markdown sheet**
 (no answer key) or a **Canvas *New Quizzes* item bank** (QTI package) you can
 upload to Canvas.
 
-> Status: early scaffold. The pipeline shape, tooling, and lint policy are in
-> place; question types are being rolled out one at a time (see
-> [`CLAUDE.md`](CLAUDE.md)).
+> Status: all six question types are implemented on both exporters. See
+> [`docs/`](docs/) for the authoring reference and [`samples/`](samples/) for
+> runnable examples.
 
 ## Idea
 
@@ -28,9 +28,9 @@ An item bank is the only collection today. A future `Quiz` target can build on
 the same model: in Canvas *New Quizzes* a quiz draws its questions from item
 banks, so the bank is the natural first artifact.
 
-Question types follow the Canvas **New Quizzes** model. Planned, in roll-out
-order: true/false, multiple choice, multiple select, fill in the blank (literal
-or regex), matching, ordering.
+Question types follow the Canvas **New Quizzes** model: true/false, multiple
+choice, multiple select, fill in the blank (literal or regex), matching, and
+ordering. Each is documented under [`docs/`](docs/).
 
 ## Usage
 
@@ -42,6 +42,13 @@ cargo run -- export module01/ --output module01.zip  --format canvas
 
 The Canvas output is a zipped QTI package — import it via Canvas's **"QTI .zip
 file"** option, so give it a `.zip` extension.
+
+## Documentation
+
+- [`docs/`](docs/) — the authoring-format reference: common metadata (which
+  fields are required vs optional), a page per question type, plus images and
+  exporting.
+- [`samples/`](samples/) — runnable example banks, one directory per type.
 
 ## Development
 

@@ -19,6 +19,11 @@ The Canvas output is a zipped QTI package; import it through Canvas's **"QTI
 The bank name defaults to the directory name (`true-false`); override it with
 `--name "Module 1 — Fundamentals"`.
 
+> The authoring format is documented in full under [`../docs/`](../docs/) —
+> including which metadata fields are required vs optional, a page per question
+> type, and the Canvas caveats. The sections below are a quick tour; `docs/` is
+> the reference.
+
 ## Question file format
 
 A question file is **YAML front-matter** (a `---`-delimited block at the very
