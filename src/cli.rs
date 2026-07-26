@@ -8,11 +8,13 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use mdquiz::export::{self, canvas, markdown};
+use mdquiz::mermaid::{self, DiagramFormat};
 use mdquiz::model::ItemBank;
 use mdquiz::parse;
 
@@ -41,6 +43,9 @@ pub(crate) enum Command {
         /// Bank name; defaults to the directory's own name.
         #[arg(short, long)]
         name: Option<String>,
+        /// Image format for rendered mermaid diagrams (Canvas export only).
+        #[arg(long, value_enum, default_value_t = DiagramFormatArg::Png)]
+        diagram_format: DiagramFormatArg,
     },
 }
 
@@ -63,6 +68,25 @@ impl From<FormatArg> for export::Format {
     }
 }
 
+/// The mermaid diagram image format as selected on the command line.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum DiagramFormatArg {
+    /// Raster PNG (most reliably rendered inside Canvas).
+    Png,
+    /// Scalable SVG.
+    Svg,
+}
+
+impl From<DiagramFormatArg> for DiagramFormat {
+    /// Map the CLI-facing diagram format onto the library's [`DiagramFormat`].
+    fn from(arg: DiagramFormatArg) -> Self {
+        match arg {
+            DiagramFormatArg::Png => Self::Png,
+            DiagramFormatArg::Svg => Self::Svg,
+        }
+    }
+}
+
 /// Run the parsed CLI to completion.
 ///
 /// # Errors
@@ -76,13 +100,15 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             output,
             format,
             name,
+            diagram_format,
         } => {
             let sources = read_question_sources(&dir)?;
             let reader = partial_reader(&dir);
-            let bank = parse::item_bank_from_sources_with(bank_name(&dir, name), sources, &reader)?;
-            // Local images are only bundled into the Canvas package.
+            let mut bank =
+                parse::item_bank_from_sources_with(bank_name(&dir, name), sources, &reader)?;
+            // Mermaid rendering and image bundling apply only to the Canvas package.
             let images = match format {
-                FormatArg::Canvas => load_images(&dir, &bank),
+                FormatArg::Canvas => canvas_images(&dir, &mut bank, diagram_format.into()),
                 FormatArg::Markdown => Vec::new(),
             };
             let reminders = write_export(&bank, format.into(), &output, &images)?;
@@ -92,11 +118,34 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
+/// Render mermaid diagrams in `bank`, then gather every image the Canvas package
+/// needs: the generated diagrams plus the local images read from `dir`.
+fn canvas_images(
+    dir: &Path,
+    bank: &mut ItemBank,
+    diagram_format: DiagramFormat,
+) -> Vec<(String, Vec<u8>)> {
+    let renderer = move |source: &str| render_mermaid(source, diagram_format);
+    let outcome = mermaid::render_diagrams(bank, &renderer, diagram_format);
+    for warning in &outcome.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let mut images = load_images(dir, bank);
+    images.extend(outcome.images);
+    images
+}
+
 /// Load the bytes of every local image referenced by the bank, resolved
 /// relative to `dir`. Missing or unsafe paths are skipped with a warning.
+///
+/// Generated-diagram paths (under [`mermaid::GENERATED_DIR`]) are skipped here:
+/// their bytes come from the diagram pass, not the question directory.
 fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
     let mut images = Vec::new();
     for path in canvas::local_image_paths(bank) {
+        if mermaid::is_generated_path(&path) {
+            continue;
+        }
         if escapes_dir(&path) {
             eprintln!("warning: skipping image outside the question directory: {path}");
             continue;
@@ -107,6 +156,46 @@ fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
         }
     }
     images
+}
+
+/// Render one mermaid `source` to image bytes by shelling out to the mermaid CLI.
+///
+/// # Errors
+///
+/// Returns a message when the CLI is missing or the render fails; the caller
+/// turns that into a warning and leaves the diagram as a code block.
+fn render_mermaid(source: &str, format: DiagramFormat) -> std::result::Result<Vec<u8>, String> {
+    let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let input = dir.path().join("diagram.mmd");
+    let output = dir.path().join(format!("diagram.{}", format.extension()));
+    fs::write(&input, source).map_err(|error| error.to_string())?;
+    run_mmdc(&input, &output)?;
+    fs::read(&output).map_err(|error| error.to_string())
+}
+
+/// Invoke the mermaid CLI (`mmdc`, else `npx @mermaid-js/mermaid-cli`) on
+/// `input`, writing `output`.
+///
+/// # Errors
+///
+/// Returns a message when no mermaid CLI is found or the render exits non-zero.
+fn run_mmdc(input: &Path, output: &Path) -> std::result::Result<(), String> {
+    let input = input.to_string_lossy();
+    let output = output.to_string_lossy();
+    let args = ["-i", input.as_ref(), "-o", output.as_ref()];
+    for (program, pre_args) in [
+        ("mmdc", &[][..]),
+        ("npx", &["-y", "@mermaid-js/mermaid-cli"][..]),
+    ] {
+        let mut command = ProcessCommand::new(program);
+        command.args(pre_args).args(args);
+        match command.output() {
+            Ok(result) if result.status.success() => return Ok(()),
+            Ok(result) => return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned()),
+            Err(_) => {} // program not found; try the next candidate
+        }
+    }
+    Err("no mermaid CLI found (install @mermaid-js/mermaid-cli or `mmdc`)".to_owned())
 }
 
 /// A [`parse::PartialReader`] that reads `file:` partials relative to `dir`.
@@ -229,6 +318,19 @@ mod tests {
     }
 
     #[test]
+    /// The CLI diagram format maps onto the library's `DiagramFormat`.
+    fn diagram_format_arg_maps() {
+        assert!(matches!(
+            DiagramFormat::from(DiagramFormatArg::Png),
+            DiagramFormat::Png
+        ));
+        assert!(matches!(
+            DiagramFormat::from(DiagramFormatArg::Svg),
+            DiagramFormat::Svg
+        ));
+    }
+
+    #[test]
     /// An explicit `--name` overrides the directory-derived default.
     fn bank_name_prefers_explicit_override() {
         let name = bank_name(
@@ -340,6 +442,32 @@ mod tests {
         };
         // The file exists outside `qdir`, so only the `..` guard can skip it.
         assert!(load_images(&qdir, &bank).is_empty());
+    }
+
+    #[test]
+    /// Generated-diagram paths are skipped by `load_images` (bytes come elsewhere).
+    fn load_images_skips_generated_paths() {
+        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("real.png"), b"x").expect("write image");
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: "![d](generated/mermaid-abc.png) and ![r](real.png)".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            }],
+        };
+        let images = load_images(dir.path(), &bank);
+        assert_eq!(images.len(), 1);
+        assert_eq!(
+            images.first().map(|(path, _)| path.as_str()),
+            Some("real.png")
+        );
     }
 
     #[test]

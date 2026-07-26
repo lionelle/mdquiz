@@ -8,12 +8,19 @@
 //! * a single print-ready Markdown sheet with **no** answer key, and
 //! * a Canvas *New Quizzes* item bank (QTI package) suitable for import.
 //!
+//! Prompts and answers are Markdown: they may embed images, LaTeX math
+//! (`$…$`, rendered to Canvas's native equation image), ` ```mermaid ` diagrams
+//! (rendered to bundled images via [`mermaid`]), and `file:` partials pulled
+//! from separate Markdown files.
+//!
 //! The crate is organised so the parsing and export stages never depend on the
 //! CLI: everything below [`model`] is a plain data transform that is easy to
-//! unit-test.
+//! unit-test. Filesystem and process work (reading partials, shelling out to the
+//! mermaid CLI) is injected by the caller as closures, so the library stays pure.
 
 pub mod error;
 pub mod export;
+pub mod mermaid;
 pub mod model;
 pub mod parse;
 

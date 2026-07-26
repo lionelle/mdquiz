@@ -1,6 +1,6 @@
 //! Export a [`crate::model::ItemBank`] to a distribution format.
 //!
-//! Two targets are planned:
+//! Two targets are supported:
 //!
 //! * [`markdown`] — a single print-ready Markdown sheet with no answer key, and
 //! * [`canvas`] — a Canvas *New Quizzes* QTI package.

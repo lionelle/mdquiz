@@ -512,10 +512,10 @@ fn fill_in_blank(blanks: BTreeMap<String, BlankSpec>) -> FillInBlank {
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Parse`] when the YAML front-matter is missing,
-/// [`crate::Error::Yaml`] when it is malformed, and
-/// [`crate::Error::InvalidQuestion`] when the prompt is empty or a `file:`
-/// partial is used.
+/// Returns [`crate::Error::Parse`] when the YAML front-matter is missing or
+/// malformed, [`crate::Error::Yaml`] when it cannot be deserialized, and
+/// [`crate::Error::InvalidQuestion`] when the question is semantically invalid
+/// (empty prompt, a failed per-kind rule, or a `file:` partial with no reader).
 pub fn parse_question(source: &str) -> Result<Question> {
     parse_question_with(source, &reject_includes)
 }
@@ -778,8 +778,9 @@ fn remove_span(source: &str, span: Range<usize>) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Propagates any [`parse_question`] failure, and returns
-/// [`crate::Error::InvalidQuestion`] if two questions share an `id`.
+/// Returns [`crate::Error::QuestionFile`] (naming the source file) when a
+/// question fails to parse, and [`crate::Error::InvalidQuestion`] if two
+/// questions share an `id`.
 pub fn item_bank_from_sources<N, I>(name: N, sources: I) -> Result<ItemBank>
 where
     N: Into<String>,
@@ -797,8 +798,10 @@ where
 ///
 /// # Errors
 ///
-/// Propagates any [`parse_question_with`] failure, and returns
-/// [`crate::Error::InvalidQuestion`] if two questions share an `id`.
+/// Returns [`crate::Error::QuestionFile`] (naming the source file) when a
+/// question fails to parse — including a partial-resolution failure surfaced
+/// through `read` — and [`crate::Error::InvalidQuestion`] if two questions
+/// share an `id`.
 pub fn item_bank_from_sources_with<N, I>(
     name: N,
     sources: I,

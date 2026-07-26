@@ -166,7 +166,7 @@ standard per-choice `Add`/`Subtract` QTI encoding.)
 
 One or more **inline** blanks, marked `{{name}}` in the prompt. Each name has an
 entry under `blanks` listing its acceptable answers. Shorthand is a bare list;
-the expanded form adds `exact: true` for case-sensitive matching:
+the expanded form adds a `match:` mode (`case_insensitive` / `exact` / `regex`):
 
 ```markdown
 ---
@@ -176,7 +176,7 @@ blanks:
   method: [GET, get]
   code:
     answers: ["404", "Not Found"]
-    exact: true
+    match: exact
 ---
 
 An HTTP {{method}} request for a missing resource returns status {{code}}.

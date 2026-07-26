@@ -57,25 +57,30 @@ The pipeline is a plain data transform so it is trivial to test without a
 process:
 
 ```
-source .md  ──▶  parse::parse_quiz  ──▶  model::Quiz  ──▶  export::{markdown,canvas}
+source .md  ──▶  parse::item_bank_from_sources  ──▶  model::ItemBank  ──▶  export::{markdown,canvas}
 ```
 
-- `src/model.rs` — the typed quiz (`Quiz`, `Question`, `QuestionKind`). The
+- `src/model.rs` — the typed bank (`ItemBank`, `Question`, `QuestionKind`). The
   source of truth for what a question *is*.
-- `src/parse.rs` — Markdown + YAML front-matter → `Quiz`.
+- `src/parse.rs` — Markdown + YAML front-matter → `ItemBank` (`parse_question`,
+  `item_bank_from_sources`). Resolves `file:` partials via an injected reader.
+- `src/mermaid.rs` — pre-export pass that renders ` ```mermaid ` blocks to
+  bundled images via an injected renderer (the CLI shells out to `mmdc`).
 - `src/export/markdown.rs` — print sheet (no solutions).
 - `src/export/canvas.rs` — Canvas New Quizzes QTI bytes.
 - `src/error.rs` — the crate `Error`/`Result`. Everything fallible flows through
   here.
 - `src/cli.rs` + `src/main.rs` — thin CLI shell; **no logic** beyond wiring I/O
-  to the library.
+  to the library. Filesystem/process work is injected into the library as
+  closures so the lower layers stay pure.
 
 Keep the CLI thin. If you're tempted to put logic in `cli.rs`, it belongs in the
 library.
 
-## Question-type roll-out order
+## Question types
 
-Ship these one at a time, each with tests on both exporters, in this order:
+All six now ship, each with a payload struct and tests on both exporters, in the
+roll-out order they were built:
 
 1. **True/False**
 2. **Multiple choice** (single answer)
@@ -84,8 +89,11 @@ Ship these one at a time, each with tests on both exporters, in this order:
 5. **Matching**
 6. **Ordering**
 
-Each variant of `QuestionKind` is currently unit-typed; give it a payload struct
-(and serde shape) as you implement it.
+On top of the types, prompts and answers support images, LaTeX math
+(`$…$` → Canvas's native equation image), ` ```mermaid ` diagrams (rendered to
+bundled images), and `file:` partials. Any new `QuestionKind` variant follows
+the same rule: a payload struct, both exporter branches, and tests, in one
+change.
 
 ## Commands
 

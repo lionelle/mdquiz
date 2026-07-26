@@ -44,8 +44,69 @@ pub struct Question {
     pub tags: Vec<String>,
     /// Optional feedback shown to students after answering.
     pub feedback: Feedback,
-    /// The question type together with its (future) type-specific payload.
+    /// The question type together with its type-specific payload.
     pub kind: QuestionKind,
+}
+
+impl Question {
+    /// The authored Markdown fields rendered as rich (`text/html`) content: the
+    /// prompt, choice texts, ordering items, and any feedback message.
+    ///
+    /// Content transforms (image bundling, mermaid rendering) walk exactly these
+    /// fields. Matching cells and blank answers export as plain text and are
+    /// excluded. Kinds are matched explicitly (not `_`) so a future kind with a
+    /// rich-text answer must decide whether it belongs here.
+    pub(crate) fn rich_text_fields(&self) -> Vec<&str> {
+        let mut fields = vec![self.prompt.as_str()];
+        match &self.kind {
+            QuestionKind::MultipleChoice(set) => {
+                fields.extend(set.choices.iter().map(|choice| choice.text.as_str()));
+            }
+            QuestionKind::MultipleSelect(select) => {
+                fields.extend(select.choices.iter().map(|choice| choice.text.as_str()));
+            }
+            QuestionKind::Ordering(ordering) => {
+                fields.extend(ordering.items.iter().map(String::as_str));
+            }
+            QuestionKind::TrueFalse(_)
+            | QuestionKind::FillInBlank(_)
+            | QuestionKind::Matching(_) => {}
+        }
+        let feedback = &self.feedback;
+        let messages = [
+            feedback.general.as_deref(),
+            feedback.correct.as_deref(),
+            feedback.incorrect.as_deref(),
+        ];
+        fields.extend(messages.into_iter().flatten());
+        fields
+    }
+
+    /// The [rich-text fields](Self::rich_text_fields), mutably, for transforms
+    /// that rewrite content in place (e.g. replacing a mermaid block).
+    pub(crate) fn rich_text_fields_mut(&mut self) -> Vec<&mut String> {
+        let mut fields = vec![&mut self.prompt];
+        match &mut self.kind {
+            QuestionKind::MultipleChoice(set) => {
+                fields.extend(set.choices.iter_mut().map(|choice| &mut choice.text));
+            }
+            QuestionKind::MultipleSelect(select) => {
+                fields.extend(select.choices.iter_mut().map(|choice| &mut choice.text));
+            }
+            QuestionKind::Ordering(ordering) => fields.extend(ordering.items.iter_mut()),
+            QuestionKind::TrueFalse(_)
+            | QuestionKind::FillInBlank(_)
+            | QuestionKind::Matching(_) => {}
+        }
+        let feedback = &mut self.feedback;
+        let messages = [
+            feedback.general.as_mut(),
+            feedback.correct.as_mut(),
+            feedback.incorrect.as_mut(),
+        ];
+        fields.extend(messages.into_iter().flatten());
+        fields
+    }
 }
 
 /// Feedback messages shown after a question is answered.

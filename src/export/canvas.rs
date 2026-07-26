@@ -13,7 +13,7 @@
 use std::fmt::Write as _;
 use std::io::{Cursor, Write};
 
-use pulldown_cmark::{Event, Parser, Tag, html};
+use pulldown_cmark::{Event, Options, Parser, Tag, html};
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -668,9 +668,9 @@ fn blank_conditions_xml(blanks: &[&Blank], feedback: &Feedback) -> String {
 
 /// An even `1/count` share of 100%, as a two-decimal string.
 ///
-/// Used for per-blank fill-in-the-blank credit and per-choice partial credit.
-/// Clamped to at least one so the divisor is never zero (an empty or absurdly
-/// large `count` falls back to full credit).
+/// Used for per-blank fill-in-the-blank credit, per-choice partial credit, and
+/// per-pair matching credit. Clamped to at least one so the divisor is never
+/// zero (an empty or absurdly large `count` falls back to full credit).
 fn even_share_score(count: usize) -> String {
     let count = u16::try_from(count).map_or(1.0, f64::from).max(1.0);
     format!("{:.2}", 100.0 / count)
@@ -678,8 +678,9 @@ fn even_share_score(count: usize) -> String {
 
 /// Render the general-feedback `<itemfeedback>` block, if any.
 ///
-/// Fill-in-the-blank only wires general feedback: Canvas keeps answer-level
-/// (correct/incorrect) feedback for multiple choice only.
+/// The kinds that wire general feedback only — fill-in-the-blank, matching,
+/// ordering, and partial-scored multiple-select — use this; Canvas keeps
+/// answer-level (correct/incorrect) feedback for multiple choice only.
 fn general_itemfeedback_xml(feedback: &Feedback) -> String {
     feedback
         .general
@@ -1003,10 +1004,13 @@ fn general_condition_xml(feedback: &Feedback) -> String {
 ///
 /// Local image references are rewritten to Canvas's `$IMS-CC-FILEBASE$` form so
 /// they resolve to the files bundled under `web_resources/`; absolute URLs
-/// (`http(s)://`, `//`, `data:`, root-relative) are left untouched.
+/// (`http(s)://`, `//`, `data:`, root-relative) are left untouched. Inline and
+/// display math (`$…$` / `$$…$$`) become Canvas's native `equation_image`.
 fn prompt_html(markdown: &str) -> String {
     let mut rendered = String::new();
-    let parser = Parser::new(markdown).map(rewrite_local_image);
+    let parser = Parser::new_ext(markdown, Options::ENABLE_MATH)
+        .map(rewrite_local_image)
+        .map(rewrite_math);
     html::push_html(&mut rendered, parser);
     rendered.trim().to_owned()
 }
@@ -1029,6 +1033,41 @@ fn rewrite_local_image(event: Event) -> Event {
     }
 }
 
+/// Rewrite an inline/display math event to Canvas's native `equation_image` HTML.
+///
+/// pulldown would otherwise render math as a `<span class="math">`; Canvas
+/// instead renders LaTeX from its equation service, so the raw event is replaced
+/// with the matching `<img>`.
+fn rewrite_math(event: Event) -> Event {
+    match event {
+        Event::InlineMath(latex) | Event::DisplayMath(latex) => {
+            Event::InlineHtml(equation_image_html(&latex).into())
+        }
+        other => other,
+    }
+}
+
+/// Canvas's native equation image; `{{ENCODED}}` is the double-percent-encoded
+/// LaTeX for the `src`, `{{ATTR}}` the entity-escaped LaTeX for the text
+/// attributes (escaped once here, then again with the surrounding prompt HTML).
+const EQUATION_IMAGE_TEMPLATE: &str = "<img class=\"equation_image\" \
+     src=\"/equation_images/{{ENCODED}}\" alt=\"LaTeX: {{ATTR}}\" \
+     data-equation-content=\"{{ATTR}}\" title=\"{{ATTR}}\">";
+
+/// Canvas's native equation image for `latex`, rendered by its equation service.
+///
+/// The `src` double-percent-encodes the LaTeX (Canvas decodes it twice) and is
+/// host-relative so it resolves on whatever Canvas instance imports the bank.
+/// The raw LaTeX travels in `data-equation-content` for Canvas to re-render.
+fn equation_image_html(latex: &str) -> String {
+    EQUATION_IMAGE_TEMPLATE
+        .replace(
+            "{{ENCODED}}",
+            &percent_encode_component(&percent_encode_component(latex)),
+        )
+        .replace("{{ATTR}}", &escape_xml(latex))
+}
+
 /// The `$IMS-CC-FILEBASE$` reference for a bundled local image `path`.
 fn canvas_image_ref(path: &str) -> String {
     format!(
@@ -1039,9 +1078,18 @@ fn canvas_image_ref(path: &str) -> String {
 
 /// Percent-encode a path for a URL, keeping `/` and the unreserved characters.
 fn percent_encode_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+    path.split('/')
+        .map(percent_encode_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Percent-encode `text` as a single URL component: every byte except the
+/// unreserved set (alphanumerics and `-_.~`) becomes `%XX`, including `/`.
+fn percent_encode_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             out.push(char::from(byte));
         } else {
             // Writing to a `String` is infallible, so the result is discarded.
@@ -1051,52 +1099,17 @@ fn percent_encode_path(path: &str) -> String {
     out
 }
 
-/// Every authored string in `question` that is rendered as rich HTML, and so
-/// may embed a local image to bundle: the prompt, choice texts, ordering items,
-/// and feedback messages.
-///
-/// This is the companion to the exporter's `escaped_html` call sites — any field
-/// rendered as `text/html` belongs here. Matching cells and blank answers are
-/// exported as plain text (`text/plain`), so they carry no images and are
-/// excluded.
-fn rich_text_fields(question: &Question) -> Vec<&str> {
-    let mut fields = vec![question.prompt.as_str()];
-    match &question.kind {
-        QuestionKind::MultipleChoice(set) => {
-            fields.extend(set.choices.iter().map(|choice| choice.text.as_str()));
-        }
-        QuestionKind::MultipleSelect(select) => {
-            fields.extend(select.choices.iter().map(|choice| choice.text.as_str()));
-        }
-        QuestionKind::Ordering(ordering) => {
-            fields.extend(ordering.items.iter().map(String::as_str));
-        }
-        // These kinds render no extra text/html fields (matching cells and blank
-        // answers are text/plain). Listed explicitly, not `_`, so a future kind
-        // with a rich-text answer must decide whether its images bundle.
-        QuestionKind::TrueFalse(_) | QuestionKind::FillInBlank(_) | QuestionKind::Matching(_) => {}
-    }
-    let feedback = &question.feedback;
-    let messages = [
-        feedback.general.as_deref(),
-        feedback.correct.as_deref(),
-        feedback.incorrect.as_deref(),
-    ];
-    fields.extend(messages.into_iter().flatten());
-    fields
-}
-
 /// The distinct local-image paths referenced by any question in `bank`.
 ///
-/// Scans every rich-text field (see [`rich_text_fields`]), so images embedded in
-/// answers and feedback are bundled just like prompt images. The exporter
-/// bundles these under `web_resources/`; the CLI resolves them to bytes relative
-/// to the question directory.
+/// Scans every rich-text field (see [`Question::rich_text_fields`]), so images
+/// embedded in answers and feedback are bundled just like prompt images. The
+/// exporter bundles these under `web_resources/`; the CLI resolves them to bytes
+/// relative to the question directory.
 #[must_use]
 pub fn local_image_paths(bank: &ItemBank) -> Vec<String> {
     let mut paths = Vec::new();
     for question in &bank.items {
-        for field in rich_text_fields(question) {
+        for field in question.rich_text_fields() {
             for url in image_urls(field) {
                 if is_local_image(&url) && !paths.contains(&url) {
                     paths.push(url);
@@ -1747,6 +1760,66 @@ mod tests {
     }
 
     #[test]
+    /// Inline `$…$` math becomes Canvas's native equation image (double-encoded).
+    fn inline_math_becomes_equation_image() {
+        let xml =
+            assessment_xml("a", &true_false_bank(true, "It is $x^2$ hard.")).expect("renders");
+        assert!(xml.contains("equation_image"));
+        // `^` is percent-encoded twice: `%5E` -> `%255E`.
+        assert!(xml.contains("/equation_images/x%255E2"));
+        assert!(xml.contains("data-equation-content=&quot;x^2&quot;"));
+    }
+
+    #[test]
+    /// Display `$$…$$` math also renders as an equation image.
+    fn display_math_becomes_equation_image() {
+        let xml = assessment_xml("a", &true_false_bank(true, "$$E=mc^2$$")).expect("renders");
+        assert!(xml.contains("equation_image"));
+        assert!(xml.contains("data-equation-content=&quot;E=mc^2&quot;"));
+    }
+
+    #[test]
+    /// LaTeX specials are HTML- then XML-escaped (double-encoded) in attributes.
+    fn math_escapes_special_characters() {
+        let xml = assessment_xml("a", &true_false_bank(true, "$a < b$")).expect("renders");
+        assert!(xml.contains("a &amp;lt; b"));
+        assert!(!xml.contains("a < b"));
+    }
+
+    #[test]
+    /// A lone `$` with no closing delimiter stays literal, not an equation.
+    fn lone_dollar_is_not_math() {
+        let xml =
+            assessment_xml("a", &true_false_bank(true, "It costs $5 today.")).expect("renders");
+        assert!(!xml.contains("equation_image"));
+    }
+
+    #[test]
+    /// The double-encoded `src` matches Canvas's own export for `O(\log n)`.
+    fn math_src_matches_canvas_double_encoding() {
+        let xml =
+            assessment_xml("a", &true_false_bank(true, r"Cost $O(\log n)$.")).expect("renders");
+        assert!(xml.contains("/equation_images/O%2528%255Clog%2520n%2529"));
+    }
+
+    #[test]
+    /// A double-quote in LaTeX is entity-escaped so it cannot break the attribute.
+    fn math_escapes_quotes_in_latex() {
+        let xml = assessment_xml("a", &true_false_bank(true, r#"$\text{"x"}$"#)).expect("renders");
+        // `"` -> `&quot;` (here) -> `&amp;quot;` (outer XML escape).
+        assert!(xml.contains("&amp;quot;x&amp;quot;"));
+    }
+
+    #[test]
+    /// Math renders inside a choice, not just a prompt (both HTML paths).
+    fn math_renders_in_a_choice() {
+        let bank = choice_image_bank(vec![("$x^2$", true), ("No", false)], Feedback::default());
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("equation_image"));
+        assert!(xml.contains("data-equation-content=&quot;x^2&quot;"));
+    }
+
+    #[test]
     /// The manifest wires the resource ident and href into the resource nodes.
     fn manifest_references_assessment_resource() {
         let xml = manifest_xml("assessment_m", "assessment_m/assessment_m.xml", &[]);
@@ -1892,6 +1965,21 @@ mod tests {
             distractors: Vec::new(),
         };
         assert!(local_image_paths(&matching_bank(matching, Feedback::default())).is_empty());
+    }
+
+    #[test]
+    /// A generated-diagram image bundles like any other (the exporter is
+    /// provenance-agnostic; the CLI supplies the bytes from the mermaid pass).
+    fn generated_diagram_image_is_bundled() {
+        let bank = image_bank("![d](generated/mermaid-abc.png)");
+        let images = vec![("generated/mermaid-abc.png".to_owned(), vec![1_u8, 2, 3])];
+        let bytes = to_qti(&bank, &images).expect("export");
+        let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
+        assert!(
+            archive
+                .file_names()
+                .any(|name| name == "web_resources/generated/mermaid-abc.png")
+        );
     }
 
     #[test]

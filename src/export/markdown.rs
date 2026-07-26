@@ -380,4 +380,24 @@ mod tests {
         let run = out.find("____ Run").expect("run listed");
         assert!(items < link && link < run);
     }
+
+    #[test]
+    /// The print sheet keeps math and mermaid source verbatim (no rendering).
+    fn print_keeps_math_and_mermaid_literal() {
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: "Cost $O(n)$ and\n\n```mermaid\ngraph TD; A-->B;\n```".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            }],
+        };
+        let out = to_print_markdown(&bank).expect("renders");
+        assert!(out.contains("$O(n)$") && out.contains("```mermaid"));
+        assert!(!out.contains("equation_image") && !out.contains("![diagram]"));
+    }
 }
