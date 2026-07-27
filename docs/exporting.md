@@ -7,15 +7,15 @@ numeric prefixes control question order.
 ## Command
 
 ```bash
-mdquiz export <DIR> --output <OUTPUT> --format <markdown|canvas> \
-  [--name <NAME>] [--recursive] [--diagram-format <png|svg>]
+mdquiz export <DIR> --output <OUTPUT> \
+  [--format <markdown|canvas>] [--name <NAME>] [--recursive] [--diagram-format <png|svg>]
 ```
 
 | Option              | Required? | Meaning                                                       |
 |---------------------|-----------|---------------------------------------------------------------|
 | `<DIR>`             | **Required** | Directory of Markdown question files.                      |
 | `-o`, `--output`    | **Required** | Path to write the exported bank to.                        |
-| `-f`, `--format`    | **Required** | `markdown` (print sheet) or `canvas` (QTI package).        |
+| `-f`, `--format`    | Optional  | `canvas` (QTI package, **default**) or `markdown` (print sheet). |
 | `-n`, `--name`      | Optional  | Bank name; defaults to the directory's own name.              |
 | `-r`, `--recursive` | Optional  | Descend into subdirectories, gathering every question into one bank (see below). |
 | `--diagram-format`  | Optional  | Mermaid image format, `png` (default) or `svg`; Canvas export only. See [mermaid.md](mermaid.md). |

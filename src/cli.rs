@@ -37,8 +37,8 @@ pub(crate) enum Command {
         /// Path to write the exported item bank to.
         #[arg(short, long)]
         output: PathBuf,
-        /// Export format to produce.
-        #[arg(short, long, value_enum)]
+        /// Export format to produce; defaults to the Canvas package.
+        #[arg(short, long, value_enum, default_value_t = FormatArg::Canvas)]
         format: FormatArg,
         /// Bank name; defaults to the directory's own name.
         #[arg(short, long)]
