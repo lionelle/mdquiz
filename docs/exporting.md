@@ -8,7 +8,7 @@ numeric prefixes control question order.
 
 ```bash
 mdquiz export <DIR> --output <OUTPUT> --format <markdown|canvas> \
-  [--name <NAME>] [--diagram-format <png|svg>]
+  [--name <NAME>] [--recursive] [--diagram-format <png|svg>]
 ```
 
 | Option              | Required? | Meaning                                                       |
@@ -17,7 +17,26 @@ mdquiz export <DIR> --output <OUTPUT> --format <markdown|canvas> \
 | `-o`, `--output`    | **Required** | Path to write the exported bank to.                        |
 | `-f`, `--format`    | **Required** | `markdown` (print sheet) or `canvas` (QTI package).        |
 | `-n`, `--name`      | Optional  | Bank name; defaults to the directory's own name.              |
+| `-r`, `--recursive` | Optional  | Descend into subdirectories, gathering every question into one bank (see below). |
 | `--diagram-format`  | Optional  | Mermaid image format, `png` (default) or `svg`; Canvas export only. See [mermaid.md](mermaid.md). |
+
+## Which files become questions
+
+By default the export reads only the `*.md` files **directly inside** `<DIR>`;
+subdirectories are skipped. A file counts as a question only if it opens with a
+YAML front-matter block, so **`README.md`, partials, and other prose Markdown
+are ignored** (not errors).
+
+With `-r` / `--recursive`, the walk descends into subdirectories and gathers
+every question into a single bank, ordered by relative path. Each question's
+images and `file:` partials resolve relative to **its own folder**, so a
+question at `module01/q.md` referencing `diagram.png` uses
+`module01/diagram.png`. Question `id`s must be unique across the whole tree.
+
+```bash
+# One bank from an entire course tree:
+mdquiz export course/ --recursive --output course.zip --format canvas
+```
 
 ## Formats
 

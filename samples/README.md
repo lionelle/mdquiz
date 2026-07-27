@@ -3,7 +3,10 @@
 Each subdirectory here is a ready-to-export **item bank**: a folder of
 per-question Markdown files. Point `mdquiz` at a directory to build one bank
 from every `*.md` file inside it (files are ordered by filename, so the numeric
-prefixes control question order).
+prefixes control question order). Add `-r`/`--recursive` to gather nested
+subdirectories into a single bank — e.g. `export samples/ -r` builds one bank
+from all of these; READMEs and partials (files without front-matter) are
+skipped. See [`../docs/exporting.md`](../docs/exporting.md).
 
 ```bash
 # Print-ready sheet (no answer key):

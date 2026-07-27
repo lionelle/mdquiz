@@ -43,6 +43,9 @@ pub(crate) enum Command {
         /// Bank name; defaults to the directory's own name.
         #[arg(short, long)]
         name: Option<String>,
+        /// Recurse into subdirectories, gathering every question into one bank.
+        #[arg(short, long)]
+        recursive: bool,
         /// Image format for rendered mermaid diagrams (Canvas export only).
         #[arg(long, value_enum, default_value_t = DiagramFormatArg::Png)]
         diagram_format: DiagramFormatArg,
@@ -100,12 +103,11 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             output,
             format,
             name,
+            recursive,
             diagram_format,
         } => {
-            let sources = read_question_sources(&dir)?;
-            let reader = partial_reader(&dir);
-            let mut bank =
-                parse::item_bank_from_sources_with(bank_name(&dir, name), sources, &reader)?;
+            let sources = read_question_sources(&dir, recursive)?;
+            let mut bank = build_bank(&dir, bank_name(&dir, name), sources)?;
             // Mermaid rendering and image bundling apply only to the Canvas package.
             let images = match format {
                 FormatArg::Canvas => canvas_images(&dir, &mut bank, diagram_format.into()),
@@ -234,30 +236,102 @@ fn print_import_reminders(reminders: &[String]) {
     }
 }
 
-/// Read every `*.md` file directly in `dir` as a `(filename, content)` pair.
+/// Read every question `*.md` file under `dir` as a `(relative-path, content)`
+/// pair; with `recursive`, descend into subdirectories.
 ///
-/// The listing is not sorted here; deterministic ordering is the library's job
-/// in [`parse::item_bank_from_sources`]. Subdirectories and non-Markdown files
-/// are skipped.
+/// Paths use `/` separators and are relative to `dir` (e.g. `matching/01.md`).
+/// Skipped: `README.md`, hidden entries (starting with `.`), non-Markdown files,
+/// and Markdown lacking a leading YAML front-matter block (partials and prose).
+/// Ordering is [`build_bank`]'s job.
 ///
 /// # Errors
 ///
 /// Returns an error if the directory or any question file cannot be read.
-fn read_question_sources(dir: &Path) -> anyhow::Result<Vec<(String, String)>> {
+fn read_question_sources(dir: &Path, recursive: bool) -> anyhow::Result<Vec<(String, String)>> {
     let mut sources = Vec::new();
-    let entries = fs::read_dir(dir)
-        .with_context(|| format!("reading question directory {}", dir.display()))?;
+    collect_sources(dir, "", recursive, &mut sources)?;
+    Ok(sources)
+}
+
+/// Collect question sources under `dir`, prefixing their keys with `prefix`.
+///
+/// # Errors
+///
+/// Returns an error if a directory or file cannot be read.
+fn collect_sources(
+    dir: &Path,
+    prefix: &str,
+    recursive: bool,
+    out: &mut Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    let entries =
+        fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("reading an entry in {}", dir.display()))?;
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(OsStr::to_str) != Some("md") {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
             continue;
         }
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("reading question file {}", path.display()))?;
-        sources.push((entry.file_name().to_string_lossy().into_owned(), content));
+        let path = entry.path();
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if path.is_dir() {
+            if recursive {
+                collect_sources(&path, &rel, recursive, out)?;
+            }
+        } else if is_question_file(&path, &name) {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("reading question file {}", path.display()))?;
+            // A partial or other prose `.md` has no front-matter and is not a
+            // standalone question — skip it so recursion ignores partials.
+            if looks_like_question(&content) {
+                out.push((rel, content));
+            }
+        }
     }
-    Ok(sources)
+    Ok(())
+}
+
+/// Whether `path` (with file `name`) is a candidate question file: a `*.md` that
+/// is not a `README.md`.
+fn is_question_file(path: &Path, name: &str) -> bool {
+    path.extension().and_then(OsStr::to_str) == Some("md")
+        && !name.eq_ignore_ascii_case("readme.md")
+}
+
+/// Whether `content` opens with a YAML front-matter block, marking it a question
+/// (rather than a partial or other prose Markdown).
+fn looks_like_question(content: &str) -> bool {
+    content.trim_start().starts_with("---")
+}
+
+/// Parse every `(relative-path, content)` source into a question — resolving its
+/// partials and images relative to its own subdirectory — and assemble the bank.
+///
+/// # Errors
+///
+/// Returns an error naming the source file if a question fails to parse, or if
+/// two questions share an `id`.
+fn build_bank(
+    dir: &Path,
+    name: String,
+    mut sources: Vec<(String, String)>,
+) -> anyhow::Result<ItemBank> {
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut questions = Vec::with_capacity(sources.len());
+    for (rel_path, content) in sources {
+        let base = rel_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let question_dir = dir.join(base);
+        let reader = partial_reader(&question_dir);
+        let mut question = parse::parse_question_with(&content, &reader)
+            .with_context(|| format!("in question file {rel_path}"))?;
+        parse::rebase_local_paths(&mut question, base);
+        questions.push(question);
+    }
+    Ok(parse::item_bank_from_questions(name, questions)?)
 }
 
 /// Choose the bank name: the `--name` override, else the directory's own name.
@@ -356,25 +430,82 @@ mod tests {
     }
 
     #[test]
-    /// Only `*.md` files are read; other files and subdirectories are skipped.
-    fn read_question_sources_keeps_only_markdown_files() {
+    /// Only front-matter `*.md` questions are read; other files, non-question
+    /// Markdown (README/partials), and subdirectories are skipped.
+    fn read_question_sources_keeps_only_questions() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        fs::write(dir.path().join("q1.md"), "one").expect("write q1");
+        fs::write(dir.path().join("q1.md"), "---\nid: q\n---\n\nQ?").expect("write q1");
         fs::write(dir.path().join("notes.txt"), "skip").expect("write notes");
+        fs::write(dir.path().join("README.md"), "# readme").expect("write readme");
+        fs::write(dir.path().join("partial.md"), "Just prose, no front-matter").expect("partial");
+        // A hidden file is skipped even with valid front-matter.
+        fs::write(dir.path().join(".draft.md"), "---\nid: d\n---\n\nD?").expect("draft");
         fs::create_dir(dir.path().join("nested.md")).expect("create dir named like md");
 
-        let sources = read_question_sources(dir.path()).expect("read sources");
+        let sources = read_question_sources(dir.path(), false).expect("read sources");
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["q1.md"]);
-        assert_eq!(sources.first().map(|(_, c)| c.as_str()), Some("one"));
+    }
+
+    #[test]
+    /// With `--recursive`, questions in subdirectories are gathered (paths keep
+    /// their subfolder), while non-recursive stays one level deep.
+    fn read_question_sources_recurses_when_asked() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::write(dir.path().join("top.md"), "---\nid: t\n---\n\nT?").expect("top");
+        fs::create_dir(dir.path().join("sub")).expect("subdir");
+        fs::write(dir.path().join("sub/deep.md"), "---\nid: d\n---\n\nD?").expect("deep");
+
+        let flat = read_question_sources(dir.path(), false).expect("flat");
+        assert_eq!(
+            flat.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["top.md"]
+        );
+
+        let deep = read_question_sources(dir.path(), true).expect("recursive");
+        let mut names: Vec<&str> = deep.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["sub/deep.md", "top.md"]);
+    }
+
+    #[test]
+    /// `build_bank` roots each subdir question's reader at its own folder and
+    /// rebases its prompt image and its partial's image to root-relative paths.
+    fn build_bank_rebases_subdir_paths() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::create_dir(dir.path().join("topics")).expect("subdir");
+        fs::write(dir.path().join("topics/pic.png"), b"png").expect("pic");
+        fs::write(dir.path().join("topics/ans.md"), "![p](inpartial.png)").expect("partial");
+        fs::write(dir.path().join("topics/inpartial.png"), b"png").expect("inpartial");
+        let src = "---\nid: q\nkind: multiple_choice\nchoices:\n\
+            \x20 - file: ans.md\n    correct: true\n  - text: No\n---\n\n![m](pic.png)\n";
+        fs::write(dir.path().join("topics/01.md"), src).expect("question");
+
+        let sources = read_question_sources(dir.path(), true).expect("sources");
+        let bank = build_bank(dir.path(), "m".to_owned(), sources).expect("bank");
+        let question = bank.items.first().expect("question");
+        // Prompt image and the partial's image both rebased under `topics/`.
+        assert!(question.prompt.contains("![m](topics/pic.png)"));
+        assert!(matches!(
+            &question.kind,
+            mdquiz::model::QuestionKind::MultipleChoice(mc) if mc.choices.first()
+                .is_some_and(|c| c.text.contains("![p](topics/inpartial.png)"))
+        ));
+        // Both rebased paths resolve on disk through the root-rooted loader.
+        let names: Vec<String> = load_images(dir.path(), &bank)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert!(names.iter().any(|n| n == "topics/pic.png"));
+        assert!(names.iter().any(|n| n == "topics/inpartial.png"));
     }
 
     #[test]
     /// Reading a directory that does not exist is an error, not a panic.
     fn read_question_sources_errors_on_missing_dir() {
-        let err = read_question_sources(Path::new("/no/such/mdquiz/dir"))
+        let err = read_question_sources(Path::new("/no/such/mdquiz/dir"), false)
             .expect_err("missing directory must fail");
-        assert!(err.to_string().contains("reading question directory"));
+        assert!(err.to_string().contains("no/such/mdquiz/dir"));
     }
 
     /// A one-question true/false bank for exercising the write seam.
@@ -495,7 +626,7 @@ mod tests {
         let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
             \x20 - file: partials/right.md\n    correct: true\n  - text: Wrong\n---\n\nPick?\n";
         fs::write(dir.path().join("01-q.md"), source).expect("question");
-        let sources = read_question_sources(dir.path()).expect("sources");
+        let sources = read_question_sources(dir.path(), false).expect("sources");
         let read = partial_reader(dir.path());
         let bank = parse::item_bank_from_sources_with("m", sources, &read).expect("bank assembles");
         assert!(matches!(
@@ -515,7 +646,7 @@ mod tests {
         let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
             \x20 - file: parts/ans.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
         fs::write(dir.path().join("01-q.md"), source).expect("question");
-        let sources = read_question_sources(dir.path()).expect("sources");
+        let sources = read_question_sources(dir.path(), false).expect("sources");
         let read = partial_reader(dir.path());
         let bank = parse::item_bank_from_sources_with("m", sources, &read).expect("bank");
         // The partial's `img.png` was rebased to `parts/img.png`, which exists.
@@ -533,7 +664,7 @@ mod tests {
         let source = "---\nid: q\nkind: multiple_choice\nchoices:\n\
             \x20 - file: parts/nope.md\n    correct: true\n  - text: No\n---\n\nPick?\n";
         fs::write(dir.path().join("01-q.md"), source).expect("question");
-        let sources = read_question_sources(dir.path()).expect("sources");
+        let sources = read_question_sources(dir.path(), false).expect("sources");
         let read = partial_reader(dir.path());
         let err = parse::item_bank_from_sources_with("m", sources, &read).expect_err("missing");
         assert!(err.to_string().contains("01-q.md"));

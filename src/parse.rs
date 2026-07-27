@@ -456,6 +456,19 @@ fn parent_dir(path: &str) -> &str {
     }
 }
 
+/// Prefix every local image path in `question`'s rich-text fields with `base`,
+/// the question's subdirectory relative to the export root.
+///
+/// A question authored in a subfolder references its images relative to that
+/// folder; this rebases them to the export root so a single image loader (rooted
+/// there) resolves them. A blank `base` is a no-op, so top-level questions are
+/// unaffected. Absolute and external URLs are left untouched.
+pub fn rebase_local_paths(question: &mut Question, base: &str) {
+    for field in question.rich_text_fields_mut() {
+        *field = rebase_images(field, base);
+    }
+}
+
 /// Rewrite each local image URL in `markdown` to sit under `base` (the partial's
 /// directory), so bundling resolves it relative to the bank root. External and
 /// absolute URLs are left untouched; an empty `base` needs no rewrite.
@@ -789,12 +802,13 @@ where
     item_bank_from_sources_with(name, sources, &reject_includes)
 }
 
-/// Assemble an [`ItemBank`], resolving `file:` partials via `read`.
+/// Assemble an [`ItemBank`] from sources sharing one `read`er, resolving `file:`
+/// partials through it.
 ///
 /// Sources are ordered by filename for a deterministic bank layout, then each is
-/// parsed via [`parse_question_with`]. This is the seam the CLI wires its
-/// directory walk onto (supplying a reader rooted at the bank directory), so the
-/// assembly stays testable without a process.
+/// parsed via [`parse_question_with`]. A disk-free seam, testable without a
+/// process. (The CLI's recursive export instead parses each source with a reader
+/// rooted at its own subdirectory, rebasing paths per question.)
 ///
 /// # Errors
 ///
@@ -1015,6 +1029,23 @@ mod tests {
         assert!(rebased.contains("https://x/y.png"));
         // An empty base is a no-op.
         assert_eq!(rebase_images(md, ""), md);
+    }
+
+    #[test]
+    /// `rebase_local_paths` prefixes local image paths in every rich-text field
+    /// (prompt and feedback) with the subdirectory; externals/empty base untouched.
+    fn rebase_local_paths_prefixes_by_subdir() {
+        let mut q = question("q");
+        q.prompt = "![a](foo.png) and ![b](https://x/y.png)".to_owned();
+        q.feedback.general = Some("hint ![f](fb.png)".to_owned());
+        rebase_local_paths(&mut q, "sub");
+        assert!(q.prompt.contains("![a](sub/foo.png)"));
+        assert!(q.prompt.contains("https://x/y.png"));
+        // A non-prompt field is rebased too (the rich_text_fields_mut walk).
+        assert_eq!(q.feedback.general.as_deref(), Some("hint ![f](sub/fb.png)"));
+        // An empty base leaves the (already-rebased) content unchanged.
+        rebase_local_paths(&mut q, "");
+        assert!(q.prompt.contains("![a](sub/foo.png)"));
     }
 
     #[test]
