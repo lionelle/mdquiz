@@ -3,7 +3,7 @@
 //! Each source file is one question. YAML front-matter (a `---`-delimited block
 //! at the top of the file) carries the machine-readable answer data; everything
 //! below it is the prompt as ordinary Markdown. Parsing splits the two: the
-//! front-matter is deserialized into a [`QuestionSpec`] (a flat, `kind`-tagged
+//! front-matter is deserialized into a `QuestionSpec` (a flat, `kind`-tagged
 //! shape), and the body becomes the prompt. A directory of such files is
 //! assembled into one [`ItemBank`].
 
@@ -24,14 +24,15 @@ use crate::model::{
 /// human-readable message on failure.
 ///
 /// Supplied by the caller that owns the files (the CLI), so the parse layer
-/// stays free of direct filesystem calls. The default reader
-/// ([`reject_includes`]) rejects every `file:`, so `parse_question` and
-/// `item_bank_from_sources` support inline content only; callers that can read
-/// files use the `_with` variants.
+/// stays free of direct filesystem calls. The default reader (`reject_includes`)
+/// rejects every `file:`, so `parse_question` and `item_bank_from_sources`
+/// support inline content only; callers that can read files use the `_with`
+/// variants.
 ///
-/// The failure type is a plain `String` message (not the crate [`Error`]) so
-/// callers need not depend on the crate's error type; [`read_partial`] wraps it
-/// into [`crate::Error::InvalidQuestion`] with the question's context.
+/// The failure type is a plain `String` message (not the crate
+/// [`Error`](crate::Error)) so callers need not depend on the crate's error
+/// type; `read_partial` wraps it into [`crate::Error::InvalidQuestion`] with the
+/// question's context.
 pub type PartialReader<'a> = dyn Fn(&str) -> std::result::Result<String, String> + 'a;
 
 /// A [`PartialReader`] that rejects every include, for the disk-free entry
@@ -538,7 +539,7 @@ pub fn parse_question(source: &str) -> Result<Question> {
 /// # Errors
 ///
 /// As [`parse_question`], plus any partial-resolution failure surfaced through
-/// `read` (see [`resolve_content`]).
+/// `read`.
 pub fn parse_question_with(source: &str, read: &PartialReader<'_>) -> Result<Question> {
     let (yaml, prompt) = extract_yaml_and_prompt(source)?;
     let spec: QuestionSpec = serde_norway::from_str(&yaml)?;

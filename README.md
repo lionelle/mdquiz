@@ -1,67 +1,125 @@
 # mdquiz
 
-Author quiz questions as **Markdown + YAML**, then assemble a directory of them
-into an **item bank** and export it to either a **print-ready Markdown sheet**
-(no answer key) or a **Canvas *New Quizzes* item bank** (QTI package) you can
-upload to Canvas.
+Author quiz questions as **Markdown + YAML**, then export a whole directory of
+them as a **Canvas *New Quizzes* item bank** (QTI package) — or a **print-ready
+Markdown sheet** with no answer key.
 
-> Status: all six question types are implemented on both exporters. See
-> [`docs/`](docs/) for the authoring reference and [`samples/`](samples/) for
-> runnable examples.
+> **Status: alpha.** All six question types work on both exporters and the
+> format is documented, but it hasn't been battle-tested across many Canvas
+> instances yet. Expect rough edges; feedback welcome.
 
-## Idea
+Each question is a single Markdown file: a `---`-delimited **YAML front-matter**
+block carries the machine-readable parts (answers, choices, scoring…), and
+everything below it is the prompt as ordinary Markdown.
 
-Each question is one Markdown file: **YAML front-matter** (a `---`-delimited
-block at the top) carries the machine-readable parts (choices, correct answers,
-scoring, matching pairs, regex for fill-in-the-blank, …), and everything below
-it is the prompt as plain Markdown. A directory of question files — say
-`module01/` with 10–20 questions — is assembled into a single item bank.
-`mdquiz` parses those files into a typed model and renders the export you ask
-for.
+```markdown
+---
+id: tf-binary-search
+kind: true_false
+answer: true
+---
 
-```
-module01/*.md  ─▶  parse  ─▶  ItemBank model  ─▶  export ─┬─ print Markdown (no solutions)
-                                                          └─ Canvas New Quizzes item bank (QTI)
+Binary search requires its input array to be sorted.
 ```
 
-An item bank is the only collection today. A future `Quiz` target can build on
-the same model: in Canvas *New Quizzes* a quiz draws its questions from item
-banks, so the bank is the natural first artifact.
+## Features
 
-Question types follow the Canvas **New Quizzes** model: true/false, multiple
-choice, multiple select, fill in the blank (literal or regex), matching, and
-ordering. Each is documented under [`docs/`](docs/).
+- **Six question types:** true/false, multiple choice, multiple select, fill in
+  the blank (literal *and* regex), matching, and ordering.
+- **Rich prompts and answers:** images (bundled into the package), LaTeX math
+  (`$…$`, rendered by Canvas's native equation service), [Mermaid](https://mermaid.js.org)
+  diagrams (rendered to images), and `file:` includes that pull content from
+  separate Markdown files.
+- **Two exports:** a Canvas New Quizzes **QTI `.zip`** (the default) and a
+  **print-ready Markdown** sheet with no answer key (add `--include-key` for a
+  matching answer-key file).
+- **One command:** point it at a directory; add `--recursive` to gather a whole
+  tree of subfolders into one bank, or `--sample N` to draw N random questions
+  from each folder. For print sheets, `--include-key` emits an answer key and
+  `--random-order` shuffles the questions.
 
-## Usage
+## Install
+
+mdquiz is a Rust CLI. You need a recent stable [Rust toolchain](https://rustup.rs)
+(edition 2024). Build and install the `mdquiz` binary from source:
 
 ```bash
-# The bank name defaults to the directory name ("module01"); override with --name.
-cargo run -- export module01/ --output module01.md   --format markdown
-cargo run -- export module01/ --output module01.zip  --format canvas
+git clone https://github.com/lionelle/mdquiz
+cd mdquiz
+cargo install --path .
 ```
 
-The Canvas output is a zipped QTI package — import it via Canvas's **"QTI .zip
-file"** option, so give it a `.zip` extension.
+That puts `mdquiz` on your `PATH` (via `~/.cargo/bin`). Prefer not to install?
+Run it in place with `cargo run -- <args>` instead of `mdquiz <args>`.
+
+**Optional:** rendering Mermaid diagrams needs the
+[mermaid CLI](https://github.com/mermaid-js/mermaid-cli) — mdquiz uses `mmdc` if
+it's on your `PATH`, otherwise `npx @mermaid-js/mermaid-cli`
+(`npm install -g @mermaid-js/mermaid-cli`). Without it, diagrams are left as code
+blocks and a warning tells you which; everything else still exports.
+
+## Quick start
+
+```bash
+# 1. Make a directory with one question.
+mkdir quiz
+cat > quiz/01-binary-search.md <<'EOF'
+---
+id: tf-binary-search
+kind: true_false
+answer: true
+---
+
+Binary search requires its input array to be sorted.
+EOF
+
+# 2. Export a Canvas package (canvas is the default format).
+mdquiz export quiz/ --output quiz.zip
+
+# ...or a print-ready sheet:
+mdquiz export quiz/ --output quiz.md --format markdown
+```
+
+Then in Canvas: create a **New Quizzes item bank**, open it, and import
+`quiz.zip` through the **"QTI .zip file"** option. The bank name defaults to the
+directory name; override it with `--name`.
+
+The [`samples/`](samples/) directory has a ready-to-export bank for every
+question type — try `mdquiz export samples/multiple-choice/ --output mc.zip`.
+
+## How it works
+
+```
+quiz/*.md  ─▶  parse  ─▶  ItemBank model  ─▶  export ─┬─ Canvas New Quizzes QTI (.zip)
+                                                      └─ print Markdown (no solutions)
+```
+
+Questions follow the Canvas **New Quizzes** model. The parsing and export stages
+are pure data transforms with no filesystem or process dependencies (the CLI
+injects those), so the pipeline is easy to test and reason about.
 
 ## Documentation
 
-- [`docs/`](docs/) — the authoring-format reference: common metadata (which
-  fields are required vs optional), a page per question type, plus images and
-  exporting.
-- [`samples/`](samples/) — runnable example banks, one directory per type.
+- **[`docs/`](docs/)** — the authoring reference: [common
+  metadata](docs/README.md) (which fields are required vs optional), a page per
+  [question type](docs/README.md#question-types), and guides for
+  [images](docs/images.md), [math](docs/math.md), [Mermaid](docs/mermaid.md),
+  [file includes](docs/partials.md), and [exporting](docs/exporting.md).
+- **[`samples/`](samples/)** — runnable example banks, one directory per feature.
 
 ## Development
 
 ```bash
-pre-commit install          # wire up the git hooks (once)
 cargo test
-pre-commit run --all-files  # fmt + clippy (-D warnings) + tests
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --all -- --check
+pre-commit run --all-files   # the same gate the commit hook runs
 ```
 
-Quality bar (enforced by clippy, the pre-commit hook, and CI): functions ≤ 30
-lines, docs on every function, zero warnings, no uncaught panics, no `unsafe`.
+The quality bar (enforced by clippy, the pre-commit hook, and CI): functions
+≤ 30 lines, docs on every item, zero warnings, no uncaught panics, no `unsafe`.
 See [`CLAUDE.md`](CLAUDE.md) for the full working agreement.
 
 ## License
 
-Licensed under either of Apache-2.0 or MIT at your option.
+Licensed under the [MIT License](LICENSE).

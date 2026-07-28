@@ -5,6 +5,9 @@
 the reference for the authoring format; [`../samples/`](../samples/) holds
 runnable examples you can export as-is.
 
+> New here? Start with the [project README](../README.md) for installation and a
+> first-run quick start, then come back here for the authoring format.
+
 ## How a question file is shaped
 
 Every question lives in its own `*.md` file: a **YAML front-matter** block

@@ -1101,7 +1101,7 @@ fn percent_encode_component(text: &str) -> String {
 
 /// The distinct local-image paths referenced by any question in `bank`.
 ///
-/// Scans every rich-text field (see [`Question::rich_text_fields`]), so images
+/// Scans every rich-text field (see `Question::rich_text_fields`), so images
 /// embedded in answers and feedback are bundled just like prompt images. The
 /// exporter bundles these under `web_resources/`; the CLI resolves them to bytes
 /// relative to the question directory.

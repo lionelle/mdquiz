@@ -8,7 +8,8 @@ numeric prefixes control question order.
 
 ```bash
 mdquiz export <DIR> --output <OUTPUT> \
-  [--format <markdown|canvas>] [--name <NAME>] [--recursive] [--diagram-format <png|svg>]
+  [--format <markdown|canvas>] [--name <NAME>] [--recursive] [--sample <N>] \
+  [--include-key] [--random-order] [--diagram-format <png|svg>]
 ```
 
 | Option              | Required? | Meaning                                                       |
@@ -18,6 +19,9 @@ mdquiz export <DIR> --output <OUTPUT> \
 | `-f`, `--format`    | Optional  | `canvas` (QTI package, **default**) or `markdown` (print sheet). |
 | `-n`, `--name`      | Optional  | Bank name; defaults to the directory's own name.              |
 | `-r`, `--recursive` | Optional  | Descend into subdirectories, gathering every question into one bank (see below). |
+| `--sample <N>`      | Optional  | Keep at most `N` randomly-chosen questions **from each directory** (see below). |
+| `--include-key`     | Optional  | Also write a matching answer key (markdown export only; see below). |
+| `--random-order`    | Optional  | Shuffle the questions into a random order after selection (markdown export only). |
 | `--diagram-format`  | Optional  | Mermaid image format, `png` (default) or `svg`; Canvas export only. See [mermaid.md](mermaid.md). |
 
 ## Which files become questions
@@ -38,6 +42,22 @@ question at `module01/q.md` referencing `diagram.png` uses
 mdquiz export course/ --recursive --output course.zip --format canvas
 ```
 
+## Sampling a random subset
+
+`--sample <N>` keeps at most `N` randomly-chosen questions **from each
+directory** (questions are grouped by the folder they live in). Combined with
+`-r`, it draws `N` from every topic folder — handy for generating a print quiz
+that covers each topic without using every question. A folder with fewer than
+`N` questions contributes all of them.
+
+```bash
+# A practice sheet: 3 random questions from each topic folder.
+mdquiz export course/ --recursive --sample 3 --format markdown --output practice.md
+```
+
+The selection is random on every run (re-run for a different draw); the chosen
+questions are laid out in their normal path order.
+
 ## Formats
 
 ### `markdown` — print-ready sheet
@@ -47,6 +67,35 @@ answer key and any scoring hints. Questions are numbered under the bank name.
 
 ```bash
 mdquiz export samples/true-false/ --output true-false.md --format markdown
+```
+
+#### Answer key (`--include-key`)
+
+Add `--include-key` to also write a **second** file — `<output>-key.md` (e.g.
+`quiz.md` → `quiz-key.md`) — an instructor answer key. It uses the same
+numbering as the sheet, and each entry shows **only** the correct answer(s):
+`True`/`False`, the correct choice(s) by letter, each blank's accepted answers,
+the correct matching pairs, or the items in their correct order.
+
+```bash
+mdquiz export quiz/ --format markdown --include-key --output quiz.md
+# writes quiz.md (student sheet) and quiz-key.md (answer key)
+```
+
+`--include-key` applies only to the markdown format (the Canvas package already
+carries the answers).
+
+#### Random order (`--random-order`)
+
+Add `--random-order` to shuffle the questions into a random order **after**
+selection (so it composes with `--sample`). When combined with `--include-key`,
+the answer key is shuffled to match, keeping the numbering aligned. Like
+`--include-key`, it applies only to the markdown format.
+
+```bash
+# Sample 3 per topic, shuffle them, and print a keyed practice quiz.
+mdquiz export course/ -r --sample 3 --random-order --include-key \
+  --format markdown --output practice.md
 ```
 
 ### `canvas` — Canvas New Quizzes item bank

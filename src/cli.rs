@@ -46,6 +46,18 @@ pub(crate) enum Command {
         /// Recurse into subdirectories, gathering every question into one bank.
         #[arg(short, long)]
         recursive: bool,
+        /// Keep at most N randomly-chosen questions from each directory (handy
+        /// with `-r` to build a print quiz that samples every topic).
+        #[arg(long, value_name = "N")]
+        sample: Option<usize>,
+        /// Also write a matching answer key (markdown export only): a second
+        /// file, `<output>-key.md`, with each question's correct answer.
+        #[arg(long)]
+        include_key: bool,
+        /// Shuffle the questions into a random order after selection (markdown
+        /// export only).
+        #[arg(long)]
+        random_order: bool,
         /// Image format for rendered mermaid diagrams (Canvas export only).
         #[arg(long, value_enum, default_value_t = DiagramFormatArg::Png)]
         diagram_format: DiagramFormatArg,
@@ -104,19 +116,59 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             format,
             name,
             recursive,
+            sample,
+            include_key,
+            random_order,
             diagram_format,
         } => {
-            let sources = read_question_sources(&dir, recursive)?;
-            let mut bank = build_bank(&dir, bank_name(&dir, name), sources)?;
+            if (include_key || random_order) && matches!(format, FormatArg::Canvas) {
+                anyhow::bail!("--include-key and --random-order apply only to `--format markdown`");
+            }
+            let mut bank = assemble_bank(&dir, name, recursive, sample, random_order)?;
             // Mermaid rendering and image bundling apply only to the Canvas package.
             let images = match format {
                 FormatArg::Canvas => canvas_images(&dir, &mut bank, diagram_format.into()),
                 FormatArg::Markdown => Vec::new(),
             };
             let reminders = write_export(&bank, format.into(), &output, &images)?;
+            if include_key {
+                write_answer_key(&bank, &output)?;
+            }
             print_import_reminders(&reminders);
             Ok(())
         }
+    }
+}
+
+/// Read a directory's questions into a bank, optionally recursing, sampling,
+/// and shuffling the final order.
+///
+/// # Errors
+///
+/// Propagates any source-read, parse, or assembly failure.
+fn assemble_bank(
+    dir: &Path,
+    name: Option<String>,
+    recursive: bool,
+    sample: Option<usize>,
+    random_order: bool,
+) -> anyhow::Result<ItemBank> {
+    let mut rng = SampleRng::from_entropy();
+    let mut sources = read_question_sources(dir, recursive)?;
+    if let Some(limit) = sample {
+        sources = sample_per_directory(sources, limit, &mut rng);
+    }
+    let mut bank = build_bank(dir, bank_name(dir, name), sources)?;
+    if random_order {
+        shuffle(&mut bank.items, &mut rng);
+    }
+    Ok(bank)
+}
+
+/// Randomly permute `items` in place (Fisher-Yates).
+fn shuffle<T>(items: &mut [T], rng: &mut SampleRng) {
+    for index in (1..items.len()).rev() {
+        items.swap(index, rng.index(index + 1));
     }
 }
 
@@ -334,6 +386,80 @@ fn build_bank(
     Ok(parse::item_bank_from_questions(name, questions)?)
 }
 
+/// Keep at most `limit` questions from each directory, chosen at random.
+///
+/// Sources are grouped by their parent directory (top-level files form one
+/// group, keyed by `""`), and each group is independently down-sampled to
+/// `limit`. Group order and the relative order of the questions kept within a
+/// group are preserved; only which questions survive is random.
+fn sample_per_directory(
+    sources: Vec<(String, String)>,
+    limit: usize,
+    rng: &mut SampleRng,
+) -> Vec<(String, String)> {
+    let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for source in sources {
+        let dir = source.0.rsplit_once('/').map_or("", |(parent, _)| parent);
+        match groups.iter_mut().find(|(name, _)| name == dir) {
+            Some((_, group)) => group.push(source),
+            None => groups.push((dir.to_owned(), vec![source])),
+        }
+    }
+    let mut kept = Vec::new();
+    for (_, group) in groups {
+        kept.extend(sample_group(group, limit, rng));
+    }
+    kept
+}
+
+/// Randomly keep `limit` of `group` (all of it when it is already that small),
+/// preserving the relative order of the survivors.
+fn sample_group(
+    mut group: Vec<(String, String)>,
+    limit: usize,
+    rng: &mut SampleRng,
+) -> Vec<(String, String)> {
+    if group.len() <= limit {
+        return group;
+    }
+    // Partial Fisher-Yates: move `limit` random items to the front, then keep
+    // them in their original relative order for a stable sheet layout.
+    for slot in 0..limit {
+        let pick = slot + rng.index(group.len() - slot);
+        group.swap(slot, pick);
+    }
+    group.truncate(limit);
+    group.sort_by(|a, b| a.0.cmp(&b.0));
+    group
+}
+
+/// A tiny non-cryptographic PRNG (`SplitMix64`) for sampling questions.
+struct SampleRng(u64);
+
+impl SampleRng {
+    /// Seed from operating-system entropy mixed with the current time.
+    fn from_entropy() -> Self {
+        use std::hash::BuildHasher as _;
+        let seed =
+            std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
+        Self(seed)
+    }
+
+    /// The next pseudo-random `u64`.
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A pseudo-random index in `0..bound` (`bound` must be non-zero).
+    fn index(&mut self, bound: usize) -> usize {
+        usize::try_from(self.next_u64() % bound as u64).unwrap_or(0)
+    }
+}
+
 /// Choose the bank name: the `--name` override, else the directory's own name.
 fn bank_name(dir: &Path, name: Option<String>) -> String {
     name.unwrap_or_else(|| {
@@ -372,6 +498,33 @@ fn write_export(
             Ok(canvas::import_reminders(bank))
         }
     }
+}
+
+/// Write the answer key beside the markdown sheet, at [`key_path`]`(output)`.
+///
+/// # Errors
+///
+/// Returns an error if the key file cannot be written.
+fn write_answer_key(bank: &ItemBank, output: &Path) -> anyhow::Result<()> {
+    let path = key_path(output);
+    fs::write(&path, markdown::to_answer_key(bank))
+        .with_context(|| format!("writing answer key to {}", path.display()))?;
+    eprintln!("wrote answer key to {}", path.display());
+    Ok(())
+}
+
+/// The answer-key path for a sheet `output`: `<stem>-key.<ext>` in the same
+/// directory (e.g. `quiz.md` → `quiz-key.md`).
+fn key_path(output: &Path) -> PathBuf {
+    let mut name = output
+        .file_stem()
+        .map_or_else(String::new, |stem| stem.to_string_lossy().into_owned());
+    name.push_str("-key");
+    if let Some(ext) = output.extension() {
+        name.push('.');
+        name.push_str(&ext.to_string_lossy());
+    }
+    output.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -445,6 +598,70 @@ mod tests {
         let sources = read_question_sources(dir.path(), false).expect("read sources");
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["q1.md"]);
+    }
+
+    /// Build `(path, "")` sources for the given relative paths.
+    fn sources(paths: &[&str]) -> Vec<(String, String)> {
+        paths
+            .iter()
+            .map(|p| ((*p).to_owned(), String::new()))
+            .collect()
+    }
+
+    /// The directory of each kept source, in order.
+    fn dirs_of(kept: &[(String, String)]) -> Vec<&str> {
+        kept.iter()
+            .map(|(p, _)| p.rsplit_once('/').map_or("", |(dir, _)| dir))
+            .collect()
+    }
+
+    #[test]
+    /// Sampling caps each directory at `limit` and keeps smaller groups whole.
+    fn sample_per_directory_caps_each_group() {
+        let src = sources(&["a/1.md", "a/2.md", "a/3.md", "b/1.md"]);
+        let kept = sample_per_directory(src, 2, &mut SampleRng(1));
+        let dirs = dirs_of(&kept);
+        assert_eq!(kept.len(), 3); // a: 3 -> 2, b: 1 -> 1
+        assert_eq!(dirs.iter().filter(|d| **d == "a").count(), 2);
+        assert_eq!(dirs.iter().filter(|d| **d == "b").count(), 1);
+    }
+
+    #[test]
+    /// A fixed seed makes sampling reproducible, and survivors stay in path order.
+    fn sample_is_deterministic_and_ordered() {
+        let src = sources(&["d/0.md", "d/1.md", "d/2.md", "d/3.md", "d/4.md"]);
+        let first = sample_per_directory(src.clone(), 3, &mut SampleRng(42));
+        let again = sample_per_directory(src, 3, &mut SampleRng(42));
+        assert_eq!(first, again);
+        assert_eq!(first.len(), 3);
+        let paths: Vec<&str> = first.iter().map(|(p, _)| p.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted);
+    }
+
+    #[test]
+    /// The PRNG always yields an index within bounds.
+    fn sample_rng_index_is_in_bounds() {
+        let mut rng = SampleRng(7);
+        for _ in 0..100 {
+            assert!(rng.index(5) < 5);
+        }
+    }
+
+    #[test]
+    /// Shuffling permutes the items and is reproducible for a fixed seed.
+    fn shuffle_permutes_deterministically() {
+        let original: Vec<u32> = (0..8).collect();
+        let mut first = original.clone();
+        let mut again = original.clone();
+        shuffle(&mut first, &mut SampleRng(99));
+        shuffle(&mut again, &mut SampleRng(99));
+        assert_eq!(first, again); // same seed -> same order
+        assert_ne!(first, original); // it actually reordered
+        let mut sorted = first.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, original); // and it is a permutation (nothing lost)
     }
 
     #[test]
@@ -678,6 +895,26 @@ mod tests {
         write_export(&true_false_bank(), export::Format::Markdown, &out, &[]).expect("write");
         let text = fs::read_to_string(&out).expect("read back");
         assert!(text.starts_with("# M"));
+    }
+
+    #[test]
+    /// The answer-key path inserts `-key` before the extension.
+    fn key_path_inserts_key_suffix() {
+        assert_eq!(key_path(Path::new("quiz.md")), Path::new("quiz-key.md"));
+        assert_eq!(
+            key_path(Path::new("out/quiz.md")),
+            Path::new("out/quiz-key.md")
+        );
+        assert_eq!(key_path(Path::new("quiz")), Path::new("quiz-key"));
+    }
+
+    #[test]
+    /// `write_answer_key` writes the key beside the sheet.
+    fn write_answer_key_writes_key_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_answer_key(&true_false_bank(), &dir.path().join("quiz.md")).expect("write key");
+        let key = fs::read_to_string(dir.path().join("quiz-key.md")).expect("read key");
+        assert!(key.contains("Answer Key"));
     }
 
     #[test]

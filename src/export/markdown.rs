@@ -1,7 +1,8 @@
-//! Render an item bank to a single print-ready Markdown sheet.
+//! Render an item bank to print-ready Markdown.
 //!
-//! This target is for paper distribution, so it deliberately omits the answer
-//! key and any per-question scoring hints.
+//! [`to_print_markdown`] produces the student sheet — no answer key or scoring
+//! hints. [`to_answer_key`] produces the matching instructor key: the same
+//! numbering, but each question shows only its correct answer(s).
 
 use std::fmt::Write as _;
 
@@ -14,7 +15,7 @@ use crate::model::{Blank, Choice, Matching, Ordering, Question, QuestionKind};
 ///
 /// # Errors
 ///
-/// Currently infallible; the `Result` is retained because [`render_question`]
+/// Currently infallible; the `Result` is retained because `render_question`
 /// keeps a fallible signature for future `#[non_exhaustive]` question kinds.
 pub fn to_print_markdown(bank: &crate::model::ItemBank) -> Result<String> {
     let mut out = format!("# {}\n", bank.name);
@@ -129,6 +130,77 @@ fn choice_label(index: usize) -> String {
         return char::from(b'A' + offset).to_string();
     }
     (index + 1).to_string()
+}
+
+/// Render `bank` as a Markdown **answer key**: each question number with only
+/// its correct answer(s), for the instructor.
+///
+/// Pairs with [`to_print_markdown`] — the numbering matches, so the key reads
+/// alongside the answer-free question sheet.
+#[must_use]
+pub fn to_answer_key(bank: &crate::model::ItemBank) -> String {
+    let mut out = format!("# {} — Answer Key\n", bank.name);
+    for (index, question) in bank.items.iter().enumerate() {
+        out.push('\n');
+        out.push_str(&render_answer(index + 1, question));
+    }
+    out
+}
+
+/// Render one numbered question's correct answer(s), dispatching on its kind.
+fn render_answer(number: usize, question: &Question) -> String {
+    let answer = match &question.kind {
+        QuestionKind::TrueFalse(tf) => {
+            (if tf.answer { "**True**" } else { "**False**" }).to_owned()
+        }
+        QuestionKind::MultipleChoice(set) => correct_choices(&set.choices),
+        QuestionKind::MultipleSelect(set) => correct_choices(&set.choices),
+        QuestionKind::FillInBlank(fitb) => blank_answers(&fitb.blanks),
+        QuestionKind::Matching(matching) => matching_answer(matching),
+        QuestionKind::Ordering(ordering) => ordering_answer(ordering),
+    };
+    format!("{number}. {answer}\n")
+}
+
+/// The correct choices as `label. text`, joined; covers single and multi-select.
+fn correct_choices(choices: &[Choice]) -> String {
+    choices
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| choice.correct)
+        .map(|(index, choice)| format!("{}. {}", choice_label(index), choice.text))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Each blank's accepted answers, as `name: a, b`, joined.
+fn blank_answers(blanks: &[Blank]) -> String {
+    blanks
+        .iter()
+        .map(|blank| format!("{}: {}", blank.id, blank.answers.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Each correct left → right pairing, joined.
+fn matching_answer(matching: &Matching) -> String {
+    matching
+        .pairs
+        .iter()
+        .map(|pair| format!("{} → {}", pair.left, pair.right))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The items in their correct order, numbered.
+fn ordering_answer(ordering: &Ordering) -> String {
+    ordering
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| format!("{}. {item}", index + 1))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[cfg(test)]
@@ -399,5 +471,47 @@ mod tests {
         let out = to_print_markdown(&bank).expect("renders");
         assert!(out.contains("$O(n)$") && out.contains("```mermaid"));
         assert!(!out.contains("equation_image") && !out.contains("![diagram]"));
+    }
+
+    /// A one-question bank for the given `kind`.
+    fn key_question(kind: QuestionKind) -> Question {
+        Question {
+            id: "q".to_owned(),
+            title: None,
+            prompt: "p".to_owned(),
+            points: 1.0,
+            tags: Vec::new(),
+            feedback: Feedback::default(),
+            kind,
+        }
+    }
+
+    #[test]
+    /// The answer key shows only correct answers, numbered like the sheet.
+    fn answer_key_shows_only_correct_answers() {
+        let bank = ItemBank {
+            name: "Q".to_owned(),
+            items: vec![
+                key_question(QuestionKind::TrueFalse(TrueFalse { answer: false })),
+                key_question(QuestionKind::MultipleChoice(ChoiceSet {
+                    choices: vec![
+                        Choice {
+                            text: "Right".to_owned(),
+                            correct: true,
+                        },
+                        Choice {
+                            text: "Wrong".to_owned(),
+                            correct: false,
+                        },
+                    ],
+                })),
+            ],
+        };
+        let key = to_answer_key(&bank);
+        assert!(key.contains("# Q — Answer Key"));
+        assert!(key.contains("1. **False**"));
+        assert!(key.contains("2. A. Right"));
+        // The distractor is absent — the key lists correct answers only.
+        assert!(!key.contains("Wrong"));
     }
 }

@@ -355,7 +355,7 @@ impl Matching {
 /// The payload for a [`QuestionKind::Ordering`] question.
 ///
 /// `items` are authored in the *correct* order; the exporters shuffle them for
-/// display (see [`Ordering::display_order`]) so the shown sequence is not the
+/// display (see `Ordering::display_order`) so the shown sequence is not the
 /// answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ordering {
