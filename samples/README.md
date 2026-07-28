@@ -35,8 +35,8 @@ The bank name defaults to the directory name (`true-false`); override it with
 A question file is **YAML front-matter** (a `---`-delimited block at the very
 top of the file) carrying the machine-readable data, followed by the prompt as
 ordinary Markdown. Everything below the closing `---` is the prompt, so you can
-use normal Markdown — emphasis, inline `code`, Markdown headings, even fenced
-code blocks in any language.
+use normal Markdown — emphasis, inline `code`, Markdown headings, GitHub-flavored
+pipe tables and `~~strikethrough~~`, even fenced code blocks in any language.
 
 ### Common fields
 

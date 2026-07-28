@@ -12,7 +12,8 @@ runnable examples you can export as-is.
 
 Every question lives in its own `*.md` file: a **YAML front-matter** block
 (delimited by `---` at the very top) carries the machine-readable data, and
-everything below the closing `---` is the prompt as ordinary Markdown.
+everything below the closing `---` is the prompt as ordinary Markdown
+(including GitHub-flavored pipe tables and `~~strikethrough~~`).
 
 ```markdown
 ---

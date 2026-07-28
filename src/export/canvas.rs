@@ -1006,9 +1006,13 @@ fn general_condition_xml(feedback: &Feedback) -> String {
 /// they resolve to the files bundled under `web_resources/`; absolute URLs
 /// (`http(s)://`, `//`, `data:`, root-relative) are left untouched. Inline and
 /// display math (`$…$` / `$$…$$`) become Canvas's native `equation_image`.
+///
+/// GitHub-flavored extensions are enabled so common authoring — pipe tables and
+/// `~~strikethrough~~` — renders as real HTML rather than literal text.
 fn prompt_html(markdown: &str) -> String {
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
     let mut rendered = String::new();
-    let parser = Parser::new_ext(markdown, Options::ENABLE_MATH)
+    let parser = Parser::new_ext(markdown, options)
         .map(rewrite_local_image)
         .map(rewrite_math);
     html::push_html(&mut rendered, parser);
@@ -1757,6 +1761,25 @@ mod tests {
             prompt_html("A **bold** word"),
             "<p>A <strong>bold</strong> word</p>"
         );
+    }
+
+    #[test]
+    /// A Markdown pipe table renders as an HTML `<table>`, not literal text.
+    fn markdown_table_renders_as_html() {
+        let prompt = "Costs:\n\n| Op | Cost |\n|----|------|\n| push | O(1) |\n";
+        let xml = assessment_xml("a", &true_false_bank(true, prompt)).expect("renders");
+        // mattext is HTML-escaped, so `<table>` appears as `&lt;table&gt;`.
+        assert!(xml.contains("&lt;table&gt;"));
+        assert!(xml.contains("&lt;td&gt;push&lt;/td&gt;"));
+        assert!(!xml.contains("| push |"));
+    }
+
+    #[test]
+    /// GFM `~~strikethrough~~` renders as `<del>`.
+    fn markdown_strikethrough_renders() {
+        let xml =
+            assessment_xml("a", &true_false_bank(true, "This is ~~wrong~~.")).expect("renders");
+        assert!(xml.contains("&lt;del&gt;wrong&lt;/del&gt;"));
     }
 
     #[test]
