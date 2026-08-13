@@ -22,7 +22,7 @@ mdquiz export <DIR> --output <OUTPUT> \
 | `--sample <N>`      | Optional  | Keep at most `N` randomly-chosen questions **from each directory** (see below). |
 | `--include-key`     | Optional  | Also write a matching answer key (markdown export only; see below). |
 | `--random-order`    | Optional  | Shuffle the questions into a random order after selection (markdown export only). |
-| `--diagram-format`  | Optional  | Mermaid image format, `png` (default) or `svg`; Canvas export only. See [mermaid.md](mermaid.md). |
+| `--diagram-format`  | Optional  | Diagram image format, `png` (default) or `svg`; Canvas export only. See [diagrams.md](diagrams.md). |
 
 ## Which files become questions
 

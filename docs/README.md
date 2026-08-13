@@ -98,8 +98,8 @@ See also:
 - [images.md](images.md) — adding pictures to prompts, answers, and feedback.
 - [math.md](math.md) — LaTeX math (`$…$` / `$$…$$`) via Canvas's native
   equation rendering.
-- [mermaid.md](mermaid.md) — ` ```mermaid ` diagrams rendered to bundled images
-  on Canvas export.
+- [diagrams.md](diagrams.md) — ` ```mermaid ` and ` ```dot ` (Graphviz) diagrams
+  rendered to bundled images on Canvas export.
 - [partials.md](partials.md) — pointing a choice, ordering item, or feedback
   message at a separate Markdown file (`file:`) instead of inline text.
 - [exporting.md](exporting.md) — the CLI and the Canvas import workflow.

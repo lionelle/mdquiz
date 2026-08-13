@@ -24,6 +24,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # The Graphviz-backed diagram tests skip themselves when `dot` is absent,
+      # so CI installs it to keep that path actually covered.
+      - name: Install Graphviz
+        run: sudo apt-get update && sudo apt-get install -y graphviz
+
       - name: Formatting
         run: cargo fmt --all -- --check
 

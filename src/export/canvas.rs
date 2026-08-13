@@ -1992,7 +1992,7 @@ mod tests {
 
     #[test]
     /// A generated-diagram image bundles like any other (the exporter is
-    /// provenance-agnostic; the CLI supplies the bytes from the mermaid pass).
+    /// provenance-agnostic; the CLI supplies the bytes from the diagram pass).
     fn generated_diagram_image_is_bundled() {
         let bank = image_bank("![d](generated/mermaid-abc.png)");
         let images = vec![("generated/mermaid-abc.png".to_owned(), vec![1_u8, 2, 3])];
@@ -2003,6 +2003,39 @@ mod tests {
                 .file_names()
                 .any(|name| name == "web_resources/generated/mermaid-abc.png")
         );
+    }
+
+    #[test]
+    /// A Graphviz block travels the whole Canvas path: the diagram pass replaces
+    /// the fence, the item HTML points at the generated image, and its bytes are
+    /// bundled under `web_resources/`.
+    fn graphviz_diagram_reaches_canvas_package() {
+        use crate::diagram::{DiagramFormat, DiagramLanguage, render_diagrams};
+        let mut bank = image_bank("```dot\ndigraph { a -> b; }\n```");
+        let render = |_language: DiagramLanguage, _source: &str| Ok(vec![1_u8, 2, 3]);
+        let outcome = render_diagrams(&mut bank, &render, DiagramFormat::Png);
+        let path = outcome
+            .images
+            .first()
+            .map(|(path, _)| path.clone())
+            .expect("one generated image");
+        assert!(path.starts_with("generated/graphviz-"));
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains(&format!("$IMS-CC-FILEBASE$/{path}?canvas_download=1")));
+        let bytes = to_qti(&bank, &outcome.images).expect("export");
+        let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
+        let bundled = format!("web_resources/{path}");
+        assert!(archive.file_names().any(|name| name == bundled));
+    }
+
+    #[test]
+    /// An unrendered Graphviz block still exports: the fence reaches Canvas as a
+    /// code block instead of an image, and nothing is bundled for it.
+    fn unrendered_graphviz_block_exports_as_code() {
+        let bank = image_bank("```dot\ndigraph { a -> b; }\n```");
+        let xml = assessment_xml("a", &bank).expect("renders");
+        assert!(xml.contains("language-dot") && xml.contains("digraph"));
+        assert!(local_image_paths(&bank).is_empty());
     }
 
     #[test]

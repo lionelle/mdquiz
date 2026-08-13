@@ -13,8 +13,8 @@ use std::process::Command as ProcessCommand;
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 
+use mdquiz::diagram::{self, DiagramFormat, DiagramLanguage};
 use mdquiz::export::{self, canvas, markdown};
-use mdquiz::mermaid::{self, DiagramFormat};
 use mdquiz::model::ItemBank;
 use mdquiz::parse;
 
@@ -58,7 +58,7 @@ pub(crate) enum Command {
         /// export only).
         #[arg(long)]
         random_order: bool,
-        /// Image format for rendered mermaid diagrams (Canvas export only).
+        /// Image format for rendered diagrams (Canvas export only).
         #[arg(long, value_enum, default_value_t = DiagramFormatArg::Png)]
         diagram_format: DiagramFormatArg,
     },
@@ -83,7 +83,7 @@ impl From<FormatArg> for export::Format {
     }
 }
 
-/// The mermaid diagram image format as selected on the command line.
+/// The diagram image format as selected on the command line.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum DiagramFormatArg {
     /// Raster PNG (most reliably rendered inside Canvas).
@@ -125,7 +125,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
                 anyhow::bail!("--include-key and --random-order apply only to `--format markdown`");
             }
             let mut bank = assemble_bank(&dir, name, recursive, sample, random_order)?;
-            // Mermaid rendering and image bundling apply only to the Canvas package.
+            // Diagram rendering and image bundling apply only to the Canvas package.
             let images = match format {
                 FormatArg::Canvas => canvas_images(&dir, &mut bank, diagram_format.into()),
                 FormatArg::Markdown => Vec::new(),
@@ -172,15 +172,17 @@ fn shuffle<T>(items: &mut [T], rng: &mut SampleRng) {
     }
 }
 
-/// Render mermaid diagrams in `bank`, then gather every image the Canvas package
+/// Render the diagrams in `bank`, then gather every image the Canvas package
 /// needs: the generated diagrams plus the local images read from `dir`.
 fn canvas_images(
     dir: &Path,
     bank: &mut ItemBank,
     diagram_format: DiagramFormat,
 ) -> Vec<(String, Vec<u8>)> {
-    let renderer = move |source: &str| render_mermaid(source, diagram_format);
-    let outcome = mermaid::render_diagrams(bank, &renderer, diagram_format);
+    let renderer = move |language: DiagramLanguage, source: &str| {
+        render_diagram(language, source, diagram_format)
+    };
+    let outcome = diagram::render_diagrams(bank, &renderer, diagram_format);
     for warning in &outcome.warnings {
         eprintln!("warning: {warning}");
     }
@@ -192,12 +194,12 @@ fn canvas_images(
 /// Load the bytes of every local image referenced by the bank, resolved
 /// relative to `dir`. Missing or unsafe paths are skipped with a warning.
 ///
-/// Generated-diagram paths (under [`mermaid::GENERATED_DIR`]) are skipped here:
+/// Generated-diagram paths (under [`diagram::GENERATED_DIR`]) are skipped here:
 /// their bytes come from the diagram pass, not the question directory.
 fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
     let mut images = Vec::new();
     for path in canvas::local_image_paths(bank) {
-        if mermaid::is_generated_path(&path) {
+        if diagram::is_generated_path(&path) {
             continue;
         }
         if escapes_dir(&path) {
@@ -212,44 +214,124 @@ fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
     images
 }
 
-/// Render one mermaid `source` to image bytes by shelling out to the mermaid CLI.
+/// Render one diagram `source` to image bytes by shelling out to the renderer
+/// for its `language` (`mmdc` for mermaid, `dot` for Graphviz).
 ///
 /// # Errors
 ///
-/// Returns a message when the CLI is missing or the render fails; the caller
-/// turns that into a warning and leaves the diagram as a code block.
-fn render_mermaid(source: &str, format: DiagramFormat) -> std::result::Result<Vec<u8>, String> {
-    let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let input = dir.path().join("diagram.mmd");
+/// Returns a message when the tool is missing, the render fails, or the
+/// temporary files it works through cannot be written or read back. Every
+/// message names what failed, because the caller turns it into a warning the
+/// author sees instead of a diagram.
+fn render_diagram(
+    language: DiagramLanguage,
+    source: &str,
+    format: DiagramFormat,
+) -> std::result::Result<Vec<u8>, String> {
+    let dir = tempfile::tempdir()
+        .map_err(|error| format!("could not create a temporary directory ({error})"))?;
+    let input = dir
+        .path()
+        .join(format!("diagram.{}", language.source_extension()));
     let output = dir.path().join(format!("diagram.{}", format.extension()));
-    fs::write(&input, source).map_err(|error| error.to_string())?;
-    run_mmdc(&input, &output)?;
-    fs::read(&output).map_err(|error| error.to_string())
+    fs::write(&input, source)
+        .map_err(|error| format!("could not write the diagram source ({error})"))?;
+    match language {
+        DiagramLanguage::Mermaid => run_mmdc(&input, &output)?,
+        DiagramLanguage::Graphviz => run_dot(&input, &output, format)?,
+    }
+    fs::read(&output).map_err(|error| format!("the renderer produced no image ({error})"))
 }
 
 /// Invoke the mermaid CLI (`mmdc`, else `npx @mermaid-js/mermaid-cli`) on
 /// `input`, writing `output`.
 ///
+/// The image format follows `output`'s extension, which `mmdc` reads — so
+/// unlike [`run_dot`] this needs no [`DiagramFormat`].
+///
 /// # Errors
 ///
 /// Returns a message when no mermaid CLI is found or the render exits non-zero.
 fn run_mmdc(input: &Path, output: &Path) -> std::result::Result<(), String> {
-    let input = input.to_string_lossy();
-    let output = output.to_string_lossy();
-    let args = ["-i", input.as_ref(), "-o", output.as_ref()];
-    for (program, pre_args) in [
-        ("mmdc", &[][..]),
-        ("npx", &["-y", "@mermaid-js/mermaid-cli"][..]),
-    ] {
+    run_first_available(
+        &[("mmdc", &[]), ("npx", &["-y", "@mermaid-js/mermaid-cli"])],
+        &[
+            OsStr::new("-i"),
+            input.as_os_str(),
+            OsStr::new("-o"),
+            output.as_os_str(),
+        ],
+        "no mermaid CLI found; install it with `npm install -g @mermaid-js/mermaid-cli`",
+    )
+}
+
+/// The message shown when Graphviz is not installed. Named so a test can tell
+/// "`dot` is missing" apart from "`dot` rejected this diagram".
+const DOT_MISSING: &str =
+    "Graphviz `dot` not found; install Graphviz from https://graphviz.org/download/";
+
+/// Invoke Graphviz (`dot`) on `input`, writing `output` in `format`.
+///
+/// # Errors
+///
+/// Returns a message when `dot` is not installed or the render exits non-zero
+/// (a syntax error in the diagram, for instance).
+fn run_dot(input: &Path, output: &Path, format: DiagramFormat) -> std::result::Result<(), String> {
+    // Spelled out rather than derived from the file extension: `dot`'s output
+    // format is its own vocabulary that only happens to agree with ours.
+    let format_flag = match format {
+        DiagramFormat::Png => "-Tpng",
+        DiagramFormat::Svg => "-Tsvg",
+    };
+    run_first_available(
+        &[("dot", &[])],
+        &[
+            OsStr::new(format_flag),
+            OsStr::new("-o"),
+            output.as_os_str(),
+            input.as_os_str(),
+        ],
+        DOT_MISSING,
+    )
+}
+
+/// Run the first of `candidates` that can be spawned, passing its own leading
+/// arguments followed by `args`.
+///
+/// Candidates are `(program, leading arguments)` pairs tried in order; a program
+/// that cannot be spawned is treated as "not installed" and the next one is
+/// tried.
+///
+/// # Errors
+///
+/// Returns the failing program's stderr (named, since a language may have
+/// several candidates), or `missing` if none of them could be spawned.
+fn run_first_available(
+    candidates: &[(&str, &[&str])],
+    args: &[&OsStr],
+    missing: &str,
+) -> std::result::Result<(), String> {
+    for (program, pre_args) in candidates {
         let mut command = ProcessCommand::new(program);
-        command.args(pre_args).args(args);
+        command.args(*pre_args).args(args);
         match command.output() {
             Ok(result) if result.status.success() => return Ok(()),
-            Ok(result) => return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned()),
+            Ok(result) => return Err(tool_failure(program, &result)),
             Err(_) => {} // program not found; try the next candidate
         }
     }
-    Err("no mermaid CLI found (install @mermaid-js/mermaid-cli or `mmdc`)".to_owned())
+    Err(missing.to_owned())
+}
+
+/// The message for a `program` that ran but exited non-zero: its stderr, or the
+/// exit status when it said nothing (an empty message would leave the eventual
+/// warning explaining nothing).
+fn tool_failure(program: &str, result: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    match stderr.trim() {
+        "" => format!("`{program}` failed ({})", result.status),
+        message => format!("`{program}`: {message}"),
+    }
 }
 
 /// A [`parse::PartialReader`] that reads `file:` partials relative to `dir`.
@@ -725,15 +807,15 @@ mod tests {
         assert!(err.to_string().contains("no/such/mdquiz/dir"));
     }
 
-    /// A one-question true/false bank for exercising the write seam.
-    fn true_false_bank() -> ItemBank {
+    /// A one-question true/false bank whose prompt is `prompt`.
+    fn true_false_bank(prompt: &str) -> ItemBank {
         use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
         ItemBank {
             name: "M".to_owned(),
             items: vec![Question {
                 id: "q".to_owned(),
                 title: None,
-                prompt: "P?".to_owned(),
+                prompt: prompt.to_owned(),
                 points: 1.0,
                 tags: Vec::new(),
                 feedback: Feedback::default(),
@@ -745,21 +827,9 @@ mod tests {
     #[test]
     /// `load_images` reads present images and skips missing/unsafe ones.
     fn load_images_reads_present_skips_others() {
-        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
         let dir = tempfile::tempdir().expect("temp dir");
         fs::write(dir.path().join("here.png"), b"png-bytes").expect("write image");
-        let bank = ItemBank {
-            name: "M".to_owned(),
-            items: vec![Question {
-                id: "q".to_owned(),
-                title: None,
-                prompt: "![a](here.png) ![b](missing.png) ![c](../escape.png)".to_owned(),
-                points: 1.0,
-                tags: Vec::new(),
-                feedback: Feedback::default(),
-                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
-            }],
-        };
+        let bank = true_false_bank("![a](here.png) ![b](missing.png) ![c](../escape.png)");
         let images = load_images(dir.path(), &bank);
         assert_eq!(images.len(), 1);
         assert_eq!(
@@ -771,23 +841,11 @@ mod tests {
     #[test]
     /// A `..` image path is refused by the guard even when the target exists.
     fn load_images_refuses_parent_escape() {
-        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
         let root = tempfile::tempdir().expect("temp dir");
         fs::write(root.path().join("secret.png"), b"x").expect("write outside");
         let qdir = root.path().join("q");
         fs::create_dir(&qdir).expect("qdir");
-        let bank = ItemBank {
-            name: "M".to_owned(),
-            items: vec![Question {
-                id: "q".to_owned(),
-                title: None,
-                prompt: "![e](../secret.png)".to_owned(),
-                points: 1.0,
-                tags: Vec::new(),
-                feedback: Feedback::default(),
-                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
-            }],
-        };
+        let bank = true_false_bank("![e](../secret.png)");
         // The file exists outside `qdir`, so only the `..` guard can skip it.
         assert!(load_images(&qdir, &bank).is_empty());
     }
@@ -795,21 +853,13 @@ mod tests {
     #[test]
     /// Generated-diagram paths are skipped by `load_images` (bytes come elsewhere).
     fn load_images_skips_generated_paths() {
-        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
         let dir = tempfile::tempdir().expect("temp dir");
         fs::write(dir.path().join("real.png"), b"x").expect("write image");
-        let bank = ItemBank {
-            name: "M".to_owned(),
-            items: vec![Question {
-                id: "q".to_owned(),
-                title: None,
-                prompt: "![d](generated/mermaid-abc.png) and ![r](real.png)".to_owned(),
-                points: 1.0,
-                tags: Vec::new(),
-                feedback: Feedback::default(),
-                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
-            }],
-        };
+        // The generated image exists on disk too, so only the reserved-prefix
+        // guard — not a read error — can keep it out of the loaded set.
+        fs::create_dir(dir.path().join("generated")).expect("generated dir");
+        fs::write(dir.path().join("generated/mermaid-abc.png"), b"x").expect("write generated");
+        let bank = true_false_bank("![d](generated/mermaid-abc.png) and ![r](real.png)");
         let images = load_images(dir.path(), &bank);
         assert_eq!(images.len(), 1);
         assert_eq!(
@@ -892,7 +942,7 @@ mod tests {
     fn write_export_writes_markdown() {
         let dir = tempfile::tempdir().expect("temp dir");
         let out = dir.path().join("quiz.md");
-        write_export(&true_false_bank(), export::Format::Markdown, &out, &[]).expect("write");
+        write_export(&true_false_bank("P?"), export::Format::Markdown, &out, &[]).expect("write");
         let text = fs::read_to_string(&out).expect("read back");
         assert!(text.starts_with("# M"));
     }
@@ -912,7 +962,7 @@ mod tests {
     /// `write_answer_key` writes the key beside the sheet.
     fn write_answer_key_writes_key_file() {
         let dir = tempfile::tempdir().expect("temp dir");
-        write_answer_key(&true_false_bank(), &dir.path().join("quiz.md")).expect("write key");
+        write_answer_key(&true_false_bank("P?"), &dir.path().join("quiz.md")).expect("write key");
         let key = fs::read_to_string(dir.path().join("quiz-key.md")).expect("read key");
         assert!(key.contains("Answer Key"));
     }
@@ -922,8 +972,151 @@ mod tests {
     fn write_export_writes_canvas_zip() {
         let dir = tempfile::tempdir().expect("temp dir");
         let out = dir.path().join("quiz.zip");
-        write_export(&true_false_bank(), export::Format::Canvas, &out, &[]).expect("write");
+        write_export(&true_false_bank("P?"), export::Format::Canvas, &out, &[]).expect("write");
         let bytes = fs::read(&out).expect("read back");
         assert!(bytes.starts_with(b"PK"));
+    }
+
+    /// A program name no PATH will resolve, for exercising the "not installed"
+    /// branch of [`run_first_available`].
+    const MISSING_PROGRAM: &str = "mdquiz-no-such-program";
+
+    #[test]
+    /// An unspawnable candidate is skipped in favour of the next one.
+    fn run_first_available_skips_missing_candidates() {
+        let result = run_first_available(
+            &[(MISSING_PROGRAM, &[]), ("cargo", &[])],
+            &[OsStr::new("--version")],
+            "none found",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    /// When no candidate can be spawned, the caller's message is returned.
+    fn run_first_available_reports_missing_tool() {
+        let error = run_first_available(&[(MISSING_PROGRAM, &[])], &[], "none found")
+            .expect_err("no such program");
+        assert_eq!(error, "none found");
+    }
+
+    #[test]
+    /// A candidate that runs but fails reports its own stderr, named — the
+    /// difference between "not installed" and "bad diagram".
+    fn run_first_available_reports_stderr_on_failure() {
+        let error = run_first_available(
+            &[("cargo", &[])],
+            &[OsStr::new("--mdquiz-not-a-flag")],
+            "none found",
+        )
+        .expect_err("bad flag");
+        assert!(error.starts_with("`cargo`: ") && error != "none found");
+    }
+
+    #[test]
+    /// A candidate's own leading arguments are passed before the shared ones —
+    /// the mermaid fallback (`npx -y @mermaid-js/mermaid-cli`, then `-i`/`-o`)
+    /// depends on that order. `test ok = ok` exits 0; any other order is a
+    /// usage error.
+    fn run_first_available_passes_leading_args_first() {
+        // `test ok = ok` exits 0 and `false` exits 1, so this is `Ok` only if the
+        // unspawnable candidate is skipped *and* the rest are tried in order.
+        let result = run_first_available(
+            &[
+                (MISSING_PROGRAM, &[]),
+                ("test", &["ok", "="]),
+                ("false", &[]),
+            ],
+            &[OsStr::new("ok")],
+            "none found",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    /// A tool that fails silently still reports which program failed, rather
+    /// than an empty message.
+    fn tool_failure_names_program_when_stderr_is_empty() {
+        let quiet = std::process::Command::new("cargo")
+            .arg("--version")
+            .output()
+            .map(|mut output| {
+                output.stderr.clear();
+                output
+            })
+            .expect("cargo runs");
+        let message = tool_failure("dot", &quiet);
+        assert!(message.starts_with("`dot` failed ("));
+    }
+
+    /// Whether Graphviz is installed, so a `dot`-dependent test can skip
+    /// deliberately rather than pass silently on a render failure.
+    fn graphviz_available() -> bool {
+        let available =
+            run_first_available(&[("dot", &[])], &[OsStr::new("-V")], "missing").is_ok();
+        if !available {
+            eprintln!("skipping: Graphviz not installed");
+        }
+        available
+    }
+
+    #[test]
+    /// With Graphviz installed, DOT source renders to real bytes in each format
+    /// (so the `-T` flag matches the extension the pass will name the file).
+    fn render_diagram_renders_dot_in_each_format() {
+        if !graphviz_available() {
+            return; // Graphviz is not installed on this machine.
+        }
+        let source = "digraph { a -> b; }";
+        let png =
+            render_diagram(DiagramLanguage::Graphviz, source, DiagramFormat::Png).expect("png");
+        assert!(png.starts_with(b"\x89PNG"));
+        let svg =
+            render_diagram(DiagramLanguage::Graphviz, source, DiagramFormat::Svg).expect("svg");
+        assert!(String::from_utf8_lossy(&svg).contains("<svg"));
+    }
+
+    #[test]
+    /// Malformed DOT fails with Graphviz's own message rather than silently
+    /// producing an image — the pass turns that message into a warning.
+    fn render_diagram_reports_dot_syntax_error() {
+        if !graphviz_available() {
+            return; // Graphviz is not installed on this machine.
+        }
+        let error = render_diagram(DiagramLanguage::Graphviz, "digraph {", DiagramFormat::Png)
+            .expect_err("malformed dot must fail");
+        assert!(error.starts_with("`dot`") && error != DOT_MISSING);
+    }
+
+    #[test]
+    /// The Canvas image set is the local images plus the pass's generated ones;
+    /// an unrenderable diagram simply contributes nothing and keeps its fence.
+    fn canvas_images_merges_local_and_generated() {
+        use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(dir.path().join("real.png"), b"x").expect("write image");
+        let mut bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "q".to_owned(),
+                title: None,
+                prompt: "![r](real.png)\n\n```dot\ndigraph { a -> b; }\n```".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            }],
+        };
+        let images = canvas_images(dir.path(), &mut bank, DiagramFormat::Png);
+        let names: Vec<&str> = images.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(names.contains(&"real.png"));
+        let prompt = bank.items.first().map_or("", |q| q.prompt.as_str());
+        if graphviz_available() {
+            assert!(prompt.contains("![diagram](generated/graphviz-"));
+            assert!(names.iter().any(|n| n.starts_with("generated/graphviz-")));
+        } else {
+            assert!(prompt.contains("```dot"));
+            assert!(!names.iter().any(|n| n.starts_with("generated/")));
+        }
     }
 }

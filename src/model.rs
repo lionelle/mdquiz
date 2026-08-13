@@ -52,7 +52,7 @@ impl Question {
     /// The authored Markdown fields rendered as rich (`text/html`) content: the
     /// prompt, choice texts, ordering items, and any feedback message.
     ///
-    /// Content transforms (image bundling, mermaid rendering) walk exactly these
+    /// Content transforms (image bundling, diagram rendering) walk exactly these
     /// fields. Matching cells and blank answers export as plain text and are
     /// excluded. Kinds are matched explicitly (not `_`) so a future kind with a
     /// rich-text answer must decide whether it belongs here.
@@ -83,7 +83,7 @@ impl Question {
     }
 
     /// The [rich-text fields](Self::rich_text_fields), mutably, for transforms
-    /// that rewrite content in place (e.g. replacing a mermaid block).
+    /// that rewrite content in place (e.g. replacing a diagram block).
     pub(crate) fn rich_text_fields_mut(&mut self) -> Vec<&mut String> {
         let mut fields = vec![&mut self.prompt];
         match &mut self.kind {

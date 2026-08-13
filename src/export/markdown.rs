@@ -454,14 +454,16 @@ mod tests {
     }
 
     #[test]
-    /// The print sheet keeps math and mermaid source verbatim (no rendering).
-    fn print_keeps_math_and_mermaid_literal() {
+    /// The print sheet keeps math and diagram source verbatim (no rendering).
+    fn print_keeps_math_and_diagrams_literal() {
         let bank = ItemBank {
             name: "M".to_owned(),
             items: vec![Question {
                 id: "q".to_owned(),
                 title: None,
-                prompt: "Cost $O(n)$ and\n\n```mermaid\ngraph TD; A-->B;\n```".to_owned(),
+                prompt: "Cost $O(n)$ and\n\n```mermaid\ngraph TD; A-->B;\n```\n\n\
+                    ```dot\ndigraph { a -> b; }\n```"
+                    .to_owned(),
                 points: 1.0,
                 tags: Vec::new(),
                 feedback: Feedback::default(),
@@ -469,7 +471,7 @@ mod tests {
             }],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        assert!(out.contains("$O(n)$") && out.contains("```mermaid"));
+        assert!(out.contains("$O(n)$") && out.contains("```mermaid") && out.contains("```dot"));
         assert!(!out.contains("equation_image") && !out.contains("![diagram]"));
     }
 

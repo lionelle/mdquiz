@@ -36,7 +36,8 @@ A question file is **YAML front-matter** (a `---`-delimited block at the very
 top of the file) carrying the machine-readable data, followed by the prompt as
 ordinary Markdown. Everything below the closing `---` is the prompt, so you can
 use normal Markdown — emphasis, inline `code`, Markdown headings, GitHub-flavored
-pipe tables and `~~strikethrough~~`, even fenced code blocks in any language.
+pipe tables and `~~strikethrough~~`, even fenced code blocks in any language
+(except the diagram fences — see below).
 
 ### Common fields
 
@@ -287,6 +288,15 @@ See [`images/`](images/) for a runnable example (`binary-tree.png` is bundled;
 the Rust-logo URL is passed through). Local-image bundling follows Canvas's
 Common Cartridge format; if an item-bank import doesn't show a bundled image,
 host it and use a URL instead.
+
+## Diagrams
+
+A fenced ` ```mermaid `, ` ```dot `, or ` ```graphviz ` block is **rendered to an
+image** on Canvas export (and bundled like a local image); the print sheet keeps
+the source as a code block. Rendering needs the matching tool on your `PATH` —
+`mmdc` for Mermaid, `dot` for Graphviz — and without it the block is left as
+code with a warning. See [`mermaid/`](mermaid/), [`graphviz/`](graphviz/), and
+[`../docs/diagrams.md`](../docs/diagrams.md).
 
 ## Canvas caveats
 

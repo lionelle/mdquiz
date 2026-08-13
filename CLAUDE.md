@@ -64,8 +64,9 @@ source .md  ──▶  parse::item_bank_from_sources  ──▶  model::ItemBank
   source of truth for what a question *is*.
 - `src/parse.rs` — Markdown + YAML front-matter → `ItemBank` (`parse_question`,
   `item_bank_from_sources`). Resolves `file:` partials via an injected reader.
-- `src/mermaid.rs` — pre-export pass that renders ` ```mermaid ` blocks to
-  bundled images via an injected renderer (the CLI shells out to `mmdc`).
+- `src/diagram.rs` — pre-export pass that renders ` ```mermaid ` and ` ```dot `
+  blocks to bundled images via an injected renderer (the CLI shells out to
+  `mmdc` and `dot`).
 - `src/export/markdown.rs` — print sheet (no solutions).
 - `src/export/canvas.rs` — Canvas New Quizzes QTI bytes.
 - `src/error.rs` — the crate `Error`/`Result`. Everything fallible flows through
@@ -90,10 +91,10 @@ roll-out order they were built:
 6. **Ordering**
 
 On top of the types, prompts and answers support images, LaTeX math
-(`$…$` → Canvas's native equation image), ` ```mermaid ` diagrams (rendered to
-bundled images), and `file:` partials. Any new `QuestionKind` variant follows
-the same rule: a payload struct, both exporter branches, and tests, in one
-change.
+(`$…$` → Canvas's native equation image), ` ```mermaid ` and ` ```dot `
+(Graphviz) diagrams (rendered to bundled images), and `file:` partials. Any new
+`QuestionKind` variant follows the same rule: a payload struct, both exporter
+branches, and tests, in one change.
 
 ## Commands
 
