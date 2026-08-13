@@ -1008,7 +1008,8 @@ fn general_condition_xml(feedback: &Feedback) -> String {
 /// display math (`$…$` / `$$…$$`) become Canvas's native `equation_image`.
 ///
 /// GitHub-flavored extensions are enabled so common authoring — pipe tables and
-/// `~~strikethrough~~` — renders as real HTML rather than literal text.
+/// `~~strikethrough~~` — renders as real HTML rather than literal text. Tables
+/// are then given visible rules by [`style_tables`].
 fn prompt_html(markdown: &str) -> String {
     let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
     let mut rendered = String::new();
@@ -1016,7 +1017,58 @@ fn prompt_html(markdown: &str) -> String {
         .map(rewrite_local_image)
         .map(rewrite_math);
     html::push_html(&mut rendered, parser);
-    rendered.trim().to_owned()
+    style_tables(rendered.trim())
+}
+
+/// The unadorned opening tag pulldown-cmark writes for a table.
+const BARE_TABLE_TAG: &str = "<table>";
+
+/// The opening tag an exported table carries instead.
+///
+/// `border`/`cellpadding` are the legacy attributes the HTML spec maps onto
+/// every cell, and are what Canvas's sanitizer is most likely to keep.
+const TABLE_TAG: &str = r#"<table border="1" cellpadding="4" style="border-collapse: collapse">"#;
+
+/// The cell rules, repeated inline so the grid survives even where the table's
+/// attributes do not.
+const CELL_STYLE: &str = "border: 1px solid #999; padding: 4px 8px";
+
+/// Give every table in `html` visible rules.
+///
+/// A bare `<table>` inherits Canvas's own stylesheet, which rules imported quiz
+/// content not at all — so a pipe table arrives as unseparated columns. The
+/// borders are written inline (rather than as a class) because Canvas serves
+/// item HTML without our stylesheet, and belt-and-braces on both the table and
+/// its cells because its sanitizer may drop either.
+///
+/// Only the exact tags pulldown-cmark emits are rewritten — a bare tag, or one
+/// carrying just the alignment it wrote — so an author's own raw-HTML
+/// `<td style="…">` keeps the styling they gave it. Prompts with no generated
+/// table are returned untouched, so stray cell markup in prose is never
+/// restyled.
+///
+/// This is a text pass, not an HTML parser: a *literal* `<td>` written as raw
+/// HTML is indistinguishable from a generated one and is rewritten too, which
+/// would mangle it inside an attribute value (`title="<td>"`). Prompts are
+/// instructor-authored Markdown, so that is accepted rather than guarded.
+fn style_tables(html: &str) -> String {
+    if !html.contains(BARE_TABLE_TAG) {
+        return html.to_owned();
+    }
+    let mut styled = html.replace(BARE_TABLE_TAG, TABLE_TAG);
+    for tag in ["td", "th"] {
+        styled = styled.replace(
+            &format!("<{tag}>"),
+            &format!("<{tag} style=\"{CELL_STYLE}\">"),
+        );
+        for align in ["left", "center", "right"] {
+            styled = styled.replace(
+                &format!("<{tag} style=\"text-align: {align}\">"),
+                &format!("<{tag} style=\"{CELL_STYLE}; text-align: {align}\">"),
+            );
+        }
+    }
+    styled
 }
 
 /// Rewrite a local image event's URL to its bundled `$IMS-CC-FILEBASE$` form.
@@ -1764,14 +1816,70 @@ mod tests {
     }
 
     #[test]
-    /// A Markdown pipe table renders as an HTML `<table>`, not literal text.
+    /// A Markdown pipe table renders as an HTML table, not literal text, and
+    /// carries its own rules so Canvas shows the grid.
     fn markdown_table_renders_as_html() {
         let prompt = "Costs:\n\n| Op | Cost |\n|----|------|\n| push | O(1) |\n";
         let xml = assessment_xml("a", &true_false_bank(true, prompt)).expect("renders");
-        // mattext is HTML-escaped, so `<table>` appears as `&lt;table&gt;`.
-        assert!(xml.contains("&lt;table&gt;"));
-        assert!(xml.contains("&lt;td&gt;push&lt;/td&gt;"));
+        // mattext is HTML-escaped, so the markup appears in its escaped form.
+        assert!(xml.contains(
+            "&lt;td style=&quot;border: 1px solid #999; padding: 4px 8px&quot;&gt;push&lt;/td&gt;"
+        ));
         assert!(!xml.contains("| push |"));
+    }
+
+    /// A two-column, two-row pipe table with the given alignment row.
+    fn table_prompt(alignment: &str) -> String {
+        format!("| Op | Cost |\n|{alignment}|\n| push | O(1) |\n")
+    }
+
+    /// The rules an exported cell carries, spelled out rather than built from
+    /// [`CELL_STYLE`] so these tests pin its value. An aligned cell appends its
+    /// `text-align` after these, so this is a prefix of the `style` attribute.
+    const EXPECTED_CELL_RULES: &str = "border: 1px solid #999; padding: 4px 8px";
+
+    #[test]
+    /// The table tag carries both the legacy `border` attribute and collapsed
+    /// borders, so the grid renders whichever one Canvas's sanitizer keeps.
+    fn table_tag_declares_border_attribute_and_collapse() {
+        let html = prompt_html(&table_prompt("----|------"));
+        assert!(html.starts_with(
+            r#"<table border="1" cellpadding="4" style="border-collapse: collapse">"#
+        ));
+    }
+
+    #[test]
+    /// Every cell spells out a visible border inline — an unruled table is the
+    /// bug this pass exists to fix — so the grid survives a sanitizer that
+    /// drops the table's own attributes.
+    fn table_cells_carry_inline_rules() {
+        let html = prompt_html(&table_prompt("----|------"));
+        assert!(html.contains(&format!("<th style=\"{EXPECTED_CELL_RULES}\">Op</th>")));
+        assert!(html.contains(&format!("<td style=\"{EXPECTED_CELL_RULES}\">push</td>")));
+        assert_eq!(html.matches(EXPECTED_CELL_RULES).count(), 4); // 2 headers + 2 cells
+        assert!(!html.contains("<td>") && !html.contains("<th>"));
+    }
+
+    #[test]
+    /// A column's alignment survives the added rules rather than being replaced,
+    /// and a table mixing aligned and bare columns still gets each cell's rules
+    /// exactly once.
+    fn table_alignment_survives_styling() {
+        let html = prompt_html(&table_prompt(":---|-----:"));
+        assert!(html.contains(
+            r#"<td style="border: 1px solid #999; padding: 4px 8px; text-align: right">O(1)</td>"#
+        ));
+        assert_eq!(html.matches(EXPECTED_CELL_RULES).count(), 4);
+        let mixed = prompt_html(&table_prompt(":---|------"));
+        assert_eq!(mixed.matches(EXPECTED_CELL_RULES).count(), 4);
+    }
+
+    #[test]
+    /// A `<td>` outside any table is left alone: the pass keys off the table
+    /// tag, so stray cell markup in prose is not silently restyled.
+    fn loose_cells_without_a_table_are_untouched() {
+        let html = "<p>Totals</p>\n<td>stray</td>";
+        assert_eq!(style_tables(html), html);
     }
 
     #[test]

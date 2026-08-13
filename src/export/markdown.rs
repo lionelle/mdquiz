@@ -462,7 +462,8 @@ mod tests {
                 id: "q".to_owned(),
                 title: None,
                 prompt: "Cost $O(n)$ and\n\n```mermaid\ngraph TD; A-->B;\n```\n\n\
-                    ```dot\ndigraph { a -> b; }\n```"
+                    ```dot\ndigraph { a -> b; }\n```\n\n| Op | Cost |\n|----|------|\n\
+                    | push | O(1) |"
                     .to_owned(),
                 points: 1.0,
                 tags: Vec::new(),
@@ -472,6 +473,8 @@ mod tests {
         };
         let out = to_print_markdown(&bank).expect("renders");
         assert!(out.contains("$O(n)$") && out.contains("```mermaid") && out.contains("```dot"));
+        // A pipe table stays literal pipe text: the print sheet renders no HTML.
+        assert!(out.contains("| push | O(1) |") && !out.contains("<table"));
         assert!(!out.contains("equation_image") && !out.contains("![diagram]"));
     }
 
