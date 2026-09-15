@@ -26,6 +26,16 @@ pub fn escapes_dir(path: &str) -> bool {
         .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
 }
 
+/// The directory part of a bank-relative `path`, or `""` for a top-level file.
+///
+/// Bank-relative paths always use `/`, whatever the host platform, because
+/// they are built from directory walks rather than read from the filesystem —
+/// so this splits on `/` rather than going through [`std::path::Path`].
+#[must_use]
+pub fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
 /// Whether an image URL is a local file path (rather than an absolute URL).
 ///
 /// Shared by the parser (which rebases a partial's local images) and the Canvas
@@ -71,6 +81,16 @@ mod tests {
         let base = Path::new("/questions");
         assert_eq!(base.join("/etc/passwd"), Path::new("/etc/passwd"));
         assert!(escapes_dir("/etc/passwd"));
+    }
+
+    #[test]
+    /// The directory part is everything before the last `/`; a top-level file
+    /// has none, and nested paths keep their full parent.
+    fn parent_dir_splits_on_the_last_separator() {
+        assert_eq!(parent_dir("a/b/c.md"), "a/b");
+        assert_eq!(parent_dir("a/c.md"), "a");
+        assert_eq!(parent_dir("c.md"), "");
+        assert_eq!(parent_dir(""), "");
     }
 
     #[test]

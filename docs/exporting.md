@@ -9,7 +9,7 @@ numeric prefixes control question order.
 ```bash
 mdquiz export <DIR> --output <OUTPUT> \
   [--format <markdown|canvas>] [--name <NAME>] [--recursive] [--sample <N>] \
-  [--include-key] [--random-order] [--diagram-format <png|svg>]
+  [--include-key] [--random-order] [--seed <N>] [--diagram-format <png|svg>]
 ```
 
 | Option              | Required? | Meaning                                                       |
@@ -22,6 +22,7 @@ mdquiz export <DIR> --output <OUTPUT> \
 | `--sample <N>`      | Optional  | Keep at most `N` randomly-chosen questions **from each directory** (see below). |
 | `--include-key`     | Optional  | Also write a matching answer key (markdown export only; see below). |
 | `--random-order`    | Optional  | Shuffle the questions into a random order after selection (markdown export only). |
+| `--seed <N>`        | Optional  | Seed the random draw so `--sample`/`--random-order` reproduce exactly (see below). |
 | `--diagram-format`  | Optional  | Diagram image format, `png` (default) or `svg`; Canvas export only. See [diagrams.md](diagrams.md). |
 
 ## Which files become questions
@@ -55,8 +56,31 @@ that covers each topic without using every question. A folder with fewer than
 mdquiz export course/ --recursive --sample 3 --format markdown --output practice.md
 ```
 
-The selection is random on every run (re-run for a different draw); the chosen
-questions are laid out in their normal path order.
+The selection is random on every run (re-run for a different draw) unless you
+pass `--seed`; the chosen questions are laid out in their normal path order.
+
+### Reproducing a draw (`--seed`)
+
+Pass `--seed <N>` to make the draw deterministic: the same seed over the same
+questions always selects the same questions, in the same order, on any machine.
+Omit it and each run draws differently.
+
+```bash
+# Hand out this exact sheet again next term, or regenerate it after a typo fix:
+mdquiz export course/ -r --sample 3 --random-order --seed 20260915 \
+  --format markdown --include-key --output quiz.md
+```
+
+The seed also drives `--random-order`, so a seeded run reproduces both *which*
+questions were chosen and *what order* they appear in.
+
+A seed reproduces a draw only against the same inputs: adding or removing
+question files changes the pool, and a future mdquiz release that changes the
+sampling algorithm will draw differently from the same seed. Keep the sheet you
+handed out, not just the seed that made it.
+
+On its own `--seed` does nothing — there is no randomness to pin unless
+`--sample` or `--random-order` is also in play.
 
 ## Formats
 

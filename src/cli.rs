@@ -5,10 +5,13 @@
 //! export target to disk. All real work lives in the library so it can be
 //! tested without a process.
 
+use std::collections::hash_map::RandomState;
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::BuildHasher as _;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -18,6 +21,7 @@ use mdquiz::export::{self, canvas, markdown};
 use mdquiz::model::{ItemBank, Question};
 use mdquiz::parse;
 use mdquiz::path::escapes_dir;
+use mdquiz::quiz::sample::{self, SampleRng};
 
 /// Author quizzes in Markdown + YAML and export them for print or Canvas.
 #[derive(Debug, Parser)]
@@ -59,6 +63,10 @@ pub(crate) enum Command {
         /// export only).
         #[arg(long)]
         random_order: bool,
+        /// Seed the random draw so `--sample`/`--random-order` reproduce
+        /// exactly; omit for a different draw each run.
+        #[arg(long, value_name = "N")]
+        seed: Option<u64>,
         /// Image format for rendered diagrams (Canvas export only).
         #[arg(long, value_enum, default_value_t = DiagramFormatArg::Png)]
         diagram_format: DiagramFormatArg,
@@ -117,15 +125,16 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             format,
             name,
             recursive,
-            sample,
+            sample: sample_size,
             include_key,
             random_order,
+            seed,
             diagram_format,
         } => {
             if (include_key || random_order) && matches!(format, FormatArg::Canvas) {
                 anyhow::bail!("--include-key and --random-order apply only to `--format markdown`");
             }
-            let mut bank = assemble_bank(&dir, name, recursive, sample, random_order)?;
+            let mut bank = assemble_bank(&dir, name, recursive, sample_size, random_order, seed)?;
             // Diagram rendering and image bundling apply only to the Canvas package.
             let images = match format {
                 FormatArg::Canvas => canvas_images(&dir, &mut bank.items, diagram_format.into()),
@@ -153,24 +162,27 @@ fn assemble_bank(
     recursive: bool,
     sample: Option<usize>,
     random_order: bool,
+    seed: Option<u64>,
 ) -> anyhow::Result<ItemBank> {
-    let mut rng = SampleRng::from_entropy();
+    let mut rng = SampleRng::seeded(seed.unwrap_or_else(entropy_seed));
     let mut sources = read_question_sources(dir, recursive)?;
     if let Some(limit) = sample {
-        sources = sample_per_directory(sources, limit, &mut rng);
+        sources = sample::per_directory(sources, limit, &mut rng);
     }
     let mut bank = build_bank(dir, bank_name(dir, name), sources)?;
     if random_order {
-        shuffle(&mut bank.items, &mut rng);
+        sample::shuffle(&mut bank.items, &mut rng);
     }
     Ok(bank)
 }
 
-/// Randomly permute `items` in place (Fisher-Yates).
-fn shuffle<T>(items: &mut [T], rng: &mut SampleRng) {
-    for index in (1..items.len()).rev() {
-        items.swap(index, rng.index(index + 1));
-    }
+/// A seed drawn from operating-system entropy mixed with the current time.
+///
+/// Lives in the binary, not the library: seeding from ambient state is exactly
+/// the impurity the library avoids, so the caller decides when a draw should be
+/// unpredictable and when `--seed` should make it reproducible.
+fn entropy_seed() -> u64 {
+    RandomState::new().hash_one(SystemTime::now())
 }
 
 /// Render the diagrams in `items`, then gather every image the Canvas package
@@ -450,7 +462,7 @@ fn build_bank(
     sources.sort_by(|a, b| a.0.cmp(&b.0));
     let mut questions = Vec::with_capacity(sources.len());
     for (rel_path, content) in sources {
-        let base = rel_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let base = mdquiz::path::parent_dir(&rel_path);
         let question_dir = dir.join(base);
         let reader = partial_reader(&question_dir);
         let mut question = parse::parse_question_with(&content, &reader)
@@ -459,80 +471,6 @@ fn build_bank(
         questions.push(question);
     }
     Ok(parse::item_bank_from_questions(name, questions)?)
-}
-
-/// Keep at most `limit` questions from each directory, chosen at random.
-///
-/// Sources are grouped by their parent directory (top-level files form one
-/// group, keyed by `""`), and each group is independently down-sampled to
-/// `limit`. Group order and the relative order of the questions kept within a
-/// group are preserved; only which questions survive is random.
-fn sample_per_directory(
-    sources: Vec<(String, String)>,
-    limit: usize,
-    rng: &mut SampleRng,
-) -> Vec<(String, String)> {
-    let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    for source in sources {
-        let dir = source.0.rsplit_once('/').map_or("", |(parent, _)| parent);
-        match groups.iter_mut().find(|(name, _)| name == dir) {
-            Some((_, group)) => group.push(source),
-            None => groups.push((dir.to_owned(), vec![source])),
-        }
-    }
-    let mut kept = Vec::new();
-    for (_, group) in groups {
-        kept.extend(sample_group(group, limit, rng));
-    }
-    kept
-}
-
-/// Randomly keep `limit` of `group` (all of it when it is already that small),
-/// preserving the relative order of the survivors.
-fn sample_group(
-    mut group: Vec<(String, String)>,
-    limit: usize,
-    rng: &mut SampleRng,
-) -> Vec<(String, String)> {
-    if group.len() <= limit {
-        return group;
-    }
-    // Partial Fisher-Yates: move `limit` random items to the front, then keep
-    // them in their original relative order for a stable sheet layout.
-    for slot in 0..limit {
-        let pick = slot + rng.index(group.len() - slot);
-        group.swap(slot, pick);
-    }
-    group.truncate(limit);
-    group.sort_by(|a, b| a.0.cmp(&b.0));
-    group
-}
-
-/// A tiny non-cryptographic PRNG (`SplitMix64`) for sampling questions.
-struct SampleRng(u64);
-
-impl SampleRng {
-    /// Seed from operating-system entropy mixed with the current time.
-    fn from_entropy() -> Self {
-        use std::hash::BuildHasher as _;
-        let seed =
-            std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
-        Self(seed)
-    }
-
-    /// The next pseudo-random `u64`.
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A pseudo-random index in `0..bound` (`bound` must be non-zero).
-    fn index(&mut self, bound: usize) -> usize {
-        usize::try_from(self.next_u64() % bound as u64).unwrap_or(0)
-    }
 }
 
 /// Choose the bank name: the `--name` override, else the directory's own name.
@@ -633,6 +571,54 @@ mod tests {
     }
 
     #[test]
+    /// A seed reproduces both the draw and the shuffled order exactly, and a
+    /// different seed is free to differ. This is the promise `docs/exporting.md`
+    /// makes for `--seed`.
+    fn assemble_bank_is_reproducible_for_a_seed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        for n in 0..6 {
+            fs::write(
+                dir.path().join(format!("q{n}.md")),
+                format!("---\nid: q{n}\nkind: true_false\nanswer: true\n---\n\nQ{n}?\n"),
+            )
+            .expect("write question");
+        }
+        let ids = |seed| {
+            assemble_bank(dir.path(), None, false, Some(3), true, seed)
+                .expect("assemble")
+                .items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<String>>()
+        };
+        let drawn = ids(Some(7));
+        assert_eq!(drawn.len(), 3);
+        assert_eq!(drawn, ids(Some(7)), "same seed must reproduce the sheet");
+        let others: Vec<Vec<String>> = (1..8).map(|seed| ids(Some(seed))).collect();
+        assert!(
+            others.iter().any(|other| *other != drawn),
+            "no seed produced a different sheet"
+        );
+        // The unseeded branch is the default path and must stay unpredictable:
+        // pinned to a constant, every "random" sheet would be the same one and
+        // none of the seeded assertions above would notice.
+        let unseeded: Vec<Vec<String>> = (0..5).map(|_| ids(None)).collect();
+        assert_eq!(unseeded.first().map(Vec::len), Some(3));
+        assert!(
+            unseeded.windows(2).any(|pair| pair.first() != pair.get(1)),
+            "five unseeded runs all produced the same sheet"
+        );
+    }
+
+    #[test]
+    /// Two unseeded runs get different seeds. This is the only thing worth
+    /// asserting about a reader of ambient state: not *what* it returns, but
+    /// that it is not a constant.
+    fn entropy_seed_is_not_a_constant() {
+        assert_ne!(entropy_seed(), entropy_seed());
+    }
+
+    #[test]
     /// An explicit `--name` overrides the directory-derived default.
     fn bank_name_prefers_explicit_override() {
         let name = bank_name(
@@ -673,70 +659,6 @@ mod tests {
         let sources = read_question_sources(dir.path(), false).expect("read sources");
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["q1.md"]);
-    }
-
-    /// Build `(path, "")` sources for the given relative paths.
-    fn sources(paths: &[&str]) -> Vec<(String, String)> {
-        paths
-            .iter()
-            .map(|p| ((*p).to_owned(), String::new()))
-            .collect()
-    }
-
-    /// The directory of each kept source, in order.
-    fn dirs_of(kept: &[(String, String)]) -> Vec<&str> {
-        kept.iter()
-            .map(|(p, _)| p.rsplit_once('/').map_or("", |(dir, _)| dir))
-            .collect()
-    }
-
-    #[test]
-    /// Sampling caps each directory at `limit` and keeps smaller groups whole.
-    fn sample_per_directory_caps_each_group() {
-        let src = sources(&["a/1.md", "a/2.md", "a/3.md", "b/1.md"]);
-        let kept = sample_per_directory(src, 2, &mut SampleRng(1));
-        let dirs = dirs_of(&kept);
-        assert_eq!(kept.len(), 3); // a: 3 -> 2, b: 1 -> 1
-        assert_eq!(dirs.iter().filter(|d| **d == "a").count(), 2);
-        assert_eq!(dirs.iter().filter(|d| **d == "b").count(), 1);
-    }
-
-    #[test]
-    /// A fixed seed makes sampling reproducible, and survivors stay in path order.
-    fn sample_is_deterministic_and_ordered() {
-        let src = sources(&["d/0.md", "d/1.md", "d/2.md", "d/3.md", "d/4.md"]);
-        let first = sample_per_directory(src.clone(), 3, &mut SampleRng(42));
-        let again = sample_per_directory(src, 3, &mut SampleRng(42));
-        assert_eq!(first, again);
-        assert_eq!(first.len(), 3);
-        let paths: Vec<&str> = first.iter().map(|(p, _)| p.as_str()).collect();
-        let mut sorted = paths.clone();
-        sorted.sort_unstable();
-        assert_eq!(paths, sorted);
-    }
-
-    #[test]
-    /// The PRNG always yields an index within bounds.
-    fn sample_rng_index_is_in_bounds() {
-        let mut rng = SampleRng(7);
-        for _ in 0..100 {
-            assert!(rng.index(5) < 5);
-        }
-    }
-
-    #[test]
-    /// Shuffling permutes the items and is reproducible for a fixed seed.
-    fn shuffle_permutes_deterministically() {
-        let original: Vec<u32> = (0..8).collect();
-        let mut first = original.clone();
-        let mut again = original.clone();
-        shuffle(&mut first, &mut SampleRng(99));
-        shuffle(&mut again, &mut SampleRng(99));
-        assert_eq!(first, again); // same seed -> same order
-        assert_ne!(first, original); // it actually reordered
-        let mut sorted = first.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, original); // and it is a permutation (nothing lost)
     }
 
     #[test]

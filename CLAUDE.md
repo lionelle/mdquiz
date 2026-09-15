@@ -69,6 +69,8 @@ source .md  ──▶  parse::item_bank_from_sources  ──▶  model::ItemBank
   `mmdc` and `dot`).
 - `src/export/markdown.rs` — print sheet (no solutions).
 - `src/export/canvas.rs` — Canvas New Quizzes QTI bytes.
+- `src/quiz/` — selection: which of a bank's questions go on one sheet
+  (`sample`), reproducibly from a seed. Sits between the bank and the exporters.
 - `src/path.rs` — path policy for authored, bank-relative paths (`escapes_dir`,
   `is_local_image`). Shared by the parser, the exporters and the CLI, which all
   have to agree on what a `file:`/image path may reach.

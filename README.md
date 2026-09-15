@@ -36,7 +36,8 @@ Binary search requires its input array to be sorted.
 - **One command:** point it at a directory; add `--recursive` to gather a whole
   tree of subfolders into one bank, or `--sample N` to draw N random questions
   from each folder. For print sheets, `--include-key` emits an answer key and
-  `--random-order` shuffles the questions.
+  `--random-order` shuffles the questions, and `--seed N` makes a sampled or
+  shuffled sheet reproducible.
 
 ## Install
 
