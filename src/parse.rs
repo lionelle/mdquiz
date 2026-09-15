@@ -288,7 +288,7 @@ enum QuestionSpec {
 }
 
 /// The default point value when a question omits `points`.
-fn default_points() -> f64 {
+const fn default_points() -> f64 {
     1.0
 }
 
@@ -452,10 +452,8 @@ fn read_partial(path: &str, read: &PartialReader<'_>, id: &str) -> Result<String
 
 /// The directory portion of a partial `path` (`""` when it has none).
 fn parent_dir(path: &str) -> &str {
-    match path.rfind('/') {
-        Some(index) => path.get(..index).unwrap_or(""),
-        None => "",
-    }
+    path.rfind('/')
+        .map_or("", |index| path.get(..index).unwrap_or(""))
 }
 
 /// Prefix every local image path in `question`'s rich-text fields with `base`,

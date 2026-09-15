@@ -1997,8 +1997,11 @@ mod tests {
         let images = vec![("sub/diagram.png".to_owned(), vec![1_u8, 2, 3])];
         let bytes = to_qti(&bank, &images).expect("export");
         let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
-        let names: Vec<&str> = archive.file_names().collect();
-        assert!(names.contains(&"web_resources/sub/diagram.png"));
+        assert!(
+            archive
+                .file_names()
+                .any(|name| name == "web_resources/sub/diagram.png")
+        );
         let manifest = manifest_xml("a", "a/a.xml", &images);
         assert!(manifest.contains(r#"href="web_resources/sub/diagram.png""#));
         assert!(manifest.contains("webcontent"));

@@ -86,12 +86,12 @@ pub struct SampleRng(u64);
 impl SampleRng {
     /// A generator that will always produce the same sequence for `seed`.
     #[must_use]
-    pub fn seeded(seed: u64) -> Self {
+    pub const fn seeded(seed: u64) -> Self {
         Self(seed)
     }
 
     /// The next pseudo-random `u64`.
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);

@@ -513,7 +513,8 @@ fn write_export(
     }
 }
 
-/// Write the answer key beside the markdown sheet, at [`key_path`]`(output)`.
+/// Write the answer key beside the markdown sheet, at the path [`key_path`]
+/// derives from `output`.
 ///
 /// # Errors
 ///

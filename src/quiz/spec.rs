@@ -99,7 +99,7 @@ pub struct Layout {
 }
 
 /// The default blank lines left after a question.
-fn default_answer_space() -> usize {
+const fn default_answer_space() -> usize {
     3
 }
 
@@ -143,7 +143,7 @@ pub struct Spec {
 }
 
 /// A spec with no `variants:` produces one sheet.
-fn default_variants() -> usize {
+const fn default_variants() -> usize {
     1
 }
 
@@ -717,8 +717,13 @@ mod tests {
     /// A caller passing the wrong number of pool sizes is told so rather than
     /// having groups silently treated as empty.
     fn mismatched_pool_counts_are_rejected() {
-        assert!(pool_spec("1", 1).check_pools(&[]).is_err());
-        assert!(pool_spec("1", 1).check_pools(&[3, 3]).is_err());
+        for pools in [&[][..], &[3, 3][..]] {
+            let error = pool_spec("1", 1)
+                .check_pools(pools)
+                .expect_err("mismatch")
+                .to_string();
+            assert!(error.contains("one pool size per group"), "{error}");
+        }
     }
 
     #[test]
@@ -808,6 +813,121 @@ mod tests {
     }
 
     #[test]
+    /// A group must name a folder. `dir` is trimmed first, so empty and
+    /// whitespace-only are the same blank — and neither is caught by the escape
+    /// rule, which sees no components at all in an empty path.
+    fn a_blank_group_dir_is_rejected() {
+        for dir in ["\"\"", "\"   \""] {
+            let yaml = format!("name: E\ngroups:\n  - dir: {dir}\n");
+            let error = Spec::from_yaml(&yaml).expect_err("blank dir").to_string();
+            assert!(error.contains("must name a folder"), "{dir}: {error}");
+        }
+    }
+
+    #[test]
+    /// Every rejection names the offending group by index, and an overlap names
+    /// both sides, so an author with a dozen groups knows which line to fix.
+    fn errors_name_the_offending_group_by_index() {
+        let escaping = "name: E\ngroups:\n  - dir: topics/trees\n  - dir: ../elsewhere\n";
+        let error = Spec::from_yaml(escaping).expect_err("escape").to_string();
+        assert!(error.contains(r#"groups[1] "../elsewhere""#), "{error}");
+        let overlap = "name: E\ngroups:\n  - dir: a\n  - dir: b\n  - dir: a/deep\n";
+        let error = Spec::from_yaml(overlap).expect_err("overlap").to_string();
+        assert!(error.contains(r#"groups[2] "a/deep""#), "{error}");
+        assert!(error.contains(r#"groups[0] "a""#), "{error}");
+    }
+
+    #[test]
+    /// `take:` equal to the pool size is satisfiable — the folder supplies
+    /// exactly what was asked for. It draws the whole folder, so it yields one
+    /// question set and a second variant has nothing left to differ by.
+    fn take_equal_to_the_pool_is_allowed() {
+        let warnings = pool_spec("3", 1).check_pools(&[3]).expect("exact fit");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let error = pool_spec("3", 2)
+            .check_pools(&[3])
+            .expect_err("no second set")
+            .to_string();
+        assert!(error.contains("1 distinct question set"), "{error}");
+    }
+
+    #[test]
+    /// The warning has a real 5% threshold and quotes the odds: 196 question
+    /// sets over five variants collide 5.01% of the time and warn; 197 sets is
+    /// 4.99% and stays quiet.
+    fn the_collision_warning_fires_at_five_percent() {
+        let warnings = pool_spec("1", 5).check_pools(&[196]).expect("possible");
+        let warning = warnings.first().map(String::as_str).unwrap_or_default();
+        assert!(
+            warning.starts_with("5% chance two of the 5 variants"),
+            "{warning}"
+        );
+        let quiet = pool_spec("1", 5)
+            .check_pools(&[197])
+            .expect("under the bar");
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    #[test]
+    /// One shuffling group is enough to tell two sheets apart, even when every
+    /// other group is identical on every variant.
+    fn one_shuffling_group_among_several_is_enough() {
+        let shuffled = concat!(
+            "name: E\nvariants: 5\ngroups:\n",
+            "  - dir: a\n    take: all\n",
+            "  - dir: b\n    take: all\n    shuffle_choices: true\n",
+        );
+        let spec = Spec::from_yaml(shuffled).expect("parses");
+        let warnings = spec
+            .check_pools(&[4, 4])
+            .expect("shuffling is a difference");
+        let warning = warnings.first().map(String::as_str).unwrap_or_default();
+        assert!(warning.contains("order of their choices"), "{warning}");
+        let plain = shuffled.replace("    shuffle_choices: true\n", "");
+        let error = Spec::from_yaml(&plain)
+            .expect("parses")
+            .check_pools(&[4, 4])
+            .expect_err("nothing varies")
+            .to_string();
+        assert!(error.contains("shuffle_choices"), "{error}");
+    }
+
+    #[test]
+    /// `header` and `footer` are trimmed before the escape rule sees them:
+    /// `" ../x.md"` has no `..` *component* until the padding is gone, so the
+    /// normalize-then-validate order is what closes the hole.
+    fn padded_header_paths_are_trimmed_before_the_escape_check() {
+        let escaping = "name: E\nheader: \"  ../outside.md  \"\ngroups:\n  - dir: t\n";
+        let error = Spec::from_yaml(escaping).expect_err("escape").to_string();
+        assert!(error.contains("stay inside"), "{error}");
+        let ok = "name: E\nfooter: \"  templates/footer.md  \"\ngroups:\n  - dir: t\n";
+        assert_eq!(
+            Spec::from_yaml(ok).expect("parses").footer.as_deref(),
+            Some("templates/footer.md")
+        );
+    }
+
+    #[test]
+    /// Placeholders may be spaced out inside the braces, and the legal set is
+    /// closed: a plausible-but-unsupported key is still an error.
+    fn placeholder_keys_are_trimmed_and_the_set_is_closed() {
+        let padded = "layout:\n  page_footer: \"${ name } p${ page }\"\n";
+        assert!(Spec::from_yaml(&yaml(padded)).is_ok());
+        for bad in ["answers", "date", "Name"] {
+            let footer = format!("layout:\n  page_footer: \"${{{bad}}}\"\n");
+            let error = reject(&footer);
+            assert!(error.contains("unknown placeholder"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    /// A seed round-trips, and a negative one is rejected by the type.
+    fn seed_round_trips_and_rejects_negatives() {
+        assert_eq!(parse("seed: 20260915\n").seed, Some(20_260_915));
+        assert!(Spec::from_yaml(&yaml("seed: -1\n")).is_err());
+    }
+
+    #[test]
     /// Binomials are exact for realistic folders and saturate beyond the cap.
     fn combinations_are_exact_then_capped() {
         assert_eq!(combinations_capped(4, 3), 4);
@@ -816,7 +936,8 @@ mod tests {
         assert_eq!(combinations_capped(5, 5), 1);
         assert_eq!(combinations_capped(5, 0), 1);
         assert_eq!(combinations_capped(3, 5), 0); // more than the pool holds
-        assert_eq!(combinations_capped(200, 100), COMBINATION_CAP);
+        assert_eq!(combinations_capped(200, 100), 1_000_000);
+        assert_eq!(COMBINATION_CAP, 1_000_000);
     }
 
     #[test]
@@ -850,7 +971,13 @@ mod tests {
         // 10 x 10 x 10 = 1000: deep enough to draw 5 variants quietly.
         assert!(spec.check_pools(&[10, 10, 10]).expect("ok").is_empty());
         // 2 x 1 x 1 = 2 possible exams: cannot make 5 distinct variants at all.
-        assert!(spec.check_pools(&[2, 1, 1]).is_err());
+        // Asserted by reason, not just `is_err`: an unrelated fault in the
+        // short-pool check would otherwise fail this test for the wrong cause.
+        let error = spec
+            .check_pools(&[2, 1, 1])
+            .expect_err("too few")
+            .to_string();
+        assert!(error.contains("2 distinct question set"), "{error}");
     }
 
     #[test]

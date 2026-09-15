@@ -59,7 +59,7 @@ impl DiagramLanguage {
     /// warnings. It is the language, not the fence the author typed: a
     /// ` ```dot ` block is named `graphviz`.
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Mermaid => "mermaid",
             Self::Graphviz => "graphviz",
@@ -73,7 +73,7 @@ impl DiagramLanguage {
     /// extension and treats a `.md` file as Markdown to extract diagrams *from*,
     /// so a bare diagram must not be written to one. `dot` ignores it.
     #[must_use]
-    pub fn source_extension(self) -> &'static str {
+    pub const fn source_extension(self) -> &'static str {
         match self {
             Self::Mermaid => "mmd",
             Self::Graphviz => "dot",
@@ -105,7 +105,7 @@ pub enum DiagramFormat {
 impl DiagramFormat {
     /// The file extension for this format.
     #[must_use]
-    pub fn extension(self) -> &'static str {
+    pub const fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Svg => "svg",

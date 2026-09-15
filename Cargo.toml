@@ -36,6 +36,16 @@ unreachable_pub = "warn"
 # Baseline lint groups.
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# Nursery carries `cognitive_complexity`, whose threshold lives in clippy.toml.
+# Without this group that ceiling is declared but never enforced.
+nursery = { level = "warn", priority = -1 }
+# `redundant_pub_crate` and `rust::unreachable_pub` (above) contradict each
+# other: one asks for `pub` on an item a private module already confines to the
+# crate, the other asks for `pub(crate)` on exactly that item. Applying either
+# suggestion makes the other fire. `unreachable_pub` is the rule this crate
+# keeps, so this one is off — crate-wide because the conflict is between the
+# lints themselves, not a property of any single item.
+redundant_pub_crate = "allow"
 # Require doc comments on private items too (public items are covered by
 # `rust::missing_docs`). Together these mean every function is documented.
 missing_docs_in_private_items = "warn"

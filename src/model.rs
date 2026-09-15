@@ -155,7 +155,7 @@ pub enum QuestionKind {
 impl QuestionKind {
     /// A short human-readable label for this type, used in diagnostics.
     #[must_use]
-    pub fn label(&self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
             Self::TrueFalse(_) => "true/false",
             Self::MultipleChoice(_) => "multiple choice",
