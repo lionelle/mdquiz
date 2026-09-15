@@ -15,8 +15,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use mdquiz::diagram::{self, DiagramFormat, DiagramLanguage};
 use mdquiz::export::{self, canvas, markdown};
-use mdquiz::model::ItemBank;
+use mdquiz::model::{ItemBank, Question};
 use mdquiz::parse;
+use mdquiz::path::escapes_dir;
 
 /// Author quizzes in Markdown + YAML and export them for print or Canvas.
 #[derive(Debug, Parser)]
@@ -127,7 +128,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
             let mut bank = assemble_bank(&dir, name, recursive, sample, random_order)?;
             // Diagram rendering and image bundling apply only to the Canvas package.
             let images = match format {
-                FormatArg::Canvas => canvas_images(&dir, &mut bank, diagram_format.into()),
+                FormatArg::Canvas => canvas_images(&dir, &mut bank.items, diagram_format.into()),
                 FormatArg::Markdown => Vec::new(),
             };
             let reminders = write_export(&bank, format.into(), &output, &images)?;
@@ -172,33 +173,33 @@ fn shuffle<T>(items: &mut [T], rng: &mut SampleRng) {
     }
 }
 
-/// Render the diagrams in `bank`, then gather every image the Canvas package
+/// Render the diagrams in `items`, then gather every image the Canvas package
 /// needs: the generated diagrams plus the local images read from `dir`.
 fn canvas_images(
     dir: &Path,
-    bank: &mut ItemBank,
+    items: &mut [Question],
     diagram_format: DiagramFormat,
 ) -> Vec<(String, Vec<u8>)> {
     let renderer = move |language: DiagramLanguage, source: &str| {
         render_diagram(language, source, diagram_format)
     };
-    let outcome = diagram::render_diagrams(bank, &renderer, diagram_format);
+    let outcome = diagram::render_diagrams(items, &renderer, diagram_format);
     for warning in &outcome.warnings {
         eprintln!("warning: {warning}");
     }
-    let mut images = load_images(dir, bank);
+    let mut images = load_images(dir, items);
     images.extend(outcome.images);
     images
 }
 
-/// Load the bytes of every local image referenced by the bank, resolved
+/// Load the bytes of every local image referenced by `items`, resolved
 /// relative to `dir`. Missing or unsafe paths are skipped with a warning.
 ///
 /// Generated-diagram paths (under [`diagram::GENERATED_DIR`]) are skipped here:
 /// their bytes come from the diagram pass, not the question directory.
-fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
+fn load_images(dir: &Path, items: &[Question]) -> Vec<(String, Vec<u8>)> {
     let mut images = Vec::new();
-    for path in canvas::local_image_paths(bank) {
+    for path in canvas::local_image_paths(items) {
         if diagram::is_generated_path(&path) {
             continue;
         }
@@ -346,14 +347,6 @@ fn partial_reader(dir: &Path) -> impl Fn(&str) -> std::result::Result<String, St
         }
         fs::read_to_string(dir.join(path)).map_err(|error| error.to_string())
     }
-}
-
-/// Whether `path` walks out of its base directory via a `..` component.
-///
-/// The single source of truth for the path-escape rule shared by
-/// [`partial_reader`] (which errors) and [`load_images`] (which skips).
-fn escapes_dir(path: &str) -> bool {
-    path.split('/').any(|part| part == "..")
 }
 
 /// Print any post-import manual-fix reminders to stderr after a Canvas export.
@@ -791,7 +784,7 @@ mod tests {
                 .is_some_and(|c| c.text.contains("![p](topics/inpartial.png)"))
         ));
         // Both rebased paths resolve on disk through the root-rooted loader.
-        let names: Vec<String> = load_images(dir.path(), &bank)
+        let names: Vec<String> = load_images(dir.path(), &bank.items)
             .into_iter()
             .map(|(path, _)| path)
             .collect();
@@ -830,7 +823,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         fs::write(dir.path().join("here.png"), b"png-bytes").expect("write image");
         let bank = true_false_bank("![a](here.png) ![b](missing.png) ![c](../escape.png)");
-        let images = load_images(dir.path(), &bank);
+        let images = load_images(dir.path(), &bank.items);
         assert_eq!(images.len(), 1);
         assert_eq!(
             images.first().map(|(path, _)| path.as_str()),
@@ -847,7 +840,7 @@ mod tests {
         fs::create_dir(&qdir).expect("qdir");
         let bank = true_false_bank("![e](../secret.png)");
         // The file exists outside `qdir`, so only the `..` guard can skip it.
-        assert!(load_images(&qdir, &bank).is_empty());
+        assert!(load_images(&qdir, &bank.items).is_empty());
     }
 
     #[test]
@@ -860,7 +853,7 @@ mod tests {
         fs::create_dir(dir.path().join("generated")).expect("generated dir");
         fs::write(dir.path().join("generated/mermaid-abc.png"), b"x").expect("write generated");
         let bank = true_false_bank("![d](generated/mermaid-abc.png) and ![r](real.png)");
-        let images = load_images(dir.path(), &bank);
+        let images = load_images(dir.path(), &bank.items);
         assert_eq!(images.len(), 1);
         assert_eq!(
             images.first().map(|(path, _)| path.as_str()),
@@ -917,7 +910,7 @@ mod tests {
         let read = partial_reader(dir.path());
         let bank = parse::item_bank_from_sources_with("m", sources, &read).expect("bank");
         // The partial's `img.png` was rebased to `parts/img.png`, which exists.
-        let images = load_images(dir.path(), &bank);
+        let images = load_images(dir.path(), &bank.items);
         assert_eq!(
             images.first().map(|(p, _)| p.as_str()),
             Some("parts/img.png")
@@ -1107,7 +1100,7 @@ mod tests {
                 kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
             }],
         };
-        let images = canvas_images(dir.path(), &mut bank, DiagramFormat::Png);
+        let images = canvas_images(dir.path(), &mut bank.items, DiagramFormat::Png);
         let names: Vec<&str> = images.iter().map(|(path, _)| path.as_str()).collect();
         assert!(names.contains(&"real.png"));
         let prompt = bank.items.first().map_or("", |q| q.prompt.as_str());

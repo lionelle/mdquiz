@@ -69,6 +69,9 @@ source .md  ──▶  parse::item_bank_from_sources  ──▶  model::ItemBank
   `mmdc` and `dot`).
 - `src/export/markdown.rs` — print sheet (no solutions).
 - `src/export/canvas.rs` — Canvas New Quizzes QTI bytes.
+- `src/path.rs` — path policy for authored, bank-relative paths (`escapes_dir`,
+  `is_local_image`). Shared by the parser, the exporters and the CLI, which all
+  have to agree on what a `file:`/image path may reach.
 - `src/error.rs` — the crate `Error`/`Result`. Everything fallible flows through
   here.
 - `src/cli.rs` + `src/main.rs` — thin CLI shell; **no logic** beyond wiring I/O

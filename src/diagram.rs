@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
-use crate::model::ItemBank;
+use crate::model::Question;
 
 /// The reserved bundle directory for mdquiz-generated images.
 ///
@@ -122,20 +122,24 @@ pub struct DiagramOutcome {
     pub warnings: Vec<String>,
 }
 
-/// Replace every diagram block in `bank` with a generated image reference.
+/// Replace every diagram block in `items` with a generated image reference.
 ///
 /// Each distinct diagram is rendered once (deduplicated by language and
 /// content); failures are collected as warnings and leave the block untouched.
 /// Returns the images to bundle and any warnings.
+///
+/// Operates on a question slice, so any collection of questions renders: a
+/// caller holding an [`ItemBank`](crate::model::ItemBank) passes
+/// `&mut bank.items`.
 #[must_use]
 pub fn render_diagrams(
-    bank: &mut ItemBank,
+    items: &mut [Question],
     render: &DiagramRenderer<'_>,
     format: DiagramFormat,
 ) -> DiagramOutcome {
     let mut outcome = DiagramOutcome::default();
     let mut seen = HashSet::new();
-    for question in &mut bank.items {
+    for question in items {
         let id = question.id.clone();
         for field in question.rich_text_fields_mut() {
             render_field(field, render, format, &id, &mut seen, &mut outcome);
@@ -239,7 +243,7 @@ fn image_reference(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Feedback, Question, QuestionKind, TrueFalse};
+    use crate::model::{Feedback, ItemBank, Question, QuestionKind, TrueFalse};
 
     /// A true/false question `id` asking `prompt`.
     fn question(id: &str, prompt: &str) -> Question {
@@ -277,7 +281,7 @@ mod tests {
     fn renders_block_to_image_reference() {
         let mut b = bank("Before\n\n```mermaid\ngraph TD; A-->B;\n```\n\nAfter");
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert!(prompt(&b).contains("![diagram](generated/mermaid-"));
         assert!(prompt(&b).contains(".png)") && !prompt(&b).contains("```mermaid"));
         assert_eq!(outcome.images.len(), 1);
@@ -292,7 +296,7 @@ mod tests {
     fn leaves_other_code_blocks() {
         let mut b = bank("```rust\nfn main() {}\n```");
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert!(prompt(&b).contains("```rust"));
         assert!(outcome.images.is_empty());
     }
@@ -302,7 +306,7 @@ mod tests {
     fn deduplicates_identical_diagrams() {
         let mut b = bank("```mermaid\ngraph TD; A-->B;\n```\n\n```mermaid\ngraph TD; A-->B;\n```");
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 1);
         assert_eq!(prompt(&b).matches("![diagram]").count(), 2);
     }
@@ -312,7 +316,7 @@ mod tests {
     fn failure_warns_and_leaves_block() {
         let mut b = bank("```mermaid\nbad\n```");
         let render = |_language: DiagramLanguage, _source: &str| Err("mmdc not found".to_owned());
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert!(prompt(&b).contains("```mermaid"));
         assert!(outcome.images.is_empty());
         assert_eq!(outcome.warnings.len(), 1);
@@ -362,7 +366,7 @@ mod tests {
             "Recall:\n\n```mermaid\ngraph TD; X-->Y;\n```",
         );
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         let question = b.items.first().expect("question");
         assert!(matches!(
             &question.kind,
@@ -399,7 +403,7 @@ mod tests {
         )
         .expect("bank");
         let renderer = ok_renderer();
-        let outcome = render_diagrams(&mut b, &renderer, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &renderer, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 1);
         assert!(matches!(
             b.items.first().map(|q| &q.kind),
@@ -413,7 +417,7 @@ mod tests {
     fn mermaid_with_trailing_info_renders() {
         let mut b = bank("```mermaid theme=default\ngraph TD; A-->B;\n```");
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 1);
     }
 
@@ -422,7 +426,7 @@ mod tests {
     fn svg_format_uses_svg_extension() {
         let mut b = bank("```mermaid\ngraph TD; A-->B;\n```");
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Svg);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Svg);
         let path = outcome.images.first().map_or("", |(p, _)| p.as_str());
         assert!(path.contains(".svg"));
         assert!(prompt(&b).contains(".svg)"));
@@ -478,7 +482,7 @@ mod tests {
         for fence in ["dot", "graphviz"] {
             let mut b = bank(&format!("```{fence}\ndigraph {{ a -> b; }}\n```"));
             let render = ok_renderer();
-            let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+            let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
             assert_eq!(outcome.images.len(), 1);
             assert!(prompt(&b).contains("![diagram](generated/graphviz-"));
             assert!(!prompt(&b).contains("```"));
@@ -495,7 +499,7 @@ mod tests {
             Ok(vec![1])
         };
         let mut b = bank("```mermaid\ngraph TD; A-->B;\n```\n\n```dot\ndigraph { a -> b; }\n```");
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 2);
         let mut languages = seen.into_inner();
         languages.sort_by_key(|l| l.name());
@@ -511,7 +515,7 @@ mod tests {
     fn languages_do_not_share_generated_paths() {
         let mut b = bank("```mermaid\nsame\n```\n\n```dot\nsame\n```");
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 2);
         assert!(prompt(&b).contains("generated/mermaid-"));
         assert!(prompt(&b).contains("generated/graphviz-"));
@@ -532,10 +536,28 @@ mod tests {
         let block = "```dot\ndigraph { a -> b; }\n```";
         let mut b = two_question_bank(block, block);
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 1);
         let path = outcome.images.first().map_or("", |(p, _)| p.as_str());
         assert!(b.items.iter().all(|q| q.prompt.contains(path)));
+    }
+
+    #[test]
+    /// Questions are walked in order: two distinct diagrams bundle in question
+    /// order, and an empty slice renders nothing.
+    fn questions_are_walked_in_order() {
+        let mut b = two_question_bank(
+            "```mermaid\ngraph TD; A-->B;\n```",
+            "```dot\ndigraph { a -> b; }\n```",
+        );
+        let render = ok_renderer();
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
+        let paths: Vec<&str> = outcome.images.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.first().is_some_and(|p| p.contains("mermaid-")));
+        assert!(paths.get(1).is_some_and(|p| p.contains("graphviz-")));
+        let empty = render_diagrams(&mut [], &render, DiagramFormat::Png);
+        assert!(empty.images.is_empty() && empty.warnings.is_empty());
     }
 
     #[test]
@@ -552,7 +574,7 @@ mod tests {
             DiagramLanguage::Mermaid => Ok(vec![1, 2, 3]),
             DiagramLanguage::Graphviz => Err("dot not found".to_owned()),
         };
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 2);
         assert_eq!(
             prompt(&b).matches("![diagram](generated/mermaid-").count(),
@@ -571,7 +593,7 @@ mod tests {
     fn repeated_failures_warn_once_per_occurrence() {
         let mut b = bank("```dot\nsame\n```\n\n```dot\nsame\n```");
         let render = |_language: DiagramLanguage, _source: &str| Err("dot not found".to_owned());
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert!(outcome.images.is_empty());
         assert_eq!(outcome.warnings.len(), 2);
     }
@@ -581,7 +603,7 @@ mod tests {
     fn unlabelled_fence_is_not_a_diagram() {
         let mut b = bank("```\ndigraph { a -> b; }\n```\n\n```dot\ndigraph { a -> b; }\n```");
         let render = ok_renderer();
-        let outcome = render_diagrams(&mut b, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert_eq!(outcome.images.len(), 1);
         assert!(prompt(&b).contains("```\ndigraph { a -> b; }\n```"));
     }

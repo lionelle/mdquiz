@@ -11,13 +11,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
+
+use crate::path::is_local_image;
 use serde::Deserialize;
 
 use crate::Result;
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
     MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse, blank_markers,
-    is_local_image,
 };
 
 /// Reads a partial's raw Markdown given its bank-relative `path`, returning a

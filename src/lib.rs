@@ -24,5 +24,6 @@ pub mod error;
 pub mod export;
 pub mod model;
 pub mod parse;
+pub mod path;
 
 pub use error::{Error, Result};

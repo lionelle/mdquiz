@@ -213,20 +213,44 @@ existing pattern.
 5. **Math spike** (see above): bake-off, support matrix, hard-error policy.
 6. **Inline runs** — bold, italic, code, strikethrough.
 7. **Lists** — including `numbering.xml` abstract/concrete definitions.
-8. **Tables** — `w:tbl`/`w:tblGrid`/`w:tblPr`/`w:tblBorders`. Note
-   `export/markdown.rs` never parses Markdown at all; DOCX is the first consumer
-   that must render structure, and it has to cover what Canvas covers or the two
-   paths diverge.
-9. **Code blocks** — monospace character style.
-10. **The six question kinds** + the answer-key document.
-11. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
+8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal
+   text in a monospace style. See "Tables in v1" below; folding them together is
+   what removes a whole part from this plan.
+9. **The six question kinds** + the answer-key document.
+10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
     (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.
-12. **`mdquiz quiz` subcommand.** Library returns
+11. **`mdquiz quiz` subcommand.** Library returns
     `Vec<OutputFile>` + warnings; `cli.rs` only writes bytes — it is already
     1122 lines. Variant naming (A/B/C, reusing `choice_label`'s A..Z-then-number
     rule; `key_path` only appends `-key` today and nothing produces the `-A`).
     Manifest records per-variant question ids, the shuffled choice order, and
     the derived seed.
+
+### Tables in v1
+
+A Markdown pipe table is emitted as **literal text**, not as `w:tbl`. Real table
+rendering is deferred (see "Deferred").
+
+This matches what the print sheet already does — `export/markdown.rs` never
+parses Markdown, it interpolates the authored string verbatim, and its own test
+asserts a pipe table stays literal. It does *not* match Canvas, which renders
+real bordered HTML tables; that divergence is accepted for v1 and must be
+documented in `docs/`.
+
+Two requirements make the difference between a usable stopgap and an unreadable
+one, and both are the same requirements code blocks have — which is why the two
+share one part:
+
+- **Monospace.** A pipe table in a proportional font loses column alignment
+  entirely. In a monospace style the columns still line up on paper.
+- **Preserved line breaks.** A DOCX paragraph collapses newlines, so a
+  multi-row table would otherwise render as one run-on line. Each row needs an
+  explicit `<w:br/>` (or its own paragraph with zero spacing).
+
+No warning is emitted. This is deliberate and is *not* inconsistent with the
+hard-error policy for math: a table rendered as text is visibly text, and the
+instructor sees exactly what the student sees. Wrong math, by contrast, looks
+right. The failure modes are not comparable.
 
 ### Converter contract
 
@@ -267,6 +291,9 @@ children, or a `numId` with no matching `w:num`; none of that is visible to
   `tags: [trees]` group filter is the natural next knob.
 - **Markdown header/footer.** Only the DOCX writer consumes header/footer;
   extending the Markdown sheet is a small follow-on.
+- **Real DOCX tables.** `w:tbl`/`w:tblGrid`/`w:tblPr`/`w:tblBorders`, to reach
+  parity with the Canvas exporter's bordered tables. v1 emits table text
+  instead; see "Tables in v1".
 - **Per-question points on the sheet.** `Question::points` exists but no
   exporter prints it. A paper exam wants per-question points and a per-variant
   total.

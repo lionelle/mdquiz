@@ -27,6 +27,16 @@ pub enum Error {
         message: String,
     },
 
+    /// A quiz spec (the YAML blueprint) was invalid; names the offending group
+    /// so the author knows which entry to fix.
+    #[error("in quiz spec group {group}: {message}")]
+    Spec {
+        /// The offending group, as written in the spec.
+        group: String,
+        /// The underlying failure, rendered.
+        message: String,
+    },
+
     /// A question was structurally valid but semantically incomplete
     /// (for example, a multiple-choice item with no correct answer).
     #[error("invalid question: {0}")]

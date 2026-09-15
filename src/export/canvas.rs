@@ -20,8 +20,9 @@ use zip::write::SimpleFileOptions;
 use crate::Result;
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
-    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse, is_local_image,
+    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse,
 };
+use crate::path::is_local_image;
 
 /// The `response_label` ident for the "True" choice; fills the item template.
 const TRUE_CHOICE_IDENT: &str = "true_choice";
@@ -1155,16 +1156,19 @@ fn percent_encode_component(text: &str) -> String {
     out
 }
 
-/// The distinct local-image paths referenced by any question in `bank`.
+/// The distinct local-image paths referenced by any question in `items`.
 ///
 /// Scans every rich-text field (see `Question::rich_text_fields`), so images
 /// embedded in answers and feedback are bundled just like prompt images. The
 /// exporter bundles these under `web_resources/`; the CLI resolves them to bytes
 /// relative to the question directory.
+///
+/// Operates on a question slice; a caller holding an [`ItemBank`] passes
+/// `&bank.items`.
 #[must_use]
-pub fn local_image_paths(bank: &ItemBank) -> Vec<String> {
+pub fn local_image_paths(items: &[Question]) -> Vec<String> {
     let mut paths = Vec::new();
-    for question in &bank.items {
+    for question in items {
         for field in question.rich_text_fields() {
             for url in image_urls(field) {
                 if is_local_image(&url) && !paths.contains(&url) {
@@ -1978,7 +1982,7 @@ mod tests {
     /// A local image URL is rewritten to `$IMS-CC-FILEBASE$`; external URLs stay.
     fn local_image_rewritten_external_untouched() {
         let bank = image_bank("See ![d](diagram.png) and ![x](https://ex.com/x.png).");
-        assert_eq!(local_image_paths(&bank), ["diagram.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["diagram.png"]);
         let xml = assessment_xml("a", &bank).expect("renders");
         assert!(xml.contains("$IMS-CC-FILEBASE$/diagram.png?canvas_download=1"));
         assert!(xml.contains("https://ex.com/x.png"));
@@ -2037,7 +2041,7 @@ mod tests {
         ];
         let bank = choice_image_bank(choices, feedback);
         // Choice image and feedback image collected, in field order; external skipped.
-        assert_eq!(local_image_paths(&bank), ["pic.png", "hint.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["pic.png", "hint.png"]);
     }
 
     #[test]
@@ -2047,7 +2051,7 @@ mod tests {
             vec![("![a](tree.png)", true), ("Neither", false)],
             Feedback::default(),
         );
-        assert_eq!(local_image_paths(&bank), ["tree.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["tree.png"]);
         let images = vec![("tree.png".to_owned(), vec![9_u8, 9, 9])];
         let bytes = to_qti(&bank, &images).expect("export");
         let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
@@ -2063,7 +2067,24 @@ mod tests {
     fn ordering_item_image_is_collected() {
         let items = vec!["![step](step.png)".to_owned(), "Plain".to_owned()];
         let bank = ordering_bank(items, Feedback::default());
-        assert_eq!(local_image_paths(&bank), ["step.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["step.png"]);
+    }
+
+    #[test]
+    /// Every question is scanned, in question order, and an image shared by two
+    /// questions is collected once. An empty slice collects nothing.
+    fn images_collected_across_every_question_in_order() {
+        let mut bank = image_bank("![a](first.png) and ![s](shared.png)");
+        let mut second = image_bank("![s](shared.png) and ![b](second.png)");
+        if let Some(question) = second.items.first_mut() {
+            question.id = "q2".to_owned();
+        }
+        bank.items.append(&mut second.items);
+        assert_eq!(
+            local_image_paths(&bank.items),
+            ["first.png", "shared.png", "second.png"]
+        );
+        assert!(local_image_paths(&[]).is_empty());
     }
 
     #[test]
@@ -2076,7 +2097,7 @@ mod tests {
         if let Some(question) = bank.items.first_mut() {
             question.prompt = "See ![p](same.png)".to_owned();
         }
-        assert_eq!(local_image_paths(&bank), ["same.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["same.png"]);
     }
 
     #[test]
@@ -2095,7 +2116,7 @@ mod tests {
             ],
             distractors: Vec::new(),
         };
-        assert!(local_image_paths(&matching_bank(matching, Feedback::default())).is_empty());
+        assert!(local_image_paths(&matching_bank(matching, Feedback::default()).items).is_empty());
     }
 
     #[test]
@@ -2121,7 +2142,7 @@ mod tests {
         use crate::diagram::{DiagramFormat, DiagramLanguage, render_diagrams};
         let mut bank = image_bank("```dot\ndigraph { a -> b; }\n```");
         let render = |_language: DiagramLanguage, _source: &str| Ok(vec![1_u8, 2, 3]);
-        let outcome = render_diagrams(&mut bank, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut bank.items, &render, DiagramFormat::Png);
         let path = outcome
             .images
             .first()
@@ -2143,7 +2164,7 @@ mod tests {
         let bank = image_bank("```dot\ndigraph { a -> b; }\n```");
         let xml = assessment_xml("a", &bank).expect("renders");
         assert!(xml.contains("language-dot") && xml.contains("digraph"));
-        assert!(local_image_paths(&bank).is_empty());
+        assert!(local_image_paths(&bank.items).is_empty());
     }
 
     #[test]
