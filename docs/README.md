@@ -103,3 +103,5 @@ See also:
 - [partials.md](partials.md) — pointing a choice, ordering item, or feedback
   message at a separate Markdown file (`file:`) instead of inline text.
 - [exporting.md](exporting.md) — the CLI and the Canvas import workflow.
+- [quizzes.md](quizzes.md) — quiz specs: the YAML blueprint for a printable
+  exam, sampled per topic folder and produced in several variants.

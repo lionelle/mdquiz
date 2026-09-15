@@ -6,3 +6,4 @@
 //! function of its inputs and a seed, so a draw can be reproduced exactly.
 
 pub mod sample;
+pub mod spec;

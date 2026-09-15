@@ -276,6 +276,11 @@ impl FillInBlank {
 }
 
 /// The inline marker text for a blank named `name` (that is, `{{name}}`).
+///
+/// Quiz-spec templates deliberately use `${…}` (`quiz::spec::TEMPLATE_OPEN`)
+/// rather than this syntax, so a header or footer that later became a question
+/// partial cannot sprout blanks where it meant to name the exam. Changing
+/// either delimiter means checking the other.
 pub(crate) fn blank_marker(name: &str) -> String {
     ["{{", name, "}}"].concat()
 }

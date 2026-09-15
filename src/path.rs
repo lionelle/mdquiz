@@ -36,6 +36,36 @@ pub fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
+/// The meaningful name components of a bank-relative directory.
+///
+/// Drops `.` and any root/prefix component so two spellings of the same folder
+/// compare equal. Callers reject escaping paths first, so dropping `..` here
+/// cannot mask one.
+fn dir_parts(dir: &str) -> Vec<&std::ffi::OsStr> {
+    Path::new(dir)
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether two directories would draw from the same files: the same folder, or
+/// one nested inside the other.
+///
+/// Compared by path component, not by string prefix, so `./topics`,
+/// `topics//trees` and `topics/./trees` are recognised as the folders they
+/// actually name. String matching misses all three.
+///
+/// Note two empty paths nest. Callers reject an empty directory *before*
+/// checking overlap, so that case never reaches here.
+#[must_use]
+pub fn nests(one: &str, other: &str) -> bool {
+    let (one, other) = (dir_parts(one), dir_parts(other));
+    one.starts_with(&other) || other.starts_with(&one)
+}
+
 /// Whether an image URL is a local file path (rather than an absolute URL).
 ///
 /// Shared by the parser (which rebases a partial's local images) and the Canvas
@@ -81,6 +111,30 @@ mod tests {
         let base = Path::new("/questions");
         assert_eq!(base.join("/etc/passwd"), Path::new("/etc/passwd"));
         assert!(escapes_dir("/etc/passwd"));
+    }
+
+    #[test]
+    /// Folders that name the same place nest, however they are spelled, and
+    /// a shared prefix that is not a path boundary does not.
+    fn nests_compares_path_components_not_strings() {
+        for (one, other) in [
+            ("topics", "topics"),
+            ("topics/", "topics"),
+            ("./topics", "topics"),
+            ("topics//trees", "topics/trees"),
+            ("topics/./trees", "topics/trees"),
+            ("topics", "topics/trees"),
+            ("topics/trees", "topics"),
+        ] {
+            assert!(nests(one, other), "{one} should nest with {other}");
+        }
+        for (one, other) in [
+            ("topics/tree", "topics/trees"),
+            ("topics/trees", "topics/graphs"),
+            ("a/b", "b/a"),
+        ] {
+            assert!(!nests(one, other), "{one} should not nest with {other}");
+        }
     }
 
     #[test]

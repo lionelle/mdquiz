@@ -27,12 +27,13 @@ pub enum Error {
         message: String,
     },
 
-    /// A quiz spec (the YAML blueprint) was invalid; names the offending group
-    /// so the author knows which entry to fix.
-    #[error("in quiz spec group {group}: {message}")]
+    /// A quiz spec (the YAML blueprint) was invalid; names where in the spec
+    /// the problem is so the author knows what to fix.
+    #[error("invalid quiz spec at {at}: {message}")]
     Spec {
-        /// The offending group, as written in the spec.
-        group: String,
+        /// Where the problem is: a group (`groups[1] "topics/graphs"`) or a
+        /// top-level key (`variants`). Not every spec failure is group-scoped.
+        at: String,
         /// The underlying failure, rendered.
         message: String,
     },
