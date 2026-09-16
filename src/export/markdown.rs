@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 
 use crate::Result;
+use crate::label::sequence as choice_label;
 use crate::model::{Blank, Choice, Matching, Ordering, Question, QuestionKind};
 
 /// Render `bank` as a print-ready Markdown document with no solutions.
@@ -120,16 +121,6 @@ fn render_choices(number: usize, prompt: &str, choices: &[Choice], multiple: boo
     }
     out.push('\n');
     out
-}
-
-/// The letter label for a choice at `index`: `A`..`Z`, then a 1-based number.
-fn choice_label(index: usize) -> String {
-    if let Ok(offset) = u8::try_from(index)
-        && offset < 26
-    {
-        return char::from(b'A' + offset).to_string();
-    }
-    (index + 1).to_string()
 }
 
 /// Render `bank` as a Markdown **answer key**: each question number with only
@@ -415,14 +406,6 @@ mod tests {
         assert!(out.contains("C. 8 bytes"));
         // No answer key: no pairing (e.g. "left = right") is written out.
         assert!(!out.contains('='));
-    }
-
-    #[test]
-    /// Choice labels are letters up to Z, then fall back to 1-based numbers.
-    fn choice_labels_letter_then_number() {
-        assert_eq!(choice_label(0), "A");
-        assert_eq!(choice_label(25), "Z");
-        assert_eq!(choice_label(26), "27");
     }
 
     #[test]

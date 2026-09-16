@@ -851,8 +851,26 @@ where
     I: IntoIterator<Item = Question>,
 {
     let items: Vec<Question> = items.into_iter().collect();
-    let mut seen = HashSet::with_capacity(items.len());
-    for question in &items {
+    check_unique_ids(&items)?;
+    Ok(ItemBank {
+        name: name.into(),
+        items,
+    })
+}
+
+/// Reject a set of questions that reuses an `id`.
+///
+/// Ids identify a question across a whole bank or exam — Canvas keys items by
+/// them, and the print key pairs answers to them — so a repeat is ambiguous
+/// rather than merely untidy. Shared by both assembly paths so the two cannot
+/// disagree about what counts as a collision.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming the repeated id.
+pub fn check_unique_ids(questions: &[Question]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(questions.len());
+    for question in questions {
         if !seen.insert(question.id.as_str()) {
             return Err(crate::Error::InvalidQuestion(format!(
                 "duplicate question id {:?}",
@@ -860,10 +878,7 @@ where
             )));
         }
     }
-    Ok(ItemBank {
-        name: name.into(),
-        items,
-    })
+    Ok(())
 }
 
 #[cfg(test)]

@@ -39,9 +39,9 @@ warning to an error with `-D warnings`.
 - **Functions ≤ 30 lines** (`clippy::too_many_lines`, threshold in `clippy.toml`).
   Split anything larger.
 - **Cognitive complexity ≤ 15** (`clippy::cognitive_complexity`, threshold in
-  `clippy.toml`). This lint lives in `clippy::nursery`, so that whole group is
-  enabled in `Cargo.toml` to make the ceiling real rather than merely declared.
-  The one exception is `clippy::redundant_pub_crate`, which contradicts
+  `clippy.toml`). The lint belongs to `clippy::restriction`, so it is enabled by
+  name — that group is not one to enable wholesale. `clippy::nursery` is also on
+  for its own sake, minus `clippy::redundant_pub_crate`, which contradicts
   `rust::unreachable_pub`; the rationale is recorded beside it.
 - **Docs on every function**, public *and* private (`missing_docs` +
   `clippy::missing_docs_in_private_items`). Public fallible fns document their

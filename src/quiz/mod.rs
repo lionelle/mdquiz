@@ -5,5 +5,7 @@
 //! printable quiz is a chosen subset. [`sample`] owns that choice, as a pure
 //! function of its inputs and a seed, so a draw can be reproduced exactly.
 
+pub mod assemble;
+pub mod exam;
 pub mod sample;
 pub mod spec;

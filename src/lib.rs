@@ -25,6 +25,7 @@
 pub mod diagram;
 pub mod error;
 pub mod export;
+pub mod label;
 pub mod model;
 pub mod parse;
 pub mod path;

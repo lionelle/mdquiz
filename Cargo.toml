@@ -36,9 +36,13 @@ unreachable_pub = "warn"
 # Baseline lint groups.
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-# Nursery carries `cognitive_complexity`, whose threshold lives in clippy.toml.
-# Without this group that ceiling is declared but never enforced.
 nursery = { level = "warn", priority = -1 }
+# The complexity ceiling in clippy.toml only binds if this lint is enabled by
+# name: it lives in `clippy::restriction`, which is not a group anyone enables
+# wholesale (it also bans `?`, `return`, indexing, and much else this crate
+# uses). Without this line `cognitive-complexity-threshold` is declared and
+# never enforced.
+cognitive_complexity = "warn"
 # `redundant_pub_crate` and `rust::unreachable_pub` (above) contradict each
 # other: one asks for `pub` on an item a private module already confines to the
 # crate, the other asks for `pub(crate)` on exactly that item. Applying either

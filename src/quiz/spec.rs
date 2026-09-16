@@ -75,7 +75,8 @@ pub struct Group {
     #[serde(default)]
     pub answer_space: Option<usize>,
     /// Whether to permute this group's answer choices per variant; falls back to
-    /// [`Layout::shuffle_choices`].
+    /// [`Layout::shuffle_choices`]. Affects multiple-choice and multiple-select
+    /// questions only.
     #[serde(default)]
     pub shuffle_choices: Option<bool>,
 }
@@ -91,6 +92,9 @@ pub struct Layout {
     #[serde(default)]
     pub page_break_between: bool,
     /// Whether answer choices are permuted per variant.
+    ///
+    /// Applies to multiple-choice and multiple-select questions. The other kinds
+    /// have no choice list, or derive their order when rendered.
     #[serde(default)]
     pub shuffle_choices: bool,
     /// The repeating page footer, with `${...}` placeholders.

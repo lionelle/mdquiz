@@ -12,6 +12,10 @@
 //! is seeded so a draw can be re-created, and it is in-crate so no dependency is
 //! taken for a few lines of arithmetic.
 
+/// `SplitMix64`'s additive step, the odd 64-bit approximation of the golden
+/// ratio. Used both to advance the generator and to spread derived streams.
+const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// One question source: its bank-relative path and its file contents.
 ///
 /// Sampling never looks at the contents — it groups and orders by path — but
@@ -47,12 +51,16 @@ pub fn per_directory(mut sources: Vec<Source>, limit: usize, rng: &mut SampleRng
 
 /// Randomly keep `limit` of `group` (all of it when it is already that small),
 /// returning the survivors in path order.
+///
+/// Generic in what each path carries: selection reads only the path, so the
+/// same draw works over file contents or over already-parsed questions. That
+/// keeps callers from building a stand-in vector just to reach this function.
 #[must_use]
-pub(crate) fn within_group(
-    mut group: Vec<Source>,
+pub(crate) fn within_group<T>(
+    mut group: Vec<(String, T)>,
     limit: usize,
     rng: &mut SampleRng,
-) -> Vec<Source> {
+) -> Vec<(String, T)> {
     if group.len() <= limit {
         return group;
     }
@@ -90,9 +98,24 @@ impl SampleRng {
         Self(seed)
     }
 
+    /// A generator for one `stream` of a `root` seed.
+    ///
+    /// Variants take independent streams rather than sharing one generator, so
+    /// each variant's draw depends only on its own index. Going from three
+    /// variants to five then leaves the first three sheets untouched, and a
+    /// single variant can be regenerated on its own — neither of which holds if
+    /// every variant pulls from one sequence.
+    #[must_use]
+    pub(crate) const fn derived(root: u64, stream: u64) -> Self {
+        // Mix the stream through SplitMix64's finaliser so neighbouring indices
+        // give unrelated sequences rather than adjacent ones.
+        let mut mixed = Self(root.wrapping_add(stream.wrapping_mul(GOLDEN_GAMMA)));
+        Self(mixed.next_u64())
+    }
+
     /// The next pseudo-random `u64`.
     const fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.0 = self.0.wrapping_add(GOLDEN_GAMMA);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -236,7 +259,7 @@ mod tests {
         let kept = within_group(src.clone(), 5, &mut SampleRng::seeded(3));
         assert_eq!(kept, src);
         assert_eq!(within_group(src.clone(), 2, &mut SampleRng::seeded(3)), src);
-        assert!(within_group(Vec::new(), 3, &mut SampleRng::seeded(3)).is_empty());
+        assert!(within_group(Vec::<Source>::new(), 3, &mut SampleRng::seeded(3)).is_empty());
     }
 
     #[test]
@@ -372,6 +395,27 @@ mod tests {
                 "skewed distribution: {counts:?}"
             );
         }
+    }
+
+    #[test]
+    /// Derived streams are reproducible, independent of one another, and stable
+    /// when more streams are added — so adding a sixth variant cannot disturb
+    /// the first five.
+    fn derived_streams_are_independent_and_stable() {
+        let draw = |root: u64, stream: u64| {
+            let mut rng = SampleRng::derived(root, stream);
+            (0..4).map(|_| rng.index(1_000)).collect::<Vec<usize>>()
+        };
+        assert_eq!(draw(7, 0), draw(7, 0), "same root and stream repeat");
+        let streams: Vec<Vec<usize>> = (0..6).map(|stream| draw(7, stream)).collect();
+        for (index, stream) in streams.iter().enumerate() {
+            assert!(
+                streams.iter().skip(index + 1).all(|other| other != stream),
+                "stream {index} collided with a later one"
+            );
+        }
+        // A different root changes every stream.
+        assert_ne!(draw(7, 0), draw(8, 0));
     }
 
     #[test]
