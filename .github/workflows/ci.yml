@@ -24,10 +24,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # The Graphviz-backed diagram tests skip themselves when `dot` is absent,
-      # so CI installs it to keep that path actually covered.
-      - name: Install Graphviz
-        run: sudo apt-get update && sudo apt-get install -y graphviz
+      # Tool-backed tests skip themselves when their tool is absent, so CI
+      # installs them to keep those paths actually covered: `dot` for the
+      # Graphviz diagram tests, `xmllint` for the docx package's XML
+      # well-formedness check.
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y graphviz libxml2-utils
 
       - name: Formatting
         run: cargo fmt --all -- --check

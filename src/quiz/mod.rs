@@ -1,9 +1,17 @@
-//! Quiz assembly: choosing which of a bank's questions go on one sheet.
+//! Building a printable exam from a bank of questions.
 //!
-//! Selection is kept apart from the item bank on purpose. An
-//! [`ItemBank`](crate::model::ItemBank) is *every* question an author wrote; a
-//! printable quiz is a chosen subset. [`sample`] owns that choice, as a pure
-//! function of its inputs and a seed, so a draw can be reproduced exactly.
+//! An [`ItemBank`](crate::model::ItemBank) is *every* question an author wrote;
+//! an exam is a chosen subset, laid out. The pipeline runs in one direction:
+//!
+//! * [`spec`] — the authored YAML blueprint and its validation,
+//! * [`assemble`] — the one place randomness happens, and
+//! * [`exam`] — the finished [`Exam`](exam::Exam) the print writers consume,
+//!
+//! with [`sample`] providing the seeded draws that [`assemble`] uses.
+//!
+//! The split matters because of one invariant: every random decision is made
+//! during assembly and frozen into the `Exam`, so a sheet and its answer key
+//! are two renderings of already-settled data and cannot disagree.
 
 pub mod assemble;
 pub mod exam;

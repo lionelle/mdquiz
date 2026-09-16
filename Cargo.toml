@@ -36,20 +36,18 @@ unreachable_pub = "warn"
 # Baseline lint groups.
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
 # The complexity ceiling in clippy.toml only binds if this lint is enabled by
 # name: it lives in `clippy::restriction`, which is not a group anyone enables
 # wholesale (it also bans `?`, `return`, indexing, and much else this crate
 # uses). Without this line `cognitive-complexity-threshold` is declared and
 # never enforced.
+#
+# `clippy::nursery` is deliberately NOT enabled. It was tried, on the mistaken
+# belief that it carried `cognitive_complexity`; it does not. What it did carry
+# was unstable lints that, against a floating toolchain and `-D warnings`, can
+# turn CI red on unchanged code — plus `redundant_pub_crate`, which contradicts
+# `unreachable_pub` above and forced a crate-wide relaxation to silence.
 cognitive_complexity = "warn"
-# `redundant_pub_crate` and `rust::unreachable_pub` (above) contradict each
-# other: one asks for `pub` on an item a private module already confines to the
-# crate, the other asks for `pub(crate)` on exactly that item. Applying either
-# suggestion makes the other fire. `unreachable_pub` is the rule this crate
-# keeps, so this one is off — crate-wide because the conflict is between the
-# lints themselves, not a property of any single item.
-redundant_pub_crate = "allow"
 # Require doc comments on private items too (public items are covered by
 # `rust::missing_docs`). Together these mean every function is documented.
 missing_docs_in_private_items = "warn"

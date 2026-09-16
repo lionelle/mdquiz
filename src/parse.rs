@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
 
-use crate::path::is_local_image;
+use crate::path::{is_local_image, parent_dir};
 use serde::Deserialize;
 
 use crate::Result;
@@ -450,12 +450,6 @@ fn read_partial(path: &str, read: &PartialReader<'_>, id: &str) -> Result<String
     Ok(rebase_images(&raw, parent_dir(path)))
 }
 
-/// The directory portion of a partial `path` (`""` when it has none).
-fn parent_dir(path: &str) -> &str {
-    path.rfind('/')
-        .map_or("", |index| path.get(..index).unwrap_or(""))
-}
-
 /// Prefix every local image path in `question`'s rich-text fields with `base`,
 /// the question's subdirectory relative to the export root.
 ///
@@ -868,8 +862,11 @@ where
 /// # Errors
 ///
 /// Returns [`crate::Error::InvalidQuestion`] naming the repeated id.
-pub fn check_unique_ids(questions: &[Question]) -> Result<()> {
-    let mut seen = HashSet::with_capacity(questions.len());
+pub fn check_unique_ids<'a, I>(questions: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a Question>,
+{
+    let mut seen = HashSet::new();
     for question in questions {
         if !seen.insert(question.id.as_str()) {
             return Err(crate::Error::InvalidQuestion(format!(

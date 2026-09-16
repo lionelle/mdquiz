@@ -203,20 +203,67 @@ existing pattern.
    randomization, including choice shuffling. Hoists the diagram pass above the
    variant loop with a shared cache so `mmdc`/`dot` run once, not once per
    variant.
-4. **DOCX container.** `[Content_Types].xml`, both `.rels`, `document.xml`,
-   `styles.xml`, `numbering.xml`, `sectPr` + `footer1.xml`, math font setup — no
-   question content. Lands **before** math so every later commit can be
-   round-tripped through `soffice` and Word. Decides the image-dimension
-   question: `wp:extent` requires EMU and the crate has no image dependency, so
-   either add a curated one (`imagesize`) or parse PNG headers, explicitly.
-   **Gate: open the output in real Microsoft Word before proceeding.**
+4. **DOCX container.** *Done.* `src/export/docx.rs` writes all eight parts
+   (`[Content_Types].xml`, both `.rels`, `document.xml`, `styles.xml`,
+   `numbering.xml`, `settings.xml` with the math font, `footer1.xml`), the page
+   geometry, and the `PAGE`/`NUMPAGES` footer fields. `tests/docx_package.rs`
+   checks every part with `xmllint` and converts through LibreOffice.
+   **Still open: open a generated `.docx` in real Microsoft Word.** Everything
+   so far is verified against LibreOffice and pandoc only, and `Cambria Math`
+   is not installed on the dev box — so how equations and stretchy delimiters
+   actually draw is unverified.
+
+   **Two follow-ups recorded rather than done.** (a) Nothing in CI runs
+   `cargo test -- --ignored`, so the LibreOffice "does it actually open" check
+   never runs automatically; the unit tests now cover the three faults it used
+   to be the sole killer of, but a nightly or `workflow_dispatch` job would
+   restore the end-to-end signal. (b) No test produces a multi-page document,
+   so `NUMPAGES` is never anything but 1 — only a `page_break_between: true`
+   exam through the LibreOffice path would prove the field really counts.
+
+   **Three copies of the sources→questions loop.** `parse::item_bank_from_sources_with`,
+   `cli::build_bank`, and `assemble::load_pools` each sort by path, resolve a
+   per-question base, parse with a scoped reader and name the failing file. The
+   public helper cannot do the per-question base, which is why the other two
+   exist. Fix: one `parse::questions_from_sources(sources, &read)` both callers
+   build on. Deferred out of the cleanup pass deliberately — it rewires the
+   CLI's `partial_reader`, which is security-relevant (`escapes_dir` would see
+   `sub/../x.md` rather than `../x.md`; still rejected, since `Path::components`
+   does not resolve `..`, but it changes an error message and needs
+   `partial_reader_reads_and_refuses_escape` rewritten).
+
+   **Path policy when the CLI is wired.** `assemble::parse_one` joins a
+   question's folder onto the authored partial path and hands the result to the
+   injected reader without checking it — correct layering, since the library
+   stays pure and the reader owns policy. The `quiz` subcommand's reader must
+   therefore run `escapes_dir` on the **joined** path, or a `file:` partial
+   escapes the question tree.
+
+   **Placeholder scanners.** `model::blank_markers` (`{{…}}`),
+   `quiz::spec::check_template` and `export::docx::footer_runs` (both `${…}`)
+   are the same scan written three times, and they handle an unterminated
+   opener three different ways — one of which was a real bug. The key *set* is
+   now shared (`quiz::spec::TemplateKey`), which closes the drift that mattered;
+   collapsing the three scanners into one `src/template.rs` is still worth doing
+   before a fourth appears.
+
+   **Image dimensions — decided.** `wp:extent` needs EMU and the crate has no
+   image dependency. When Part 11 lands, parse the PNG `IHDR` in-crate rather
+   than adding one: the diagram path already forces PNG, `IHDR` is a fixed
+   24-byte header, and a curated dependency is hard to justify for one struct
+   read. SVG stays out of scope, so no second decoder is implied.
 5. **Math spike** (see above): bake-off, support matrix, hard-error policy.
 6. **Inline runs** — bold, italic, code, strikethrough.
 7. **Lists** — including `numbering.xml` abstract/concrete definitions.
 8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal
    text in a monospace style. See "Tables in v1" below; folding them together is
    what removes a whole part from this plan.
-9. **The six question kinds** + the answer-key document.
+9. **The six question kinds** + the answer-key document. This is where the
+   matching/ordering freeze gap closes: their presented order is currently
+   derived inside `export/markdown.rs` at render time rather than stored, so
+   `shuffle_choices` cannot vary them between variants and a key that printed
+   labels rather than text would have to re-derive that sort. Put the derived
+   order on `ExamItem` and have the writers read it.
 10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
     (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.
 11. **`mdquiz quiz` subcommand.** Library returns

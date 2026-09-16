@@ -40,9 +40,9 @@ warning to an error with `-D warnings`.
   Split anything larger.
 - **Cognitive complexity ≤ 15** (`clippy::cognitive_complexity`, threshold in
   `clippy.toml`). The lint belongs to `clippy::restriction`, so it is enabled by
-  name — that group is not one to enable wholesale. `clippy::nursery` is also on
-  for its own sake, minus `clippy::redundant_pub_crate`, which contradicts
-  `rust::unreachable_pub`; the rationale is recorded beside it.
+  name — that group is not one to enable wholesale. `clippy::nursery` is *not*
+  enabled: it does not carry this lint, and its unstable lints can break CI on
+  unchanged code.
 - **Docs on every function**, public *and* private (`missing_docs` +
   `clippy::missing_docs_in_private_items`). Public fallible fns document their
   `# Errors`.
@@ -62,8 +62,16 @@ The pipeline is a plain data transform so it is trivial to test without a
 process:
 
 ```
-source .md  ──▶  parse::item_bank_from_sources  ──▶  model::ItemBank  ──▶  export::{markdown,canvas}
+source .md ──▶ parse ──▶ model::ItemBank ──▶ export::{markdown,canvas}
+                 │
+                 └──▶ quiz::{spec,assemble} ──▶ quiz::exam::Exam ──▶ export::docx
 ```
+
+Two pipelines share the parsing stage. The bank path is the original export; the
+exam path builds a printable, sampled, multi-variant sheet and does **not** go
+through `ItemBank`. Note `parse::item_bank_from_sources` is the inline-content
+entry point — the recursive paths resolve each question's partials against its
+own folder, which that helper cannot do.
 
 - `src/model.rs` — the typed bank (`ItemBank`, `Question`, `QuestionKind`). The
   source of truth for what a question *is*.
@@ -74,8 +82,15 @@ source .md  ──▶  parse::item_bank_from_sources  ──▶  model::ItemBank
   `mmdc` and `dot`).
 - `src/export/markdown.rs` — print sheet (no solutions).
 - `src/export/canvas.rs` — Canvas New Quizzes QTI bytes.
-- `src/quiz/` — selection: which of a bank's questions go on one sheet
-  (`sample`), reproducibly from a seed. Sits between the bank and the exporters.
+- `src/export/docx.rs` — Word document bytes for printing, built from a
+  `quiz::exam::Exam`. Shares the zip/XML-escape helpers in `export.rs` with the
+  Canvas exporter.
+- `src/quiz/` — the printable-exam pipeline: `spec` (the authored YAML
+  blueprint and its validation) → `assemble` (the one place randomness happens)
+  → `exam` (the frozen `Exam` the print writers consume), with `sample` for the
+  seeded draws.
+- `src/label.rs` — `A`..`Z`-then-number sequence labels, shared by answer
+  choices and quiz variants.
 - `src/path.rs` — path policy for authored, bank-relative paths (`escapes_dir`,
   `is_local_image`). Shared by the parser, the exporters and the CLI, which all
   have to agree on what a `file:`/image path may reach.

@@ -11,13 +11,11 @@
 //! Markdown to HTML, then XML-escaped for embedding).
 
 use std::fmt::Write as _;
-use std::io::{Cursor, Write};
 
 use pulldown_cmark::{Event, Options, Parser, Tag, html};
-use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
 
 use crate::Result;
+use crate::export::{escape_xml, zip_package};
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
     MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse,
@@ -402,7 +400,7 @@ pub fn to_qti(bank: &ItemBank, images: &[(String, Vec<u8>)]) -> Result<Vec<u8>> 
         .iter()
         .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
         .collect();
-    zip_package(&entries)
+    zip_package("QTI package", &entries)
 }
 
 /// Reminders about content that can't fully round-trip through the Canvas
@@ -1190,15 +1188,6 @@ fn image_urls(prompt: &str) -> Vec<String> {
         .collect()
 }
 
-/// XML-escape the five predefined entities, `&` first to avoid double-escaping.
-fn escape_xml(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 /// Reduce an authored string to a safe QTI identifier / path component.
 fn sanitize_ident(raw: &str) -> String {
     let cleaned: String = raw
@@ -1216,30 +1205,6 @@ fn sanitize_ident(raw: &str) -> String {
     } else {
         cleaned
     }
-}
-
-/// Zip the `(path, bytes)` files into a package byte payload.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Export`] if the zip archive cannot be written.
-fn zip_package(files: &[(&str, &[u8])]) -> Result<Vec<u8>> {
-    let mut cursor = Cursor::new(Vec::new());
-    {
-        let mut writer = ZipWriter::new(&mut cursor);
-        let options = SimpleFileOptions::default();
-        for (path, content) in files {
-            writer.start_file(*path, options).map_err(|e| zip_err(&e))?;
-            writer.write_all(content)?;
-        }
-        writer.finish().map_err(|e| zip_err(&e))?;
-    }
-    Ok(cursor.into_inner())
-}
-
-/// Map a zip-writer failure onto the crate export error.
-fn zip_err(error: &zip::result::ZipError) -> crate::Error {
-    crate::Error::Export(format!("building QTI zip package: {error}"))
 }
 
 #[cfg(test)]

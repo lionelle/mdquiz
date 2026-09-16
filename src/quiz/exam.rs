@@ -68,15 +68,6 @@ impl Exam {
             |variant| format!("{} ({variant})", self.name),
         )
     }
-
-    /// The total points on this sheet.
-    ///
-    /// Varies between variants once sampling is involved, so it is computed per
-    /// exam rather than taken from the spec.
-    #[must_use]
-    pub fn total_points(&self) -> f64 {
-        self.items.iter().map(|item| item.question.points).sum()
-    }
 }
 
 #[cfg(test)]
@@ -130,12 +121,5 @@ mod tests {
     fn title_includes_the_variant_when_present() {
         assert_eq!(exam(Some("B"), &[1.0]).title(), "Exam 1 (B)");
         assert_eq!(exam(None, &[1.0]).title(), "Exam 1");
-    }
-
-    #[test]
-    /// Points are summed from the items, so each variant reports its own total.
-    fn total_points_sums_the_items() {
-        assert!((exam(None, &[1.0, 2.5, 0.5]).total_points() - 4.0).abs() < f64::EPSILON);
-        assert!((exam(None, &[]).total_points() - 0.0).abs() < f64::EPSILON);
     }
 }

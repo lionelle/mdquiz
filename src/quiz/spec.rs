@@ -151,22 +151,51 @@ const fn default_variants() -> usize {
     1
 }
 
-/// The placeholders a `${...}` template may use.
+/// A placeholder a `${...}` template may use.
 ///
-/// `name` and `variant` are substituted as literal text. `page` and `pages`
-/// become OOXML page-number *fields*, so they resolve per printed page and are
-/// only meaningful in [`Layout::page_footer`].
-const TEMPLATE_KEYS: [&str; 4] = ["name", "variant", "page", "pages"];
+/// A type rather than a list of strings so the validator and the writers cannot
+/// disagree about the set: a new variant added here fails to compile in every
+/// exporter that substitutes placeholders, instead of validating cleanly and
+/// then printing nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateKey {
+    /// The exam's name, substituted as literal text.
+    Name,
+    /// The variant label, substituted as literal text.
+    Variant,
+    /// The current page number. Becomes a page-number *field*, so it resolves
+    /// per printed page and is only meaningful in [`Layout::page_footer`].
+    Page,
+    /// The total page count, also a field.
+    Pages,
+}
+
+impl TemplateKey {
+    /// The key `name` spells, if it is one.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "name" => Some(Self::Name),
+            "variant" => Some(Self::Variant),
+            "page" => Some(Self::Page),
+            "pages" => Some(Self::Pages),
+            _ => None,
+        }
+    }
+
+    /// Every key as authored, for error messages.
+    const ALL: [&'static str; 4] = ["name", "variant", "page", "pages"];
+}
 
 /// The delimiters are `${...}`, deliberately not `{{...}}`.
 ///
 /// `{{name}}` is already the fill-in-the-blank marker (`model::blank_marker`),
 /// so a header or footer that later became a question partial would sprout
 /// blanks where it meant to name the exam.
-const TEMPLATE_OPEN: &str = "${";
+pub(crate) const TEMPLATE_OPEN: &str = "${";
 
 /// The closing delimiter, named so the error messages cannot drift from it.
-const TEMPLATE_CLOSE: char = '}';
+pub(crate) const TEMPLATE_CLOSE: char = '}';
 
 impl Spec {
     /// Parse and structurally validate a spec from YAML.
@@ -280,7 +309,7 @@ impl Spec {
     }
 }
 
-/// Reject `${...}` placeholders that are not in [`TEMPLATE_KEYS`].
+/// Reject `${...}` placeholders that are not in [`TemplateKey`].
 ///
 /// # Errors
 ///
@@ -293,8 +322,8 @@ fn check_template(template: &str, at: &str) -> Result<()> {
             let message = format!("unclosed `{TEMPLATE_OPEN}` placeholder");
             return Err(spec_error(at, &message));
         };
-        if !TEMPLATE_KEYS.contains(&key.trim()) {
-            let known = TEMPLATE_KEYS.join("`, `");
+        if TemplateKey::parse(key.trim()).is_none() {
+            let known = TemplateKey::ALL.join("`, `");
             let message = format!(
                 "unknown placeholder `{TEMPLATE_OPEN}{key}{TEMPLATE_CLOSE}`; known: `{known}`"
             );
@@ -306,7 +335,9 @@ fn check_template(template: &str, at: &str) -> Result<()> {
 }
 
 /// How a group is named in an error message: its index and its folder.
-fn group_at(index: usize, group: &Group) -> String {
+///
+/// Shared with `quiz::assemble` so both layers report a group the same way.
+pub(crate) fn group_at(index: usize, group: &Group) -> String {
     format!("groups[{index}] {:?}", group.dir)
 }
 

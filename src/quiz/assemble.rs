@@ -13,9 +13,10 @@
 //! [`ExamItem`] and having the writers read it — which is the writers' change
 //! to make, so it is recorded against the print exporter in `Roadmap.md`.
 //!
-//! Diagram rendering belongs on each group pool's questions, before the variant
-//! loop — the questions are shared, so rendering there runs `mmdc`/`dot` once
-//! rather than once per variant. Putting it in a writer would undo that.
+//! Diagram rendering is *not* done here yet. When it lands it belongs on each
+//! group pool's questions, before the variant loop: the questions are shared,
+//! so rendering there runs `mmdc`/`dot` once rather than once per variant.
+//! Putting it in a writer would undo that.
 //!
 //! Nothing here touches the filesystem. The caller injects a [`SourceLister`]
 //! that turns a group's folder into question sources and a
@@ -27,7 +28,7 @@ use crate::parse::{self, PartialReader};
 use crate::path::parent_dir;
 use crate::quiz::exam::{Exam, ExamItem};
 use crate::quiz::sample::{self, SampleRng, Source};
-use crate::quiz::spec::{Group, Spec, Take};
+use crate::quiz::spec::{Group, Spec, Take, group_at};
 use crate::{Error, Result};
 
 /// Lists the question sources inside a group's folder.
@@ -60,6 +61,13 @@ struct Pool {
     questions: Vec<(String, Question)>,
 }
 
+impl Pool {
+    /// Just the questions, without their paths.
+    fn questions(&self) -> impl Iterator<Item = &Question> {
+        self.questions.iter().map(|(_, question)| question)
+    }
+}
+
 /// Assemble `spec` into one [`Exam`] per variant.
 ///
 /// Questions are parsed once and shared across variants; only the drawing and
@@ -88,29 +96,50 @@ pub fn assemble(
     // Across groups, not just within one: `path::nests` stops two groups naming
     // the same folder, but nothing stops two folders holding a copy-pasted id,
     // and an exam carrying it twice cannot be keyed.
-    let every: Vec<Question> = pools
-        .iter()
-        .flat_map(|pool| pool.questions.iter().map(|(_, question)| question.clone()))
+    parse::check_unique_ids(pools.iter().flat_map(Pool::questions))?;
+    let sizes: Vec<usize> = pools.iter().map(|pool| pool.questions.len()).collect();
+    let warnings = spec.check_pools(&sizes)?;
+    let blocks = Blocks::read(spec, read)?;
+    let exams = (0..spec.variants)
+        .map(|index| blocks.exam(spec, &pools, seed, index))
         .collect();
-    parse::check_unique_ids(&every)?;
-    let counts: Vec<usize> = pools.iter().map(|pool| pool.questions.len()).collect();
-    let warnings = spec.check_pools(&counts)?;
-    let header = read_optional(spec.header.as_deref(), read, "header")?;
-    let footer = read_optional(spec.footer.as_deref(), read, "footer")?;
-    let mut exams = Vec::with_capacity(spec.variants);
-    for index in 0..spec.variants {
-        let mut rng = SampleRng::derived(seed, u64::try_from(index).unwrap_or(u64::MAX));
-        let items = draw_items(&pools, &mut rng);
-        exams.push(Exam {
+    Ok(Assembly { exams, warnings })
+}
+
+/// The prose blocks every variant shares, read once.
+struct Blocks {
+    /// Markdown rendered above the questions.
+    header: Option<String>,
+    /// Markdown rendered below them.
+    footer: Option<String>,
+}
+
+impl Blocks {
+    /// Load the spec's header and footer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Spec`] naming the key whose file cannot be read.
+    fn read(spec: &Spec, read: &PartialReader<'_>) -> Result<Self> {
+        Ok(Self {
+            header: read_optional(spec.header.as_deref(), read, "header")?,
+            footer: read_optional(spec.footer.as_deref(), read, "footer")?,
+        })
+    }
+
+    /// Build the exam for variant `index`, drawing from its own seeded stream.
+    fn exam(&self, spec: &Spec, pools: &[Pool], seed: u64, index: usize) -> Exam {
+        let stream = u64::try_from(index).unwrap_or(u64::MAX);
+        let mut rng = SampleRng::derived(seed, stream);
+        Exam {
             name: spec.name.clone(),
             variant: Exam::variant_label(index, spec.variants),
-            header: header.clone(),
-            footer: footer.clone(),
+            header: self.header.clone(),
+            footer: self.footer.clone(),
             layout: spec.layout.clone(),
-            items,
-        });
+            items: draw_items(pools, &mut rng),
+        }
     }
-    Ok(Assembly { exams, warnings })
 }
 
 /// Load and parse every group's questions, once.
@@ -123,7 +152,7 @@ fn load_pools(spec: &Spec, list: &SourceLister<'_>, read: &PartialReader<'_>) ->
     let mut pools = Vec::with_capacity(spec.groups.len());
     for (index, group) in spec.groups.iter().enumerate() {
         let sources = list(&group.dir).map_err(|message| Error::Spec {
-            at: format!("groups[{index}] {:?}", group.dir),
+            at: group_at(index, group),
             message,
         })?;
         let mut parsed = Vec::with_capacity(sources.len());
