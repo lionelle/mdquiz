@@ -55,50 +55,105 @@ breaks; a clean `soffice --headless --convert-to pdf`; and OMML math rendering
 with italic variables, upright function names, super/subscripts, summations and
 fractions.
 
-### Math — open, and more expensive than first estimated
+### Math — settled (Part 5 spike)
 
-The original plan claimed LaTeX→MathML could be delegated to `pulldown-latex`
-while an in-crate MathML→OMML mapping stayed "bounded and frozen at ~25
-elements, a weekend of work". Three verified findings kill that framing:
+Math is a first-class part of many questions, so the print path must render it
+properly rather than pass `$…$` through as source.
 
-1. **It panics.** `\char é` panics inside `pulldown-latex 0.8.0`
-   (`parser/lex.rs:331`, char-boundary slice). A fuzz run hit ~0.26% of inputs.
-   CLAUDE.md denies uncaught panics, and this is reachable from an authored
-   `.md`. The crate's 0.8.0 changelog shows this is a recurring bug class.
-2. **It emits malformed XML.** `\Big( x \bigg] y` produces
-   `stretchy="true"minsize="1.8em"` — no separating space, so `xmllint` rejects
-   it. Any mapper that parses the MathML *string* dies on ordinary input.
-3. **The vocabulary is not spec MathML.** Array/matrix semantics arrive as
-   private CSS classes (`class="menv-arraylike"`, `menv-cells-left menv-cases`,
-   `menv-hline`), not `columnalign`/`columnlines`. That is an undocumented
-   convention of a pre-1.0 crate, free to change in a patch release — so the
-   "bounded and frozen" argument does not apply to this library.
+**Decision: `math-core` 0.8.2 for LaTeX→MathML, with an in-crate MathML→OMML
+mapping.** This reverses the earlier plan to use `pulldown-latex`, which was
+chosen before it was tested. Measured side by side:
 
-Additional constraints: `push_mathml` returns `Ok(())` for unsupported commands
-and leaks their arguments into the output as stray content, so a "warn and fall
-back" policy has no signal to trigger on. And some constructs have **no OMML
-representation at all** — pandoc's mature `texmath` drops `|` column rules and
-`\hline`, and gives up entirely on `\cancel`/`\phantom`/`\textcolor`. A silently
-wrong equation on a printed exam is the worst failure mode this tool has.
+| | `pulldown-latex` 0.8.0 | `math-core` 0.8.2 |
+|---|---|---|
+| `\char é` | **panics** (`lex.rs`, char-boundary slice) | `Err: Unknown command` |
+| `\Big( x` | **malformed XML** (`stretchy="true"minsize=`) | well-formed |
+| arrays / `cases` | **private CSS classes** (`menv-arraylike`, `menv-hline`) | standard inline `style=` |
+| 20 000 adversarial inputs | **185 panics, 1 906 malformed** | **0 panics, 0 malformed** |
+| transitive crates | 2 | 24 (many build-time only) |
 
-**Therefore Part 5 is a spike, not an implementation**, with three deliverables:
+The panic alone is disqualifying: CLAUDE.md forbids uncaught panics and the
+input is an authored `.md` file. The private CSS classes were the deeper
+problem — they made the "bounded, spec-defined vocabulary" argument for owning
+the OMML mapping false, because the array semantics lived in an undocumented
+convention of a pre-1.0 crate. `math-core` emits spec MathML, so that argument
+holds again.
 
-- A **bake-off** between `pulldown-latex` (consumed as an `Event` stream, not as
-  a MathML string) and `math-core` 0.8.2 — a maintained fork with snapshot and
-  fuzz tests — measured against a fixed corpus plus the `\char é` case. Also
-  price the hybrid: own the DOCX writer, shell out to pandoc for math only.
-- A written **support matrix**: constructs that map faithfully / map lossily /
-  cannot map.
-- A **hard-error policy**: anything outside the faithful set fails the export
-  with the offending LaTeX quoted (`Error::UnsupportedMath`). No best-effort
-  rendering onto paper.
+`math-core` also rejects far more than it renders (2 029 of 20 000 adversarial
+inputs, against `pulldown-latex`'s 19 815). For a printed exam that is the right
+default: it *is* the hard-error policy, arriving for free.
 
-Whichever library wins is pinned (`=x.y.z`), wrapped so a panic becomes an
-`Error`, and covered by snapshot tests so a version bump shows as a diff.
+Cost accepted: 24 crates in the build graph against `pulldown-latex`'s 2. In
+context that is proportionate — the crate already pulls 55, of which `clap`
+alone is 17 — and most of `math-core`'s are compile-time proc-macros.
 
-Still correct and not up for relitigation: the low-download direct LaTeX→OMML
-crates (`tex2word-math` 134 downloads, `easydoc-math` 97, `ooxml-omml` a
-290-download alpha) fail the curated-dependency bar.
+**Support matrix.** A 41-case corpus of realistic instructor math produced 20
+distinct MathML elements and 13 attributes. That is the whole mapping surface.
+
+*Maps faithfully:*
+
+| MathML | OMML |
+|---|---|
+| `mi` `mn` `mo` `mtext` | `m:r` + `m:t`, `m:sty` for italic/upright |
+| `mrow` | `m:e` |
+| `mfrac` | `m:f`; `linethickness="0"` → `m:type val="noBar"` (that is `\binom`) |
+| `msup` `msub` `msubsup` | `m:sSup` `m:sSub` `m:sSubSup` |
+| `msqrt` `mroot` | `m:rad` |
+| `munderover` on ∑ ∏ ∫ | `m:nary` |
+| `mover` `munder` with `accent` | `m:acc` |
+| `munder` `mover` otherwise | `m:limLow` `m:limUpp` |
+| `mphantom` | `m:phant` |
+| `mspace` | spacing run |
+| `mtable` `mtr` `mtd` | `m:m` `m:mr` `m:e`, alignment via `m:mcJc` |
+| stretchy `mo` pair | `m:d`; non-stretchy → literal character runs |
+
+Blackboard and script letters need no special handling: `math-core` emits the
+Unicode codepoint (ℝ, 𝒫) rather than a `mathvariant` to interpret.
+
+*Maps lossily (accepted):* `lspace`/`rspace` operator spacing and
+`displaystyle`/`scriptlevel` have no per-element OMML equivalent. Cosmetic;
+dropped silently.
+
+*Cannot map (hard error):* table **column rules and `\hline`** — `mtd
+style="border-…"` has no OMML element at all. pandoc's mature converter drops
+them silently, which would print an augmented matrix or a truth table with its
+rules missing and no warning. An exam is not a place for that.
+
+**Hard-error policy.** Export fails, quoting the offending LaTeX, when
+`math-core` rejects the input, or when the MathML contains a construct in the
+"cannot map" tier. A new `Error::UnsupportedMath { latex, reason }` carries
+both. Nothing renders best-effort onto paper.
+
+**Panics from dependencies are caught, not assumed away.** A third-party crate
+may panic; this crate's job is to stop it bubbling out as an abort. Conversion
+runs inside `catch_unwind` and a caught panic becomes
+`Error::UnsupportedMath`, the same as a rejection. That holds regardless of the
+measured panic rate — `math-core` scored zero, but the guard is about not
+trusting the measurement. (The release profile does not set `panic = "abort"`,
+so unwinding is available.)
+
+`math-core` is also pinned (`=0.8.2`), and the adversarial corpus lands as a
+test, so a version bump that reintroduces a panic or malformed output is caught
+here rather than discovered on an exam.
+
+**Parsing the MathML.** `math-core` returns a string, so the mapper needs an XML
+reader: `roxmltree` (73M downloads, MIT/Apache-2.0, 56 KiB, one transitive dep
+already in the tree). A read-only DOM rather than a pull parser, because the
+mapping is a tree transform — `mfrac` needs both children, `munderover` needs
+three.
+
+Rejected: hand-writing a LaTeX parser (unbounded maintenance); the direct
+LaTeX→OMML crates (`tex2word-math` 134 downloads, `easydoc-math` 97,
+`ooxml-omml` a 290-download alpha — none clears the curated-dependency bar);
+rendering math to images (hard external dep for core content, no baseline
+alignment, not editable); and shelling out to pandoc for math only (a hard
+external dependency for core content, and pandoc itself drops `|` column rules
+and gives up outright on `\cancel`, `\phantom` and `\textcolor`).
+
+`prompt_html` already parses with `Options::ENABLE_MATH`, so the DOCX writer
+walks the same `Event::InlineMath` / `Event::DisplayMath` events. The Canvas
+path is untouched (its equation-service images already work); the markdown sheet
+keeps emitting literal `$…$`.
 
 ### Variants actually have to differ
 
@@ -252,7 +307,9 @@ existing pattern.
    than adding one: the diagram path already forces PNG, `IHDR` is a fixed
    24-byte header, and a curated dependency is hard to justify for one struct
    read. SVG stays out of scope, so no second decoder is implied.
-5. **Math spike** (see above): bake-off, support matrix, hard-error policy.
+5. **Math spike.** *Done* — see "Math — settled" above. `math-core` 0.8.2 wins
+   the bake-off, the support matrix is written, and the hard-error policy is
+   decided. Implementation (`src/export/docx/omml.rs`) is the next step.
 6. **Inline runs** — bold, italic, code, strikethrough.
 7. **Lists** — including `numbering.xml` abstract/concrete definitions.
 8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal

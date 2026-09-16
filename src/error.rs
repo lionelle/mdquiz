@@ -43,6 +43,19 @@ pub enum Error {
     #[error("invalid question: {0}")]
     InvalidQuestion(String),
 
+    /// Math that cannot be put on paper faithfully.
+    ///
+    /// Either the LaTeX was rejected outright, or it uses a construct with no
+    /// Word equivalent. Both are refusals rather than best-effort renders: a
+    /// silently wrong equation on a printed exam is worse than a failed build.
+    #[error("cannot render math {latex:?}: {reason}")]
+    UnsupportedMath {
+        /// The offending LaTeX, as the author wrote it.
+        latex: String,
+        /// Why it cannot be rendered.
+        reason: String,
+    },
+
     /// An export target could not represent the quiz as given.
     #[error("failed to export quiz: {0}")]
     Export(String),

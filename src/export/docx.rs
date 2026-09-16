@@ -24,6 +24,8 @@
 //! * Children of `w:pPr` are a *sequence*, not a set: out-of-order elements are
 //!   a schema violation even though they look harmless.
 
+pub mod omml;
+
 use crate::Result;
 use crate::export::{escape_xml, zip_package};
 use crate::quiz::exam::{Exam, ExamItem};

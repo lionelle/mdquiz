@@ -12,7 +12,9 @@ categories = ["command-line-utilities", "parsing"]
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
+math-core = "=0.8.2"
 pulldown-cmark = "0.13.4"
+roxmltree = "0.21.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_norway = "0.9.42"
 tempfile = "3.27.0"
