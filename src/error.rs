@@ -48,7 +48,7 @@ pub enum Error {
     /// Either the LaTeX was rejected outright, or it uses a construct with no
     /// Word equivalent. Both are refusals rather than best-effort renders: a
     /// silently wrong equation on a printed exam is worse than a failed build.
-    #[error("cannot render math {latex:?}: {reason}")]
+    #[error("cannot render math `{latex}`: {reason}")]
     UnsupportedMath {
         /// The offending LaTeX, as the author wrote it.
         latex: String,

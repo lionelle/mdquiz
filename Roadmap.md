@@ -307,9 +307,31 @@ existing pattern.
    than adding one: the diagram path already forces PNG, `IHDR` is a fixed
    24-byte header, and a curated dependency is hard to justify for one struct
    read. SVG stays out of scope, so no second decoder is implied.
-5. **Math spike.** *Done* — see "Math — settled" above. `math-core` 0.8.2 wins
-   the bake-off, the support matrix is written, and the hard-error policy is
-   decided. Implementation (`src/export/docx/omml.rs`) is the next step.
+5. **Math.** *Done* — see "Math — settled" above. `src/export/docx/omml.rs`
+   converts LaTeX to OMML and is verified by rendering, not only by asserting
+   on XML: every defect below was found by looking at a printed page.
+
+   **Known gaps, deliberately left:**
+   - **Accent marks are not normalised.** `math-core` returns *spacing*
+     modifiers for some accents (`\hat` → U+02C6) and *combining* marks for
+     others (`\vec` → U+20D7). Word positions accents from the combining
+     forms, so a small mapping is owed.
+   - **`\underline`/`\underbrace` take the wrong construct.** `MathML` marks
+     these with `accentunder`, not `accent`, so they fall through to
+     `m:limLow` with a bare combining character as the limit. They want
+     `m:bar` and `m:groupChr`.
+   - **Ragged tables declare the wrong column count.** `m:mcs` is built from
+     row 0 only, and short rows are not padded.
+   - **The "nothing best-effort" policy leaks.** `\color{red}{x}` silently
+     drops the colour and `mstyle` attributes are discarded, where the module
+     header promises a refusal.
+   - **`⋃` renders as an error glyph in LibreOffice.** Environment-conditional:
+     Cambria Math is not installed here, and pandoc's own output shows the same
+     symptom for `\lim`. Needs checking in real Word before being treated as a
+     defect in this crate.
+   - **Not wired in.** `docx::markdown_block` still pushes prompts through as
+     plain text, so `$x^2$` prints literally in today's `.docx`. Part 6 wires
+     it, and that is where the first end-to-end math test belongs.
 6. **Inline runs** — bold, italic, code, strikethrough.
 7. **Lists** — including `numbering.xml` abstract/concrete definitions.
 8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal

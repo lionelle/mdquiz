@@ -47,9 +47,34 @@ impl From<Display> for MathDisplay {
     }
 }
 
+/// The deepest brace nesting accepted before the input is refused.
+///
+/// Pathologically nested LaTeX overflows the stack *inside the parser*, and a
+/// stack overflow aborts the process rather than unwinding — `catch_unwind`
+/// cannot contain it. Measured: `\frac{` nested 40 deep is fatal in a debug
+/// build. 32 is comfortably under that and far beyond any real exam.
+const MAX_NESTING: usize = 32;
+
+/// The deepest brace nesting in `latex`.
+fn nesting_depth(latex: &str) -> usize {
+    let (mut depth, mut deepest) = (0_usize, 0_usize);
+    for character in latex.chars() {
+        match character {
+            '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
 /// Convert `latex` to an OMML fragment.
 ///
-/// Returns the `<m:oMath>` element, ready to sit inside a `w:p`.
+/// Returns an `<m:oMath>` element, or `<m:oMathPara>` wrapping one for display
+/// math. Either is ready to sit inside a `w:p`.
 ///
 /// # Errors
 ///
@@ -57,6 +82,12 @@ impl From<Display> for MathDisplay {
 /// parser panics, or when the expression uses a construct Word has no way to
 /// represent.
 pub fn to_omml(latex: &str, display: Display) -> Result<String> {
+    if nesting_depth(latex) > MAX_NESTING {
+        return Err(unsupported(
+            latex,
+            &format!("nested more than {MAX_NESTING} deep"),
+        ));
+    }
     let mathml = to_mathml(latex, display)?;
     let document =
         roxmltree::Document::parse(&mathml).map_err(|error| unsupported(latex, &error))?;
@@ -75,14 +106,29 @@ pub fn to_omml(latex: &str, display: Display) -> Result<String> {
 /// Returns [`Error::UnsupportedMath`] if the LaTeX is rejected or the parser
 /// panics.
 fn to_mathml(latex: &str, display: Display) -> Result<String> {
-    let convert = || -> std::result::Result<String, String> {
+    contain_panics(latex, || {
         let converter = LatexToMathML::new(MathCoreConfig::default())
             .map_err(|error| format!("converter setup failed: {error:?}"))?;
         converter
             .convert_with_local_state(latex, display.into())
             .map(|rendered| rendered.mathml)
             .map_err(|error| error.to_string())
-    };
+    })
+}
+
+/// Run `convert`, turning a panic into the same error a rejection gives.
+///
+/// Split out so the containment can be tested: no LaTeX is known to make
+/// `math-core` panic — it returns errors — so exercising this through
+/// [`to_omml`] would only ever prove the rejection path.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedMath`] if `convert` fails or unwinds.
+fn contain_panics(
+    latex: &str,
+    convert: impl FnOnce() -> std::result::Result<String, String>,
+) -> Result<String> {
     // `AssertUnwindSafe` because nothing observable is shared across the
     // boundary: the closure owns its converter and returns an owned String.
     match catch_unwind(AssertUnwindSafe(convert)) {
@@ -110,6 +156,24 @@ fn unsupported(latex: &str, reason: &impl ToString) -> Error {
 /// Propagates the first unmappable construct.
 fn render_children(node: roxmltree::Node<'_, '_>, latex: &str, out: &mut String) -> Result<()> {
     let children: Vec<roxmltree::Node<'_, '_>> = node.children().filter(is_content).collect();
+    render_sequence(&children, latex, out)
+}
+
+/// Render a run of sibling nodes, giving each large operator the expression
+/// that follows it.
+///
+/// Every caller that walks siblings must go through here: rendering them one by
+/// one instead leaves a large operator with no operand, which Word draws as an
+/// empty placeholder box.
+///
+/// # Errors
+///
+/// Propagates the first unmappable node.
+fn render_sequence(
+    children: &[roxmltree::Node<'_, '_>],
+    latex: &str,
+    out: &mut String,
+) -> Result<()> {
     let mut index = 0;
     while let Some(child) = children.get(index) {
         // A large operator takes the expression after it as its operand. `MathML`
@@ -128,14 +192,37 @@ fn render_children(node: roxmltree::Node<'_, '_>, latex: &str, out: &mut String)
 }
 
 /// Whether `node` is a large operator carrying limits, e.g. `\sum_{i=1}^{n}`.
+///
+/// Both script shapes count: `\sum` arrives as `munder*` and `\int` as
+/// `msub*`, and both should become one n-ary object rather than an operator
+/// with scripts stuck on — which would leave the integral sign short and its
+/// integrand outside.
 fn is_nary(node: roxmltree::Node<'_, '_>) -> bool {
-    matches!(node.tag_name().name(), "mover" | "munder" | "munderover")
+    let scripted = matches!(
+        node.tag_name().name(),
+        "mover" | "munder" | "munderover" | "msub" | "msup" | "msubsup"
+    );
+    scripted
         && node.attribute("accent") != Some("true")
+        && node.attribute("accentunder") != Some("true")
         && parts(node)
             .first()
             .copied()
             .and_then(nary_operator)
             .is_some()
+}
+
+/// Where a large operator's limits sit.
+///
+/// `\sum` sets them above and below, `\int` beside — which is how each reads
+/// in LaTeX by default, and which `math-core`'s choice of `munder*` versus
+/// `msub*` already encodes.
+fn limit_location(node: roxmltree::Node<'_, '_>) -> &'static str {
+    if node.tag_name().name().starts_with("mu") || node.tag_name().name() == "mover" {
+        "undOvr"
+    } else {
+        "subSup"
+    }
 }
 
 /// Whether a node carries content worth rendering (elements and real text).
@@ -155,13 +242,23 @@ fn render(node: roxmltree::Node<'_, '_>, latex: &str, out: &mut String) -> Resul
     }
     match node.tag_name().name() {
         "mi" | "mn" | "mtext" | "mo" => render_token(node, out),
+        "mrow" if fences(node).is_some() => render_delimited(node, latex, out)?,
         "mrow" | "mstyle" | "semantics" => render_children(node, latex, out)?,
         "mfrac" => render_fraction(node, latex, out)?,
+        "msup" | "msub" | "msubsup" if is_nary(node) => {
+            render_limits_with_operand(node, None, latex, out)?;
+        }
         "msup" | "msub" | "msubsup" => render_scripts(node, latex, out)?,
         "msqrt" | "mroot" => render_radical(node, latex, out)?,
         "mover" | "munder" | "munderover" => render_limits(node, latex, out)?,
         "mphantom" => render_phantom(node, latex, out)?,
-        "mspace" => out.push_str(&run(" ", false)),
+        // `math-core` emits a bare `<mspace/>` before font-variant groups; a
+        // width-less space rendered as a real one prints as a stray gap.
+        "mspace" => {
+            if node.attribute("width").is_some_and(|w| !w.starts_with('0')) {
+                out.push_str(&run(" ", false));
+            }
+        }
         "mtable" => render_table(node, latex, out)?,
         other => {
             return Err(unsupported(
@@ -175,9 +272,12 @@ fn render(node: roxmltree::Node<'_, '_>, latex: &str, out: &mut String) -> Resul
 
 /// Render a leaf token: an identifier, number, operator or text run.
 ///
-/// Identifiers are italic (the convention for a variable); everything else is
-/// upright, which is what makes `log` read as a function name rather than
-/// three multiplied variables.
+/// A *single-letter* identifier is italic, the convention for a variable;
+/// everything else is upright, which is what makes `log` read as a function
+/// name rather than three multiplied variables. Multi-letter identifiers are
+/// safe to leave upright because `math-core` has already folded font variants
+/// into Unicode math-alphanumeric codepoints, so `\mathit{len}` arrives as
+/// italic glyphs rather than as an attribute to honour.
 fn render_token(node: roxmltree::Node<'_, '_>, out: &mut String) {
     let text = node.text().unwrap_or_default();
     let italic = node.tag_name().name() == "mi" && text.chars().count() == 1;
@@ -213,7 +313,7 @@ fn argument_children(node: roxmltree::Node<'_, '_>, latex: &str) -> Result<Strin
 ///
 /// # Errors
 ///
-/// Propagates the first unmappable child.
+/// Propagates the node if it cannot be mapped.
 fn argument(node: roxmltree::Node<'_, '_>, latex: &str) -> Result<String> {
     let mut inner = String::new();
     render(node, latex, &mut inner)?;
@@ -225,6 +325,65 @@ fn parts<'a>(node: roxmltree::Node<'a, 'a>) -> Vec<roxmltree::Node<'a, 'a>> {
     node.children()
         .filter(roxmltree::Node::is_element)
         .collect()
+}
+
+/// The opening and closing delimiters of `node`, if it is a fenced group.
+///
+/// `math-core` marks a `\left(…\right)` group, and the brackets `\binom` and
+/// the matrix environments put around their content, as stretchy `mo` children
+/// at each end of an `mrow`.
+fn fences(node: roxmltree::Node<'_, '_>) -> Option<(String, String)> {
+    let children = parts(node);
+    let (first, last) = (children.first()?, children.last()?);
+    if children.len() < 3 || !is_fence(*first) || !is_fence(*last) {
+        return None;
+    }
+    Some((fence_char(*first), fence_char(*last)))
+}
+
+/// Whether `node` is a stretchy delimiter.
+fn is_fence(node: roxmltree::Node<'_, '_>) -> bool {
+    node.tag_name().name() == "mo" && node.attribute("stretchy") != Some("false")
+}
+
+/// A delimiter's character, or the empty string for an invisible one.
+///
+/// `\left.` arrives as U+2063 INVISIBLE SEPARATOR; OMML spells "no delimiter
+/// here" as an empty `m:begChr`/`m:endChr`, and passing the codepoint through
+/// would print a box in some fonts.
+fn fence_char(node: roxmltree::Node<'_, '_>) -> String {
+    let text = node.text().unwrap_or_default().trim();
+    if text.chars().all(|c| matches!(c, '\u{2061}'..='\u{2064}')) {
+        return String::new();
+    }
+    text.to_owned()
+}
+
+/// Render a delimited group as OMML delimiters, which grow with their content.
+///
+/// Emitted as literal runs instead, a full-height fraction would get short
+/// parentheses beside it — the commonest way generated equations look wrong.
+///
+/// # Errors
+///
+/// Propagates an unmappable child.
+fn render_delimited(node: roxmltree::Node<'_, '_>, latex: &str, out: &mut String) -> Result<()> {
+    let Some((open, close)) = fences(node) else {
+        return render_children(node, latex, out);
+    };
+    let children = parts(node);
+    let contents = children
+        .get(1..children.len().saturating_sub(1))
+        .unwrap_or_default();
+    let mut inner = String::new();
+    render_sequence(contents, latex, &mut inner)?;
+    let _ = write!(
+        out,
+        r#"<m:d><m:dPr><m:begChr m:val="{}"/><m:endChr m:val="{}"/><m:grow/></m:dPr><m:e>{inner}</m:e></m:d>"#,
+        crate::export::escape_xml(&open),
+        crate::export::escape_xml(&close)
+    );
+    Ok(())
 }
 
 /// Render a fraction. A zero line thickness is how `\binom` arrives, and OMML
@@ -353,25 +512,33 @@ fn render_limits(node: roxmltree::Node<'_, '_>, latex: &str, out: &mut String) -
     if let Some(operator) = nary_operator(*base) {
         return render_nary(node, &operator, &sides, None, latex, out);
     }
-    let body = argument(*base, latex)?;
     let name = node.tag_name().name();
-    let (tag, part) = if name == "munder" {
-        ("limLow", "lim")
-    } else {
-        ("limUpp", "lim")
-    };
+    if name == "munderover" {
+        // `m:limLow`/`m:limUpp` carry one limit each. Emitting one and dropping
+        // the other would lose half the expression silently, which is worse on
+        // a printed exam than refusing it.
+        return Err(unsupported(
+            latex,
+            &"an over- and under-script on the same base has no Word equivalent",
+        ));
+    }
+    let body = argument(*base, latex)?;
+    let tag = if name == "munder" { "limLow" } else { "limUpp" };
     let Some(limit) = sides.get(1) else {
         return Err(unsupported(latex, &"a limit is missing its script"));
     };
     let mut inner = String::new();
     render(*limit, latex, &mut inner)?;
-    let _ = write!(out, "<m:{tag}>{body}<m:{part}>{inner}</m:{part}></m:{tag}>");
+    let _ = write!(out, "<m:{tag}>{body}<m:lim>{inner}</m:lim></m:{tag}>");
     Ok(())
 }
 
-/// The large operators that take their scripts as limits rather than as
-/// ordinary sub/superscripts.
-const NARY_OPERATORS: [&str; 6] = ["∑", "∏", "∐", "∫", "∮", "⋃"];
+/// The operators that become a single OMML n-ary object, swallowing the
+/// expression they apply to.
+///
+/// Where their limits sit is decided separately by [`limit_location`]: `\sum`
+/// sets them above and below, `\int` beside.
+const NARY_OPERATORS: [&str; 12] = ["∑", "∏", "∐", "∫", "∮", "⋃", "⋂", "⨁", "⨂", "⨀", "⋀", "⋁"];
 
 /// The operator character if `node` is a large operator, else `None`.
 fn nary_operator(node: roxmltree::Node<'_, '_>) -> Option<String> {
@@ -392,7 +559,7 @@ fn render_nary(
     latex: &str,
     out: &mut String,
 ) -> Result<()> {
-    let under = node.tag_name().name() != "mover";
+    let under = !matches!(node.tag_name().name(), "mover" | "msup");
     let limit = |part: Option<&roxmltree::Node<'_, '_>>, tag: &str| -> Result<String> {
         let Some(part) = part else {
             return Ok(format!("<m:{tag}/>"));
@@ -401,16 +568,22 @@ fn render_nary(
         render(*part, latex, &mut inner)?;
         Ok(format!("<m:{tag}>{inner}</m:{tag}>"))
     };
-    let (sub, sup) = if node.tag_name().name() == "munderover" {
+    let name = node.tag_name().name();
+    let (sub, sup) = if matches!(name, "munderover" | "msubsup") {
         (limit(sides.get(1), "sub")?, limit(sides.get(2), "sup")?)
     } else if under {
         (limit(sides.get(1), "sub")?, "<m:sup/>".to_owned())
     } else {
         ("<m:sub/>".to_owned(), limit(sides.get(1), "sup")?)
     };
+    // A slot left empty but not hidden is drawn by Word as a placeholder box,
+    // the same defect an empty operand produced.
     let properties = format!(
-        r#"<m:naryPr><m:chr m:val="{}"/><m:limLoc m:val="undOvr"/><m:subHide m:val="0"/><m:supHide m:val="0"/></m:naryPr>"#,
-        crate::export::escape_xml(operator)
+        r#"<m:naryPr><m:chr m:val="{}"/><m:limLoc m:val="{}"/><m:subHide m:val="{}"/><m:supHide m:val="{}"/></m:naryPr>"#,
+        crate::export::escape_xml(operator),
+        limit_location(node),
+        u8::from(sub.ends_with("<m:sub/>")),
+        u8::from(sup.ends_with("<m:sup/>")),
     );
     let body = match operand {
         Some(operand) => argument(operand, latex)?,
@@ -627,6 +800,159 @@ mod tests {
             body.contains(r#"<m:t xml:space="preserve">i</m:t>"#),
             "{xml}"
         );
+    }
+
+    /// The content of the first `<m:tag>…</m:tag>` — for asking what landed
+    /// *inside* a construct, not merely that the construct exists.
+    fn inside<'a>(xml: &'a str, tag: &str) -> &'a str {
+        xml.split_once(&format!("<m:{tag}>"))
+            .and_then(|(_, rest)| rest.split_once(&format!("</m:{tag}>")))
+            .map_or("", |(inner, _)| inner)
+    }
+
+    #[test]
+    /// Pathologically nested input is refused before the parser sees it. A
+    /// stack overflow inside the parser is an abort, not an unwind:
+    /// `catch_unwind` cannot contain it and it takes the whole export down.
+    fn absurdly_nested_latex_is_refused_rather_than_crashing() {
+        let latex = format!("{}x{}", r"\frac{".repeat(64), "}{1}".repeat(64));
+        let error = refused(&latex);
+        assert!(error.contains("nested more than"), "{error}");
+        // A realistic depth is untouched.
+        assert!(to_omml(r"\frac{\frac{a}{b}}{c}", Display::Inline).is_ok());
+    }
+
+    #[test]
+    /// A panic in the converter becomes an error rather than escaping. Proved
+    /// against a converter that really unwinds: no LaTeX is known to panic
+    /// `math-core`, so testing this through `to_omml` would only ever exercise
+    /// the rejection path.
+    fn a_panicking_converter_becomes_an_error() {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = contain_panics(r"\x", || {
+            // Panics with "removal index out of bounds" — a genuine unwind,
+            // written without `expect`/`unwrap`/indexing, all of which the
+            // crate denies even in tests.
+            Vec::<String>::new().remove(0);
+            Ok(String::new())
+        });
+        std::panic::set_hook(hook);
+        let error = result.expect_err("a panic must not escape").to_string();
+        assert!(error.contains("panicked on this input"), "{error}");
+        assert!(error.contains(r"\x"), "{error}");
+    }
+
+    #[test]
+    /// A one-sided operator hides the slot it has no limit for. An empty
+    /// `<m:sub/>` left visible prints the same placeholder box a missing
+    /// operand did.
+    fn a_one_sided_operator_hides_its_empty_slot() {
+        let above = omml(r"\sum^{n} x");
+        assert!(above.contains(r#"<m:subHide m:val="1"/>"#), "{above}");
+        let below = omml(r"\bigcup_{i} A");
+        assert!(below.contains(r#"<m:supHide m:val="1"/>"#), "{below}");
+        // Both present means neither is hidden.
+        let both = omml(r"\sum_{i=1}^{n} i");
+        assert!(both.contains(r#"<m:subHide m:val="0"/>"#), "{both}");
+        assert!(both.contains(r#"<m:supHide m:val="0"/>"#), "{both}");
+    }
+
+    #[test]
+    /// An integral becomes one n-ary object with its limits beside it, not an
+    /// operator with scripts stuck on — otherwise the sign does not grow.
+    fn an_integral_is_a_large_operator_too() {
+        let xml = omml(r"\int_0^1 f");
+        assert!(xml.contains("<m:nary>"), "{xml}");
+        assert!(xml.contains(r#"<m:chr m:val="∫"/>"#), "{xml}");
+        assert!(xml.contains(r#"<m:limLoc m:val="subSup"/>"#), "{xml}");
+        // A summation still sets its limits above and below.
+        assert!(omml(r"\sum_{i=1}^{n} i").contains(r#"<m:limLoc m:val="undOvr"/>"#));
+    }
+
+    #[test]
+    /// An over/under pair Word cannot express is refused rather than having
+    /// one of its two scripts silently dropped. `\lim_{a}^{b}` is a
+    /// `munderover` whose base is not a large operator, so it has no n-ary
+    /// form to fall back on.
+    fn an_unmappable_over_under_pair_is_refused() {
+        let error = refused(r"\lim_{a}^{b} x");
+        assert!(error.contains("no Word equivalent"), "{error}");
+    }
+
+    #[test]
+    /// A zero-width space is not a space. `math-core` emits a bare `<mspace/>`
+    /// before a font-variant group; rendering it prints a stray gap.
+    fn a_zero_width_space_prints_nothing() {
+        let xml = omml(r"\mathrm{len}");
+        assert!(
+            !xml.contains(r#"<m:t xml:space="preserve"> </m:t>"#),
+            "a stray space reached the page: {xml}"
+        );
+    }
+
+    #[test]
+    /// A thin fraction rule is still a rule. Only an explicit zero means the
+    /// bar-less form that `\binom` uses.
+    fn a_thin_rule_is_not_a_missing_one() {
+        assert!(!omml(r"\frac{a}{b}").contains("noBar"));
+        assert!(omml(r"\binom{n}{k}").contains("noBar"));
+    }
+
+    #[test]
+    /// A single-letter variable is italic and a multi-letter function name is
+    /// not — `contains(">n<")` alone matches the upright rendering too.
+    fn a_variable_is_italic_and_a_function_name_is_not() {
+        let xml = omml(r"O(n \log n)");
+        assert!(
+            xml.contains(r#"<m:r><m:t xml:space="preserve">n</m:t></m:r>"#),
+            "n lost its italic: {xml}"
+        );
+        assert!(
+            !xml.contains(r#"<m:sty m:val="p"/></m:rPr><m:t xml:space="preserve">n</m:t>"#),
+            "n is upright: {xml}"
+        );
+    }
+
+    #[test]
+    /// Fixed-arity parts do not swap: the numerator is on top, the subscript
+    /// below, the degree outside the radical.
+    fn fixed_arity_parts_do_not_swap() {
+        let frac = omml(r"\frac{a}{b}");
+        assert!(inside(&frac, "num").contains(">a<"), "{frac}");
+        assert!(inside(&frac, "den").contains(">b<"), "{frac}");
+        let script = omml("x_i^2");
+        assert!(inside(&script, "sub").contains(">i<"), "{script}");
+        assert!(inside(&script, "sup").contains(">2<"), "{script}");
+        let root = omml(r"\sqrt[3]{x}");
+        assert!(inside(&root, "deg").contains(">3<"), "{root}");
+    }
+
+    #[test]
+    /// Delimiters grow with what they hold. Emitted as plain runs, a
+    /// full-height fraction gets short parentheses beside it — the commonest
+    /// way a generated equation looks wrong.
+    fn delimiters_grow_with_their_content() {
+        let binom = omml(r"\binom{n}{k}");
+        assert!(binom.contains("<m:d>"), "{binom}");
+        assert!(binom.contains(r#"<m:begChr m:val="("/>"#), "{binom}");
+        assert!(binom.contains("<m:grow/>"), "{binom}");
+        assert!(
+            to_omml(r"\left[ x \right]", Display::Inline)
+                .expect("converts")
+                .contains(r#"<m:begChr m:val="["/>"#)
+        );
+    }
+
+    #[test]
+    /// A large operator keeps its operand wherever it sits. Delimited groups
+    /// walk their own children, so the look-ahead has to be shared or a
+    /// bracketed sum loses its operand and prints a placeholder box.
+    fn a_large_operator_keeps_its_operand_inside_delimiters() {
+        let xml = omml(r"\left[ \sum_{i=1}^{n} x \right]");
+        assert!(!xml.contains("<m:e/>"), "placeholder box: {xml}");
+        let nary = inside(&xml, "nary");
+        assert!(nary.contains(">x<"), "operand escaped the sigma: {xml}");
     }
 
     #[test]
