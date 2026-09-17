@@ -1,0 +1,8 @@
+# A mutant that loops instead of returning must die on the clock, not on the
+# machine's memory. The suite itself runs in 0.2 s, so cargo-mutants would
+# otherwise autoset a timeout of a few seconds and — more to the point — a
+# mutant that *allocates* in its loop reaches double-digit gigabytes long
+# before any wall-clock limit fires. The hard memory bound is `memcap`
+# (see CLAUDE.md); this is the cheap clock bound next to it.
+minimum_test_timeout = 20
+timeout_multiplier = 5.0

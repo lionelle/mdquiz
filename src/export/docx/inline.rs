@@ -7,12 +7,17 @@
 //! # What is rendered, and what is not
 //!
 //! Part of the authoring format is character-level (emphasis, code spans,
-//! math) and part is block-level (lists, tables, code blocks, images). This
-//! module handles the first and **refuses** the second rather than dropping
-//! it: a block it cannot render is emitted as its own Markdown source, so a
-//! list prints as `- item` instead of silently losing its bullets. That
-//! fallback is the same stopgap the print sheet already ships for tables —
-//! text that looks like text, which an instructor can see and work around.
+//! math) and part is block-level. Lists are laid out: [`list`] and
+//! [`item_paragraphs`] hand each item a `w:numId` from [`super::numbering`],
+//! so the markers are Word's own rather than characters typed into the text.
+//! Every other block — tables, code blocks, images — is **refused** rather
+//! than dropped: a block this module cannot render is emitted as its own
+//! Markdown source, so a table prints as `| a | b |` instead of silently
+//! losing its columns. That fallback is the same stopgap the print sheet
+//! already ships for tables — text that looks like text, which an instructor
+//! can see and work around. One item a list cannot lay out sends the *whole*
+//! list back to source, because half a list formatted and half printed as
+//! Markdown reads worse than either.
 //!
 //! Math is the exception, and deliberately: it is never printed as source. A
 //! student who meets `$\frac{a}{b}$` on a page sees something that is not a
@@ -31,6 +36,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
+use super::numbering::{MAX_LEVEL, Marker, Numbering};
 use super::omml::{self, Display};
 use crate::export::escape_xml;
 use crate::{Error, Result};
@@ -56,6 +62,19 @@ pub(super) enum Kind {
     /// — a question number, in particular — may apply it. See
     /// [`Paragraph::centred`].
     Equation,
+    /// A paragraph inside a list item.
+    Item {
+        /// The `w:numId` of the list it counts in.
+        numbering: u32,
+        /// Its nesting depth, as `w:ilvl`.
+        level: u8,
+        /// Whether it is the paragraph the marker sits on.
+        ///
+        /// An item may hold several paragraphs, and only the first is
+        /// bulleted or numbered. Marking the rest would print an item's own
+        /// second paragraph as a second item.
+        marked: bool,
+    },
 }
 
 /// One rendered paragraph.
@@ -76,7 +95,7 @@ impl Paragraph {
     pub(super) fn centred(&self) -> String {
         match self.kind {
             Kind::Equation => format!("<m:oMathPara>{}</m:oMathPara>", self.runs),
-            Kind::Prose | Kind::Heading(_) => self.runs.clone(),
+            Kind::Prose | Kind::Heading(_) | Kind::Item { .. } => self.runs.clone(),
         }
     }
 }
@@ -86,11 +105,15 @@ impl Paragraph {
 /// Only the runs are decided here. The caller picks the `w:pPr` to wrap them
 /// in, because the same prose is set differently as a header and as a prompt.
 ///
+/// `numbering` accumulates the document's lists; it is threaded in rather
+/// than built here because `w:numId`s must be unique across the whole
+/// document, and a prompt does not know what the header already opened.
+///
 /// # Errors
 ///
 /// Returns [`Error::UnsupportedMath`] if a `$…$` span cannot be converted to
 /// OOXML math, or sits in a block that would be printed as source.
-pub(super) fn paragraphs(markdown: &str) -> Result<Vec<Paragraph>> {
+pub(super) fn paragraphs(markdown: &str, numbering: &mut Numbering) -> Result<Vec<Paragraph>> {
     // Normalised first: authored text arriving CRLF would otherwise carry a
     // stray `\r` into `<w:t>`, which XML line-ending normalisation rewrites on
     // read — the document would not round-trip through its own reader.
@@ -101,7 +124,11 @@ pub(super) fn paragraphs(markdown: &str) -> Result<Vec<Paragraph>> {
         let from = line_start(&source, range.start);
         push_gap(&mut rendered, source.get(covered..from).unwrap_or_default());
         covered = range.end.max(covered);
-        rendered.push(block.render(source.get(from..range.end).unwrap_or_default())?);
+        block.render(
+            source.get(from..range.end).unwrap_or_default(),
+            numbering,
+            &mut rendered,
+        )?;
     }
     push_gap(&mut rendered, source.get(covered..).unwrap_or_default());
     Ok(rendered)
@@ -116,6 +143,9 @@ pub(super) fn text_run(text: &str) -> String {
 enum Block<'a> {
     /// A paragraph or heading, carried as the inline events inside it.
     Prose(Kind, Vec<Event<'a>>),
+    /// A list, carried as the events inside it. Unlike the others it yields
+    /// several paragraphs — one per item, and more where an item holds more.
+    List(Marker, Vec<Event<'a>>),
     /// Any other block: printed as its own source, never rendered. Its events
     /// are kept all the same, because math among them is refused rather than
     /// printed.
@@ -123,28 +153,44 @@ enum Block<'a> {
 }
 
 impl Block<'_> {
-    /// This block as a paragraph, falling back to `source` if its inline
-    /// structure cannot be rendered.
+    /// Append this block's paragraphs to `out`, falling back to `source` if
+    /// its inline structure cannot be rendered.
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedMath`] if the block holds math that cannot
     /// be rendered or would fall back to source.
-    fn render(self, source: &str) -> Result<Paragraph> {
+    fn render(
+        self,
+        source: &str,
+        numbering: &mut Numbering,
+        out: &mut Vec<Paragraph>,
+    ) -> Result<()> {
         let events = match self {
             Self::Prose(kind, events) => match runs(&events, kind)? {
-                Some(runs) => return Ok(Paragraph { kind, runs }),
+                Some(runs) => {
+                    out.push(Paragraph { kind, runs });
+                    return Ok(());
+                }
                 // The markers are what prints now, so it is no longer a
                 // heading: `## Part *2*` falls back as `## Part *2*`.
+                None => events,
+            },
+            Self::List(marker, events) => match list(&events, marker, 0, numbering)? {
+                Some(paragraphs) => {
+                    out.extend(paragraphs);
+                    return Ok(());
+                }
                 None => events,
             },
             Self::Literal(events) => events,
         };
         refuse_math(&events)?;
-        Ok(Paragraph {
+        out.push(Paragraph {
             kind: Kind::Prose,
             runs: literal(source),
-        })
+        });
+        Ok(())
     }
 }
 
@@ -165,6 +211,10 @@ fn blocks(source: &str) -> Vec<(Range<usize>, Block<'_>)> {
             Event::Start(Tag::Heading { level, .. }) => {
                 let kind = Kind::Heading(depth(level));
                 blocks.push((range, Block::Prose(kind, inside(&mut events))));
+            }
+            Event::Start(Tag::List(first)) => {
+                let marker = first.map_or(Marker::Bullet, Marker::Ordered);
+                blocks.push((range, Block::List(marker, inside(&mut events))));
             }
             Event::Start(_) => blocks.push((range, Block::Literal(inside(&mut events)))),
             // Nothing else needs an arm. Every inline event is wrapped in a
@@ -253,6 +303,177 @@ fn push_gap(rendered: &mut Vec<Paragraph>, source: &str) {
     }
 }
 
+/// One piece of a list item.
+enum Segment<'a, 'e> {
+    /// Inline events forming one paragraph.
+    Text(&'a [Event<'e>]),
+    /// A list nested inside this item, and how it marks its own items.
+    Nested(Marker, &'a [Event<'e>]),
+}
+
+/// The paragraphs of one list at nesting `level`.
+///
+/// `Ok(None)` means an item held something this writer does not render, and
+/// the caller should print the whole list as source — one item silently
+/// losing a link while its neighbours kept theirs would be worse than a list
+/// that is visibly unformatted throughout.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedMath`] if an item holds math that cannot be
+/// rendered.
+fn list(
+    events: &[Event<'_>],
+    marker: Marker,
+    level: u8,
+    numbering: &mut Numbering,
+) -> Result<Option<Vec<Paragraph>>> {
+    let id = numbering.open(marker, level);
+    let mut rendered = Vec::new();
+    for item in items(events) {
+        let Some(paragraphs) = item_paragraphs(item, id, level, numbering)? else {
+            return Ok(None);
+        };
+        rendered.extend(paragraphs);
+    }
+    Ok(Some(rendered))
+}
+
+/// The paragraphs of one list item, including any list nested in it.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedMath`] if the item holds math that cannot be
+/// rendered.
+fn item_paragraphs(
+    events: &[Event<'_>],
+    id: u32,
+    level: u8,
+    numbering: &mut Numbering,
+) -> Result<Option<Vec<Paragraph>>> {
+    let mut marked = true;
+    let mut rendered = Vec::new();
+    let segments = segments(events);
+    if !matches!(segments.first(), Some(Segment::Text(_))) {
+        rendered.push(empty_marker(id, level));
+        marked = false;
+    }
+    for segment in segments {
+        let kind = item_kind(id, level, marked);
+        match segment {
+            Segment::Text(events) => match runs(events, kind)? {
+                Some(runs) => {
+                    rendered.push(Paragraph { kind, runs });
+                    marked = false;
+                }
+                None => return Ok(None),
+            },
+            Segment::Nested(nested, events) => {
+                let deeper = level.saturating_add(1).min(MAX_LEVEL);
+                let Some(paragraphs) = list(events, nested, deeper, numbering)? else {
+                    return Ok(None);
+                };
+                rendered.extend(paragraphs);
+            }
+        }
+    }
+    Ok(Some(rendered))
+}
+
+/// The paragraph an item's marker hangs on when the item has no text of its
+/// own — one written empty, or holding nothing but a nested list.
+///
+/// Without it the item vanishes: the list comes out a line shorter, and in a
+/// numbered one every item after it moves up, so `1.` followed by
+/// `2. second` prints "second" as item 1.
+fn empty_marker(id: u32, level: u8) -> Paragraph {
+    Paragraph {
+        kind: item_kind(id, level, true),
+        runs: String::new(),
+    }
+}
+
+/// The kind of one paragraph in list `id` at depth `level`.
+const fn item_kind(id: u32, level: u8, marked: bool) -> Kind {
+    Kind::Item {
+        numbering: id,
+        level,
+        marked,
+    }
+}
+
+/// The events inside each `Item` of a list, in order.
+fn items<'a, 'e>(events: &'a [Event<'e>]) -> Vec<&'a [Event<'e>]> {
+    let mut items = Vec::new();
+    let mut index = 0;
+    while let Some(event) = events.get(index) {
+        if matches!(event, Event::Start(Tag::Item)) {
+            let (inner, next) = nested(events, index);
+            items.push(inner);
+            index = next;
+        } else {
+            index += 1;
+        }
+    }
+    items
+}
+
+/// Split a list item into the paragraphs and nested lists it holds.
+///
+/// A *tight* list gives an item's text as bare inline events; a *loose* one
+/// wraps each in a paragraph. Treating the paragraph tags as separators
+/// rather than as content handles both without asking which kind this is.
+fn segments<'a, 'e>(events: &'a [Event<'e>]) -> Vec<Segment<'a, 'e>> {
+    let mut segments = Vec::new();
+    let (mut start, mut index) = (0, 0);
+    while let Some(event) = events.get(index) {
+        match event {
+            Event::Start(Tag::List(first)) => {
+                push_text(&mut segments, events.get(start..index));
+                let (inner, next) = nested(events, index);
+                let marker = first.map_or(Marker::Bullet, Marker::Ordered);
+                segments.push(Segment::Nested(marker, inner));
+                (start, index) = (next, next);
+            }
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) => {
+                push_text(&mut segments, events.get(start..index));
+                index += 1;
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    push_text(&mut segments, events.get(start..));
+    segments
+}
+
+/// Push `events` as a text segment, unless there are none.
+fn push_text<'a, 'e>(segments: &mut Vec<Segment<'a, 'e>>, events: Option<&'a [Event<'e>]>) {
+    if let Some(events) = events.filter(|events| !events.is_empty()) {
+        segments.push(Segment::Text(events));
+    }
+}
+
+/// The events nested inside the tag opening at `start`, and the index just
+/// past its `End`.
+fn nested<'a, 'e>(events: &'a [Event<'e>], start: usize) -> (&'a [Event<'e>], usize) {
+    let mut depth = 0_usize;
+    for (index, event) in events.iter().enumerate().skip(start) {
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return (events.get(start + 1..index).unwrap_or_default(), index + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Unterminated, which pulldown does not produce: take the rest.
+    (events.get(start + 1..).unwrap_or_default(), events.len())
+}
+
 /// Render one paragraph's inline events as runs.
 ///
 /// `Ok(None)` means the paragraph holds something this writer does not render
@@ -266,7 +487,7 @@ fn push_gap(rendered: &mut Vec<Paragraph>, source: &str) {
 fn runs(events: &[Event<'_>], kind: Kind) -> Result<Option<String>> {
     let display = match kind {
         Kind::Equation => Display::Block,
-        Kind::Prose | Kind::Heading(_) => Display::Inline,
+        Kind::Prose | Kind::Heading(_) | Kind::Item { .. } => Display::Inline,
     };
     let mut xml = String::new();
     let mut marks = Marks::default();
@@ -422,9 +643,17 @@ fn literal(source: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Render `markdown` into a document with no other lists in it.
+    ///
+    /// Each call gets a fresh [`Numbering`], so a test's `w:numId`s start at
+    /// 1 and do not depend on what another test rendered.
+    fn rendered(markdown: &str) -> Result<Vec<Paragraph>> {
+        paragraphs(markdown, &mut Numbering::new())
+    }
+
     /// The runs of the single paragraph `markdown` renders to.
     fn only(markdown: &str) -> String {
-        let mut rendered = paragraphs(markdown).expect("renders");
+        let mut rendered = rendered(markdown).expect("renders");
         assert_eq!(rendered.len(), 1, "expected one paragraph: {rendered:?}");
         rendered.pop().map(|block| block.runs).unwrap_or_default()
     }
@@ -523,7 +752,7 @@ mod tests {
     /// `centred` is what sets it apart — never the runs, which a caller may
     /// have to put a question number in front of.
     fn display_math_alone_is_an_equation() {
-        let mut rendered = paragraphs(r"$$\frac{a}{b}$$").expect("renders");
+        let mut rendered = rendered(r"$$\frac{a}{b}$$").expect("renders");
         let block = rendered.pop().expect("one paragraph");
         assert!(matches!(block.kind, Kind::Equation), "{block:?}");
         assert!(!block.runs.contains("oMathPara"), "{block:?}");
@@ -535,7 +764,7 @@ mod tests {
     /// `m:oMathPara` centres the whole paragraph, so it would drag the
     /// surrounding words into the middle of the page.
     fn display_math_mid_sentence_stays_in_the_sentence() {
-        let mut rendered = paragraphs(r"Evaluate $$\frac{a}{b}$$ now.").expect("renders");
+        let mut rendered = rendered(r"Evaluate $$\frac{a}{b}$$ now.").expect("renders");
         let block = rendered.pop().expect("one paragraph");
         assert!(matches!(block.kind, Kind::Prose), "{block:?}");
         assert!(!block.centred().contains("oMathPara"), "{block:?}");
@@ -546,7 +775,7 @@ mod tests {
     /// never degraded to source: a formula that printed as `\frac{a}{b}`
     /// still looks like a question the student must answer.
     fn unconvertible_math_is_an_error() {
-        let refused = paragraphs(r"$\begin{unknown}x\end{unknown}$");
+        let refused = rendered(r"$\begin{unknown}x\end{unknown}$");
         assert!(
             matches!(refused, Err(Error::UnsupportedMath { .. })),
             "{refused:?}"
@@ -559,13 +788,17 @@ mod tests {
     /// what the no-degrading rule exists to prevent.
     fn math_inside_a_literal_block_is_refused() {
         for source in [
-            "- solve $x^2$",
             "| $x^2$ | 2 |\n|---|---|\n| a | b |",
             "> recall $e^{i\\pi}$",
             r"Given $x^2$, see [the handout](http://a.example).",
             r"Given ![fig](f.png), find $x^2$.",
+            // A list *renders* now, so math in one reaches the page as math.
+            // These two fall back — a link, then an image — and the fallback
+            // is the path that would print the LaTeX.
+            r"- see [the handout](http://a.example) and $x^2$",
+            "- solve $x^2$\n- see ![fig](f.png)",
         ] {
-            let refused = paragraphs(source);
+            let refused = rendered(source);
             assert!(
                 matches!(refused, Err(Error::UnsupportedMath { .. })),
                 "{source} was not refused: {refused:?}"
@@ -578,8 +811,8 @@ mod tests {
     /// walk reached it, then discovering the link afterwards, made the same
     /// content export or fail depending on which came first.
     fn refusal_does_not_depend_on_word_order() {
-        let before = paragraphs(r"$x^2$ and [a](b)");
-        let after = paragraphs(r"see [a](b) and $x^2$");
+        let before = rendered(r"$x^2$ and [a](b)");
+        let after = rendered(r"see [a](b) and $x^2$");
         assert!(
             matches!(before, Err(Error::UnsupportedMath { .. })),
             "{before:?}"
@@ -593,21 +826,193 @@ mod tests {
     #[test]
     /// A block with no math is not refused — only math is undegradable.
     fn a_literal_block_without_math_is_fine() {
-        assert!(only("- first\n- second").contains(">- first<"));
+        assert!(only("| a | b |\n|---|---|").contains(">| a | b |<"));
     }
 
     #[test]
-    /// A list is not rendered yet, so it prints as its own source — bullets
-    /// and all. Dropping the markers would leave a run-on sentence that
-    /// reads as prose.
-    fn a_list_falls_back_to_its_own_source() {
-        let runs = only("- first\n- second");
-        assert!(runs.contains(">- first<"), "{runs}");
-        assert!(runs.contains(">- second<"), "{runs}");
+    /// A list becomes one paragraph per item, each carrying the numbering it
+    /// counts in rather than a marker typed into its text.
+    fn a_list_becomes_one_paragraph_per_item() {
+        let rendered = rendered("- first\n- second").expect("renders");
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        for block in &rendered {
+            assert!(
+                matches!(block.kind, Kind::Item { level: 0, .. }),
+                "{block:?}"
+            );
+            assert!(!block.runs.contains('-'), "the marker is text: {block:?}");
+        }
+    }
+
+    #[test]
+    /// `items` steps past anything that is not an item rather than stalling
+    /// on it. Nothing the parser emits inside a list is anything else, so
+    /// this pins a guard the parser makes unnecessary — and which a wrong
+    /// step would turn into a hang rather than a wrong page.
+    fn items_steps_past_what_is_not_an_item() {
+        let events = [
+            Event::SoftBreak,
+            Event::Start(Tag::Item),
+            Event::Text("only".into()),
+            Event::End(TagEnd::Item),
+        ];
+        assert_eq!(items(&events).len(), 1);
+    }
+
+    #[test]
+    /// A nested list is the same list one level deeper, not a new one.
+    /// Bullets carry no counter, so every bulleted list shares a `w:numId`.
+    fn a_nested_list_goes_one_level_deeper() {
+        let rendered = rendered("- outer\n  - inner\n- back").expect("renders");
+        let levels: Vec<u8> = rendered
+            .iter()
+            .filter_map(|block| match block.kind {
+                Kind::Item { level, .. } => Some(level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(levels, [0, 1, 0], "{rendered:?}");
+    }
+
+    #[test]
+    /// Only the first paragraph of an item is marked. Marking the rest
+    /// prints an item's own second paragraph as a second item.
+    fn only_an_items_first_paragraph_carries_the_marker() {
+        let rendered = rendered("- para one\n\n  para two").expect("renders");
+        let marks: Vec<bool> = rendered
+            .iter()
+            .filter_map(|block| match block.kind {
+                Kind::Item { marked, .. } => Some(marked),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marks, [true, false], "{rendered:?}");
+    }
+
+    #[test]
+    /// An empty item still gets a paragraph to hang its marker on. Dropping
+    /// it shortens the list — and in a numbered one renumbers everything
+    /// after it, so `1.` `2. second` prints "second" as item 1.
+    fn an_empty_item_keeps_its_place() {
+        let rendered = rendered("1.\n2. second\n3. third").expect("renders");
+        assert_eq!(rendered.len(), 3, "{rendered:?}");
         assert!(
-            runs.contains("<w:r><w:br/></w:r>"),
-            "rows ran together: {runs}"
+            rendered
+                .iter()
+                .all(|block| matches!(block.kind, Kind::Item { marked: true, .. })),
+            "{rendered:?}"
         );
+    }
+
+    #[test]
+    /// An item holding nothing but a nested list keeps its own marker, at
+    /// its own level, before the nested one.
+    fn an_item_holding_only_a_nested_list_keeps_its_marker() {
+        let rendered = rendered("-\n  - inner").expect("renders");
+        let levels: Vec<u8> = rendered
+            .iter()
+            .filter_map(|block| match block.kind {
+                Kind::Item { level, .. } => Some(level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(levels, [0, 1], "{rendered:?}");
+    }
+
+    #[test]
+    /// An ordered list authored as `5.` starts at five. The parser reports the
+    /// authored value and the writer has to carry it through to a
+    /// `w:startOverride`; dropping it renumbers the list to start at 1, which
+    /// looks deliberate on the page.
+    fn an_authored_start_value_reaches_the_numbering() {
+        let mut numbering = Numbering::new();
+        paragraphs("5. five\n6. six", &mut numbering).expect("renders");
+        let xml = numbering.to_xml();
+        assert!(xml.contains(r#"<w:startOverride w:val="5"/>"#), "{xml}");
+    }
+
+    /// The `w:ilvl` of every list-item paragraph in `blocks`, in order.
+    fn levels_of(blocks: &[Paragraph]) -> Vec<u8> {
+        blocks
+            .iter()
+            .filter_map(|block| match block.kind {
+                Kind::Item { level, .. } => Some(level),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    /// Nesting deeper than Word allows clamps onto the deepest defined level
+    /// — and *only* the levels past it. An item naming a level the numbering
+    /// part does not define loses its marker *and* its indent, printing flush
+    /// against the margin. The levels are asserted in full rather than as
+    /// `level <= MAX_LEVEL`, which a clamp that flattened every level onto 0
+    /// would satisfy just as well while losing the shape of the list.
+    fn nesting_deeper_than_word_allows_clamps_only_past_the_deepest() {
+        let deep = (0..12).fold(String::new(), |mut source, depth| {
+            source.push_str(&" ".repeat(depth * 2));
+            source.push_str("- item\n");
+            source
+        });
+        let levels = levels_of(&rendered(&deep).expect("renders"));
+        assert_eq!(levels, [0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8]);
+        assert!(levels.iter().all(|level| *level <= MAX_LEVEL));
+    }
+
+    #[test]
+    /// An item's text *after* a nested list is still that item's second
+    /// paragraph, not a new item. The marker state has to survive the
+    /// recursion into the nested list; resetting it there prints a second
+    /// marker halfway down the item.
+    fn text_after_a_nested_list_is_still_the_same_item() {
+        let blocks = rendered("- outer\n\n  - inner\n\n  back to outer").expect("renders");
+        let shape: Vec<(u8, bool)> = blocks
+            .iter()
+            .filter_map(|block| match block.kind {
+                Kind::Item { level, marked, .. } => Some((level, marked)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shape, [(0, true), (1, true), (0, false)], "{blocks:?}");
+    }
+
+    #[test]
+    /// An item that cannot be rendered sends the *outer* list back to source
+    /// too, not just the list it sits in. Laying out the outer bullets around
+    /// a nested list printed as `- see [a](b)` would read as an item whose
+    /// text happens to begin with a dash.
+    fn a_bad_nested_item_falls_the_whole_outer_list_back() {
+        let blocks = rendered("- outer\n\n  - see [a](b)").expect("renders");
+        let block = blocks.first().expect("one paragraph");
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(matches!(block.kind, Kind::Prose), "{block:?}");
+        assert!(block.runs.contains("- outer"), "{block:?}");
+        assert!(
+            block.runs.contains("[a](b)"),
+            "the nested list was lost: {block:?}"
+        );
+    }
+
+    #[test]
+    /// A list item renders its own inline marks and math, which is the whole
+    /// point of laying lists out rather than printing them as source.
+    fn a_list_item_renders_its_inline_content() {
+        let rendered = rendered("- solve $x^2$ **now**").expect("renders");
+        let item = rendered.first().expect("one item");
+        assert!(item.runs.contains("<m:oMath>"), "{item:?}");
+        assert!(item.runs.contains("<w:b/>"), "{item:?}");
+    }
+
+    #[test]
+    /// One unrenderable item sends the *whole* list back to source. Half a
+    /// list laid out and half printed as Markdown is worse than either.
+    fn one_bad_item_falls_the_whole_list_back() {
+        let rendered = rendered("- fine\n- see [link](u)").expect("renders");
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        let block = rendered.first().expect("one paragraph");
+        assert!(matches!(block.kind, Kind::Prose), "{block:?}");
+        assert!(block.runs.contains(">- fine<"), "{block:?}");
     }
 
     #[test]
@@ -633,7 +1038,7 @@ mod tests {
     /// *document* start: a block after a paragraph would then reprint
     /// everything before it.
     fn widening_a_block_does_not_swallow_what_precedes_it() {
-        let rendered = paragraphs("intro\n\n    let x = 1;").expect("renders");
+        let rendered = rendered("intro\n\n    let x = 1;").expect("renders");
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         let code = rendered.last().expect("two paragraphs");
         assert!(code.runs.contains(">    let x = 1;<"), "{code:?}");
@@ -649,12 +1054,14 @@ mod tests {
     /// line is an ordinary authoring slip — and an off-by-one here drags the
     /// last letter of the paragraph onto the list.
     fn widening_a_block_starts_at_a_line_boundary() {
-        let rendered = paragraphs("text\n- item").expect("renders");
+        let rendered = rendered("text\n| a |\n|---|\n| b |").expect("renders");
         assert_eq!(rendered.len(), 2, "{rendered:?}");
-        let list = rendered.last().expect("two paragraphs");
-        assert_eq!(
-            list.runs, r#"<w:r><w:t xml:space="preserve">- item</w:t></w:r>"#,
-            "the paragraph bled into the list: {list:?}"
+        let table = rendered.last().expect("two paragraphs");
+        assert!(
+            table
+                .runs
+                .starts_with(r#"<w:r><w:t xml:space="preserve">| a |</w:t>"#),
+            "the paragraph bled into the table: {table:?}"
         );
     }
 
@@ -663,7 +1070,7 @@ mod tests {
     /// one. Printing it would open the paragraph with a blank line the
     /// author never wrote.
     fn a_gap_does_not_open_with_a_blank_line() {
-        let rendered = paragraphs("a\n\n[ref]: https://a.example\n\nb").expect("renders");
+        let rendered = rendered("a\n\n[ref]: https://a.example\n\nb").expect("renders");
         assert_eq!(rendered.len(), 3, "{rendered:?}");
         let gap = rendered.get(1).expect("three paragraphs");
         assert!(gap.runs.starts_with("<w:r><w:t"), "leading break: {gap:?}");
@@ -683,7 +1090,7 @@ mod tests {
     /// losing the definition would leave the address nowhere on the sheet.
     fn a_link_reference_definition_is_not_lost() {
         let rendered =
-            paragraphs("See [the syllabus][syl].\n\n[syl]: https://a.example/s").expect("renders");
+            rendered("See [the syllabus][syl].\n\n[syl]: https://a.example/s").expect("renders");
         let printed: String = rendered.iter().map(|block| block.runs.clone()).collect();
         assert!(printed.contains("[the syllabus][syl]"), "{rendered:?}");
         assert!(printed.contains("https://a.example/s"), "{rendered:?}");
@@ -692,7 +1099,7 @@ mod tests {
     #[test]
     /// A heading is a heading, not a paragraph beginning with a hash.
     fn headings_carry_their_level() {
-        let kinds: Vec<String> = paragraphs("# One\n\n### Three\n\nprose")
+        let kinds: Vec<String> = rendered("# One\n\n### Three\n\nprose")
             .expect("renders")
             .iter()
             .map(|block| format!("{:?}", block.kind))
@@ -712,7 +1119,7 @@ mod tests {
     /// A heading that falls back prints its markers, so it is no longer set
     /// as a heading — the `##` on the page would be a heading twice over.
     fn a_heading_that_falls_back_is_not_a_heading() {
-        let mut rendered = paragraphs("## See ![fig](f.png)").expect("renders");
+        let mut rendered = rendered("## See ![fig](f.png)").expect("renders");
         let block = rendered.pop().expect("one paragraph");
         assert!(matches!(block.kind, Kind::Prose), "{block:?}");
         assert!(block.runs.contains("## See"), "{block:?}");
@@ -752,14 +1159,14 @@ mod tests {
     #[test]
     /// Blank-line-separated blocks stay separate paragraphs.
     fn blocks_are_separate_paragraphs() {
-        assert_eq!(paragraphs("one\n\ntwo").expect("renders").len(), 2);
+        assert_eq!(rendered("one\n\ntwo").expect("renders").len(), 2);
     }
 
     #[test]
     /// A `\r` cannot survive in `<w:t>`: XML line-ending normalisation
     /// rewrites it on read, so the document would not round-trip itself.
     fn carriage_returns_do_not_reach_the_document() {
-        let rendered = paragraphs("one\r\n\r\ntwo\rthree").expect("renders");
+        let rendered = rendered("one\r\n\r\ntwo\rthree").expect("renders");
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         assert!(
             rendered.iter().all(|block| !block.runs.contains('\r')),
@@ -778,17 +1185,7 @@ mod tests {
     #[test]
     /// Empty input renders nothing at all, rather than a stray blank line.
     fn empty_markdown_renders_no_paragraphs() {
-        assert!(paragraphs("").expect("renders").is_empty());
-        assert!(paragraphs("   \n\n  ").expect("renders").is_empty());
-    }
-}
-
-#[cfg(test)]
-mod probe5 {
-    #[test]
-    fn dump() {
-        for source in ["text\n- item", "text\n# Heading", "a\n\n    code"] {
-            println!("--- {source:?}\n  {:?}", super::paragraphs(source));
-        }
+        assert!(rendered("").expect("renders").is_empty());
+        assert!(rendered("   \n\n  ").expect("renders").is_empty());
     }
 }

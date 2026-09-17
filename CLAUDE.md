@@ -31,6 +31,74 @@ We follow the Canvas **New Quizzes** model for question options.
    crates; justify anything unusual in the PR description. `cargo add` so
    versions resolve against the registry — don't hand-edit versions.
 
+## Machine limits — read before running anything heavy
+
+**Everything that runs this crate's code goes through `memcap`.** This is not
+a style preference; an uncapped run has taken the whole desktop down three
+times.
+
+```
+memcap cargo test --all-features
+memcap cargo mutants --jobs 1 --file src/export/docx/inline.rs
+```
+
+From the kernel log, not from guesswork: on 2026-09-16 at 19:25 and
+2026-09-17 at 10:51 and 10:59, the lib test binary `mdquiz-c96b716a` reached
+11.2, 10.6 and 11.0 GB of anonymous RSS and was killed by the **global** OOM
+killer. Swap here is zram-only — compressed in RAM, so there is nowhere to
+page out to — and each kill landed in the cgroup of the VS Code window the
+session was running in (`app-code-*.scope: Failed with result 'oom-kill'`),
+taking the editor down with the test.
+
+`cargo mutants` is what triggers it. Mutating the `list` / `item_paragraphs`
+recursion in `docx::inline` yields mutants that recurse or loop while
+allocating, and 11 GB arrives within seconds — sooner than any wall-clock
+timeout can help, which is why `.cargo/mutants.toml` is a backstop and not
+the fix.
+
+`memcap` (in `~/.local/bin`) runs the command in its own cgroup with
+MemoryMax=6G and swap off, so a runaway mutant is SIGKILLed on its own and
+the rest of the run carries on. `MEMCAP=12G memcap …` raises it for one run.
+A PreToolUse hook in `.claude/settings.json` refuses `cargo test`,
+`cargo mutants` and `cargo nextest` without it. Do not route around the hook
+by running the binary in `target/debug/deps` directly — that is the exact
+process that died three times.
+
+### Build memory is the smaller, separate problem
+
+This box has 20 cores but a busy desktop: it idles around **23 GB of 31 GB**
+used (rust-analyzer alone holds ~2.7 GB across two instances). That leaves
+roughly **6 GB** to build in. Measured on this crate:
+
+| Workload | Peak RSS |
+|---|---|
+| cold `cargo build`, default 20 jobs | 1886 MB |
+| cold `cargo build`, 4 jobs | 899 MB |
+| cold `clippy --all-targets`, 20 jobs | 1586 MB |
+| cold `clippy --all-targets`, 4 jobs | 811 MB |
+| running the test suite, **unmutated** | 38 MB |
+| `cargo mutants --jobs 1`, shared target dir | +1.1 GB |
+
+Note what that last-but-one row does and does not say: the suite as written
+is tiny, so a bare `cargo test` looks harmless. It is *mutated* code that
+allocates without bound, and no build-side cap touches it.
+
+Rules:
+
+1. **Never run two cargo commands at once.** Not in parallel tool calls, not
+   one agent while another builds. `.cargo/config.toml` caps jobs at 4, which
+   halves peak memory for about 1.5 s more wall time — do not raise it here.
+2. **At most one subagent at a time**, and only when a genuinely fresh view is
+   worth it. Sequential is fine; slower is fine.
+3. **Agents share one `CARGO_TARGET_DIR`, and not one under `/tmp`.** A
+   per-agent target directory rebuilds all 114 dependencies from cold, for
+   maximum memory and maximum disk. Worse, `/tmp` here is **tmpfs**, so a
+   target tree put in a scratch directory is held in RAM: the 4.8 GB two
+   sessions left behind was 4.8 GB of the 31 GB this box has, spent to save
+   memory. Point it at a real filesystem, or just use `target/`.
+4. **`cargo mutants`**: always under `memcap`, always `--jobs 1`, and point
+   `CARGO_TARGET_DIR` at the shared tree so dependencies stay warm.
+
 ## Lint & style policy (enforced, not aspirational)
 
 Declared in `Cargo.toml` `[lints]` and `clippy.toml`; the hook/CI promote every
@@ -85,7 +153,8 @@ own folder, which that helper cannot do.
 - `src/export/docx.rs` — Word document bytes for printing, built from a
   `quiz::exam::Exam`. Owns the *container* — parts, styles, page furniture —
   and delegates content: `docx::inline` turns authored Markdown into `w:r`
-  runs, `docx::omml` turns LaTeX into OOXML math. (`docx.rs` still writes runs
+  runs, `docx::omml` turns LaTeX into OOXML math, `docx::numbering` owns the
+  list definitions a `w:numPr` resolves against. (`docx.rs` still writes runs
   of its own for page furniture — page breaks, answer space, footer fields —
   which carry no authored text.) Shares the zip/XML-escape helpers in
   `export.rs` with the Canvas exporter.

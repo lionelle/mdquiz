@@ -29,14 +29,20 @@ use mdquiz::quiz::spec::Layout;
 /// A page-footer template exercising every placeholder.
 const FOOTER: &str = "${name} (${variant}) — Page ${page} of ${pages}";
 
-/// A header block exercising a heading, inline marks and a list fallback.
+/// A header block exercising a heading, inline marks, and bulleted, nested and
+/// ordered lists — including two ordered lists that must each start at 1.
 const HEADER: &str = "\
 # Instructions
 
 Answer every question. Show your *working* and mark the final answer in `ink`.
 
 - No calculators.
-- ~~No~~ notes.";
+- ~~No~~ notes, except:
+  - one index card;
+  - a calculator with no $\\log$ key.
+
+1. Write in ink.
+2. Sign every page.";
 
 /// Whether `tool` can be run on this machine.
 ///
@@ -67,12 +73,14 @@ fn sample_exam() -> Exam {
 /// Every entry is something the writer handles differently: escaping, inline
 /// math, display math and a multi-paragraph prompt. Written as prompts on a
 /// real exam rather than as a test fixture, so the converted PDF can be read.
-const PROMPTS: [&str; 5] = [
+const PROMPTS: [&str; 7] = [
     "Is statement 0 true? Consider <a> & \"b\".",
     r"Sort in $O(n \log n)$ time and say **why** it is not $O(n)$.",
     r"Evaluate $$\sum_{i=1}^{n} i^2$$ in closed form.",
     "State the invariant.\n\nThen prove it is *maintained*.",
     "Prove the identity:\n\n$$e^{i\\pi} + 1 = 0$$",
+    "Answer both parts:\n\n1. State the rule.\n\n   Then name it.\n2. Apply it to $n = 2^{10}$.",
+    "Rank these, slowest first:\n\n- bubble sort\n- merge sort\n- counting sort",
 ];
 
 /// One true/false item asking the `n`th prompt.
@@ -215,10 +223,23 @@ fn assert_furniture(rendered: &str) {
     assert!(rendered.contains("Instructions"), "header heading missing");
     assert!(
         rendered.contains("No calculators."),
-        "the list fallback lost its text"
+        "the header list lost its text"
     );
+    assert!(
+        rendered.contains("one index card"),
+        "the nested list lost its text"
+    );
+    // Both ordered lists must start at 1. Sharing a `w:numId` would make the
+    // second continue the first, printing "3." and "4." in the prompt.
+    for opener in ["1. Write in ink.", "1. State the rule."] {
+        assert!(
+            rendered.contains(opener),
+            "an ordered list did not restart: {rendered}"
+        );
+    }
     assert!(rendered.contains("End of exam."), "footer missing");
     assert!(rendered.contains("Page 1 of"), "page footer missing");
+    assert!(rendered.contains("Page 2 of 2"), "the page count is wrong");
 }
 
 /// Assert every prompt printed as the writer claims to render it.

@@ -1,0 +1,14 @@
+# Cap how many `rustc` processes cargo runs at once.
+#
+# This box has 20 cores, so the default is 20 parallel `rustc`, and a cold
+# build of this crate's 114 dependencies then peaks at ~1.9 GB. That is fine
+# on its own and fatal in company: the desktop here idles around 23 GB of
+# 31 GB (rust-analyzer, browsers, editors), leaving roughly 6 GB, and two or
+# three cargo builds running at the same time — several review agents, or an
+# agent alongside a `cargo mutants` run — go straight through it into swap.
+#
+# Measured on this crate: `clippy --all-targets` cold peaks at 1586 MB with
+# the default 20 jobs and 811 MB with 4, for 1.5 s more wall time. Raise or
+# delete this if you are building somewhere with memory to spare.
+[build]
+jobs = 4

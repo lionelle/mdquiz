@@ -147,6 +147,7 @@ printing the markers. (`page_footer` is the exception: it is plain text plus
 | `~~struck~~` | struck-through text |
 | `` `code` `` | a monospace span |
 | `# Heading` … `### Heading` | Word's built-in Heading 1–3 styles |
+| `- item`, `1. item` | a real Word list, nesting and all |
 | `$x^2$`, `$$…$$` | a real Word equation |
 
 Headings deeper than `###` are set as Heading 3. Because the built-in styles
@@ -159,40 +160,48 @@ its own is centred on that line. Written mid-sentence, or as the whole of a
 question's first line, it stays inline — centring it there would drag the
 sentence, or the question's number, into the middle of the page.
 
-**Printed as you typed it** — lists, tables, block quotes, links, images,
-fenced and indented code blocks, horizontal rules and raw HTML are not laid
-out yet, so the block appears as its own Markdown source, indentation and line
-breaks intact:
+Lists become Word lists: bulleted or numbered, nested to any depth, with the
+formatting and math inside each item rendered. Each numbered list restarts at
+1 — or at whatever number you wrote — rather than continuing the one before
+it. An item may hold more than one paragraph; only the first carries the
+number.
+
+**Printed as you typed it** — tables, block quotes, links, images, fenced and
+indented code blocks, horizontal rules and raw HTML are not laid out yet, so
+the block appears as its own Markdown source, indentation and line breaks
+intact:
 
 ```markdown
-- No calculators.
-- No notes.
+| Algorithm | Cost |
+|---|---|
+| merge sort | n log n |
 ```
 
-prints as two lines still carrying their `-`. This is deliberate: an
-unformatted list that is *visibly* unformatted is something you can see and
-work around, where a list silently flattened into one run-on sentence is not.
-The same blocks render properly on the Canvas export; the print sheet catches
-up over the releases tracked in [`../Roadmap.md`](../Roadmap.md).
+prints as three lines still carrying their pipes. This is deliberate: a table
+that is *visibly* unformatted is something you can see and work around, where
+one silently flattened into a run-on line is not. The same blocks render
+properly on the Canvas export; the print sheet catches up over the releases
+tracked in [`../Roadmap.md`](../Roadmap.md).
 
 Note that inline formatting inside such a block is printed too — a
-`~~struck~~` list item shows its tildes — because the whole block falls back
-together.
+`~~struck~~` table cell shows its tildes — because the whole block falls back
+together. A list holding a link is the same: one item the writer cannot lay
+out sends the whole list back to source, rather than formatting half of it.
 
 **Math is the exception, and it is never printed as source.** The export
 **fails**, naming the expression, if:
 
 - the formula uses something the Word writer cannot render (see
   [math.md](math.md)); or
-- the formula sits inside one of the blocks above — a list, table, quote,
-  link or image — which would otherwise print it as raw LaTeX.
+- the formula sits inside one of the blocks above — a table, quote, link or
+  image — which would otherwise print it as raw LaTeX.
 
-So `- solve $x^2$` is an error today, not a sheet with `$x^2$` on it. The
-reason math alone is treated this way: an unformatted list is visibly
-unformatted, but a student who meets `$\frac{a}{b}$` on a printed page sees
-something that is not a formula, and nobody finds out until the copies are
-run off. Move the math into a paragraph of its own until lists and tables
-land.
+So `| $x^2$ |` in a table is an error today, not a sheet with `$x^2$` printed
+on it. (Math in a *list* is fine: lists are laid out.) The reason math alone
+is treated this way: an unformatted table is visibly unformatted, but a
+student who meets `$\frac{a}{b}$` on a printed page sees something that is
+not a formula, and nobody finds out until the copies are run off. Move the
+math out of the table until tables land.
 
 ## Unknown keys are errors
 

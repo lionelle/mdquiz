@@ -388,9 +388,31 @@ existing pattern.
    - **Headings are capped at three levels**, deeper ones clamping onto
      `Heading3` rather than naming a style the document does not define.
 
-7. **Lists** — including `numbering.xml` abstract/concrete definitions. The
-   fallback in Part 6 is what this replaces; `inline::runs` already has the
-   single `match` arm to extend.
+7. **Lists.** *Done* — `src/export/docx/numbering.rs` plus the list walk in
+   `inline.rs`. Bulleted and numbered, nested to `w:ilvl` 8, with each item's
+   inline formatting and math rendered rather than printed as source.
+
+   **Each ordered list opens its own `w:numId`.** The counter lives on the
+   `w:numId`, so two lists sharing one do not both start at 1 — the second
+   continues the first, printing "3. 4." where the author wrote two lists of
+   two. Plausible enough on screen to survive review, and wrong on paper.
+   Bullets carry no counter, so every bulleted list shares one id.
+
+   **Found by rendering:** an item's *second* paragraph was marked like a
+   fresh item, so `- one` followed by an indented continuation printed two
+   bullets. A continuation now carries no `w:numPr` — and therefore inherits
+   no indent from the level either, so it is indented by hand to the same
+   place. `numbering::indent` is shared by both calculations, with a test
+   that they agree; drifting apart leaves an item's second paragraph hanging
+   to the left of its first.
+
+   The fallback rule is unchanged and now has a sharper edge: one item the
+   writer cannot lay out sends the *whole* list back to source. Half a list
+   formatted and half printed as Markdown is worse than either.
+
+   This also narrows the Part 6 math refusal — math in a list now renders, so
+   only tables, quotes, links and images still refuse it.
+
 8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal
    text in a monospace style. See "Tables in v1" below; folding them together is
    what removes a whole part from this plan.

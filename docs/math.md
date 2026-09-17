@@ -51,8 +51,9 @@ See [`../samples/math/`](../samples/math/) for a runnable example.
 - **The Word path does validate it, and refuses what it cannot render.** It
   converts the LaTeX itself, so the export **fails**, quoting the expression,
   when either the formula uses a construct it does not support *or* the
-  formula sits inside a block the Word writer cannot lay out yet (a list,
-  table, quote, link or image — see [quizzes.md](quizzes.md)). Nothing else in
+  formula sits inside a block the Word writer cannot lay out yet (a table,
+  quote, link or image — see [quizzes.md](quizzes.md); math in a list is
+  fine). Nothing else in
   the Word writer behaves this way: unsupported *layout* degrades to visible
   Markdown source. Math does not, because a formula printed as `$\frac{a}{b}$`
   still looks like a question the student must answer. Supported today:

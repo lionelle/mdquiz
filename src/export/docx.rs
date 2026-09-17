@@ -7,8 +7,9 @@
 //! This module owns the *container*: the parts a Word document must have
 //! before any question appears, plus the page furniture that is the same on
 //! every sheet. Authored content is delegated — [`inline`] renders Markdown to
-//! runs and [`omml`] renders LaTeX to math. The per-question answer structures
-//! arrive in a later change and slot into the body builder.
+//! runs, [`omml`] renders LaTeX to math, and [`numbering`] owns the list
+//! definitions a `w:numPr` resolves against. The per-question answer
+//! structures arrive in a later change and slot into the body builder.
 //!
 //! # What Word actually requires
 //!
@@ -26,12 +27,14 @@
 //!   a schema violation even though they look harmless.
 
 mod inline;
+mod numbering;
 pub mod omml;
 
 use std::fmt::Write as _;
 
 use crate::Result;
 use crate::export::docx::inline::Kind;
+use crate::export::docx::numbering::Numbering;
 use crate::export::zip_package;
 use crate::quiz::exam::{Exam, ExamItem};
 use crate::quiz::spec::{TEMPLATE_CLOSE, TEMPLATE_OPEN, TemplateKey};
@@ -99,7 +102,9 @@ const MAX_ANSWER_TWIPS: u32 = PAGE_HEIGHT - 2 * MARGIN;
 /// writer cannot convert, [`crate::Error::Export`] if the zip container cannot
 /// be written, or [`crate::Error::Io`] from the underlying writer.
 pub fn to_docx(exam: &Exam) -> Result<Vec<u8>> {
-    let document = document_xml(exam)?;
+    let mut lists = Numbering::new();
+    let document = document_xml(exam, &mut lists)?;
+    let numbering = lists.to_xml();
     let footer = footer_xml(exam);
     let rels = document_rels();
     let styles = styles();
@@ -109,7 +114,7 @@ pub fn to_docx(exam: &Exam) -> Result<Vec<u8>> {
         ("word/_rels/document.xml.rels", rels.as_bytes()),
         ("word/document.xml", document.as_bytes()),
         ("word/styles.xml", styles.as_bytes()),
-        ("word/numbering.xml", NUMBERING.as_bytes()),
+        ("word/numbering.xml", numbering.as_bytes()),
         ("word/settings.xml", SETTINGS.as_bytes()),
         ("word/footer1.xml", footer.as_bytes()),
     ];
@@ -252,16 +257,6 @@ fn heading_styles() -> String {
         })
 }
 
-/// An empty numbering part.
-///
-/// Present from the start because lists need `numbering.xml` to exist *and* be
-/// declared before any `w:numId` can resolve; adding the part later would mean
-/// touching the content types and relationships again.
-const NUMBERING: &str = concat!(
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-    r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#,
-);
-
 /// Document settings, carrying the math font.
 ///
 /// Cambria Math is set once here rather than on every run, so equations render
@@ -283,11 +278,11 @@ const SETTINGS: &str = concat!(
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt, header or footer
 /// contains math that cannot be converted.
-fn document_xml(exam: &Exam) -> Result<String> {
+fn document_xml(exam: &Exam, lists: &mut Numbering) -> Result<String> {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W_NS}" xmlns:m="{M_NS}" xmlns:r="{R_NS}"><w:body>"#
     );
-    xml.push_str(&body_xml(exam)?);
+    xml.push_str(&body_xml(exam, lists)?);
     xml.push_str(&section_xml());
     xml.push_str("</w:body></w:document>");
     Ok(xml)
@@ -299,47 +294,72 @@ fn document_xml(exam: &Exam) -> Result<String> {
 /// Question rendering is deliberately shallow for now — a numbered prompt and
 /// its answer space. The per-kind answer structures land with the question
 /// writers.
-fn body_xml(exam: &Exam) -> Result<String> {
+fn body_xml(exam: &Exam, lists: &mut Numbering) -> Result<String> {
     let mut xml = paragraph(&inline::text_run(&exam.title()), ParagraphStyle::Title);
     if let Some(header) = &exam.header {
-        xml.push_str(&prose(header)?);
+        xml.push_str(&prose(header, lists)?);
     }
     for (index, item) in exam.items.iter().enumerate() {
         xml.push_str(&question_xml(
             index + 1,
             item,
             exam.layout.page_break_between,
+            lists,
         )?);
     }
     if let Some(footer) = &exam.footer {
-        xml.push_str(&prose(footer)?);
+        xml.push_str(&prose(footer, lists)?);
     }
     Ok(xml)
+}
+
+/// The question number and the prompt's first paragraph, if it has one.
+///
+/// The number normally shares that paragraph. It cannot when the prompt opens
+/// with a list item: the item brings its own marker and indent, so the number
+/// would print inside the first bullet — and, displacing
+/// [`ParagraphStyle::Question`], take the question's leading space with it.
+/// There the number gets a line of its own and the list starts underneath.
+fn opening_paragraphs(lead: &str, first: Option<inline::Paragraph>) -> String {
+    let Some(first) = first else {
+        return paragraph(lead, ParagraphStyle::Question);
+    };
+    if matches!(first.kind, Kind::Item { .. }) {
+        return paragraph(lead, ParagraphStyle::Question)
+            + &paragraph(
+                &first.runs,
+                ParagraphStyle::Continuation.or_block(first.kind),
+            );
+    }
+    // `runs`, not `centred`: the number shares this line, and setting a
+    // display equation apart would take the number to the middle of the page
+    // with it.
+    paragraph(
+        &(lead.to_owned() + &first.runs),
+        ParagraphStyle::Question.or_block(first.kind),
+    )
 }
 
 /// One numbered question: its prompt, then the blank space to answer in.
 ///
 /// The number shares the first paragraph with the prompt rather than standing
-/// alone, so a wrapped prompt still hangs off its own number.
-fn question_xml(number: usize, item: &ExamItem, page_break: bool) -> Result<String> {
+/// alone, so a wrapped prompt still hangs off its own number — except where
+/// [`opening_paragraphs`] cannot put it there.
+fn question_xml(
+    number: usize,
+    item: &ExamItem,
+    page_break: bool,
+    lists: &mut Numbering,
+) -> Result<String> {
     let mut xml = String::new();
     if page_break && number > 1 {
         xml.push_str(r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
     }
-    let mut prompt = inline::paragraphs(&item.question.prompt)?.into_iter();
+    let mut prompt = inline::paragraphs(&item.question.prompt, lists)?.into_iter();
     let lead = inline::text_run(&format!("{number}. "));
-    match prompt.next() {
-        // `runs`, not `centred`: the number shares this line, and setting a
-        // display equation apart would take the number to the middle of the
-        // page with it.
-        Some(first) => xml.push_str(&paragraph(
-            &(lead + &first.runs),
-            ParagraphStyle::Question.or_heading(first.kind),
-        )),
-        None => xml.push_str(&paragraph(&lead, ParagraphStyle::Question)),
-    }
+    xml.push_str(&opening_paragraphs(&lead, prompt.next()));
     for block in prompt {
-        let style = ParagraphStyle::Continuation.or_heading(block.kind);
+        let style = ParagraphStyle::Continuation.or_block(block.kind);
         xml.push_str(&paragraph(&block.centred(), style));
     }
     xml.push_str(&answer_space(item.answer_space));
@@ -378,16 +398,14 @@ fn answer_space(lines: usize) -> String {
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if the block contains math that
 /// cannot be converted.
-fn prose(markdown: &str) -> Result<String> {
-    Ok(inline::paragraphs(markdown)?
+fn prose(markdown: &str, lists: &mut Numbering) -> Result<String> {
+    Ok(inline::paragraphs(markdown, lists)?
         .iter()
-        .filter(|block| !block.runs.is_empty())
-        .map(|block| {
-            paragraph(
-                &block.centred(),
-                ParagraphStyle::Body.or_heading(block.kind),
-            )
-        })
+        // An empty *list item* is kept: it is a bullet with nothing after
+        // it, and dropping it renumbers everything below. Anything else with
+        // no runs is a blank paragraph nobody authored.
+        .filter(|block| !block.runs.is_empty() || matches!(block.kind, Kind::Item { .. }))
+        .map(|block| paragraph(&block.centred(), ParagraphStyle::Body.or_block(block.kind)))
         .collect())
 }
 
@@ -405,18 +423,57 @@ enum ParagraphStyle {
     Continuation,
     /// A Markdown heading, at the given level.
     Heading(u8),
+    /// A list item, counting in `numbering` at depth `level`.
+    ///
+    /// `sticky` is inherited from the style the caller asked for, so a list
+    /// inside a prompt holds together with its answer space while one in the
+    /// exam's header is free to break across a page.
+    Item {
+        /// The `w:numId` the item counts in.
+        numbering: u32,
+        /// The nesting depth, as `w:ilvl`.
+        level: u8,
+        /// Whether this paragraph carries the item's marker.
+        marked: bool,
+        /// Whether the item is held to the paragraph after it.
+        sticky: bool,
+    },
 }
 
 impl ParagraphStyle {
-    /// This style, or the heading style for `kind` if the block is a heading.
+    /// This style, or the one `kind` demands instead.
     ///
-    /// The heading styles carry `w:keepNext` of their own, so a heading used
-    /// partway through a prompt still holds together with what follows it.
-    const fn or_heading(self, kind: Kind) -> Self {
+    /// A heading and a list item bring their own `w:pPr`; everything else
+    /// keeps the style the caller chose. The heading styles carry
+    /// `w:keepNext` of their own, and a list item inherits stickiness from
+    /// the style it displaces, so either used partway through a prompt still
+    /// holds together with what follows it.
+    const fn or_block(self, kind: Kind) -> Self {
         match kind {
             Kind::Heading(level) => Self::Heading(level),
+            Kind::Item {
+                numbering,
+                level,
+                marked,
+            } => Self::Item {
+                numbering,
+                level,
+                marked,
+                sticky: self.is_sticky(),
+            },
             Kind::Prose | Kind::Equation => self,
         }
+    }
+
+    /// Whether a list item displacing this style should inherit its
+    /// `w:keepNext`.
+    ///
+    /// Only the styles carrying `w:keepNext` *inline* answer yes. A heading
+    /// keeps with what follows too, but through its style definition, and
+    /// `or_block` replaces a heading outright rather than asking — so a
+    /// heading is never the `self` here.
+    const fn is_sticky(self) -> bool {
+        matches!(self, Self::Question | Self::Continuation)
     }
 
     /// The `w:pPr` contents for this style, in schema order.
@@ -424,15 +481,56 @@ impl ParagraphStyle {
         match self {
             Self::Title => r#"<w:pStyle w:val="Title"/>"#.to_owned(),
             Self::Body => r#"<w:spacing w:after="120"/>"#.to_owned(),
-            Self::Question => {
-                r#"<w:keepNext/><w:keepLines/><w:spacing w:before="240"/>"#.to_owned()
-            }
+            Self::Question => format!(r#"{STICKY}<w:spacing w:before="240"/>"#),
             Self::Continuation => {
-                r#"<w:keepNext/><w:keepLines/><w:spacing w:before="120" w:after="120"/>"#.to_owned()
+                format!(r#"{STICKY}<w:spacing w:before="120" w:after="120"/>"#)
             }
             Self::Heading(level) => format!(r#"<w:pStyle w:val="{}"/>"#, heading_style(level)),
+            Self::Item {
+                numbering,
+                level,
+                marked,
+                sticky,
+            } => item_properties(numbering, level, marked, sticky),
         }
     }
+}
+
+/// The `w:pPr` tags that hold a paragraph to the one after it.
+///
+/// Named because [`ParagraphStyle::is_sticky`] reports which styles carry
+/// them: spelling them out at each site lets a style gain `w:keepNext` while
+/// `is_sticky` goes on saying it has none, and a list item in a prompt then
+/// silently stops keeping with its answer space.
+const STICKY: &str = "<w:keepNext/><w:keepLines/>";
+
+/// The `w:pPr` of one list-item paragraph.
+///
+/// A marked paragraph gets `w:numPr` and takes its indent from the numbering
+/// definition. An unmarked one — an item's second and later paragraphs — has
+/// to be indented by hand to the same place, since without `w:numPr` it
+/// inherits nothing from the level.
+///
+/// `CT_PPrBase` is a sequence: `keepNext`, `keepLines`, `numPr`, `spacing`,
+/// `ind`.
+fn item_properties(numbering: u32, level: u8, marked: bool, sticky: bool) -> String {
+    let mut properties = if sticky {
+        STICKY.to_owned()
+    } else {
+        String::new()
+    };
+    if marked {
+        let _ = write!(
+            properties,
+            r#"<w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{numbering}"/></w:numPr>"#
+        );
+    }
+    properties.push_str(r#"<w:spacing w:after="60"/>"#);
+    if !marked {
+        let indent = numbering::indent(usize::from(level));
+        let _ = write!(properties, r#"<w:ind w:left="{indent}"/>"#);
+    }
+    properties
 }
 
 /// The style id for a Markdown heading at `level`.
@@ -781,12 +879,14 @@ mod tests {
 
     /// The `CT_PPrBase` child sequence, in schema order. Only the elements this
     /// writer emits need listing; an unknown one fails the check loudly.
-    const PPR_ORDER: [&str; 7] = [
+    const PPR_ORDER: [&str; 9] = [
         "w:pStyle",
         "w:keepNext",
         "w:keepLines",
         "w:pageBreakBefore",
+        "w:numPr",
         "w:spacing",
+        "w:ind",
         "w:jc",
         "w:outlineLvl",
     ];
@@ -1059,6 +1159,178 @@ mod tests {
         assert!(!document.contains(r#"w:lineRule="exact""#), "{document}");
     }
 
+    #[test]
+    /// A prompt that opens with a list keeps the question number out of the
+    /// first bullet. The number shares the first prompt paragraph, so that
+    /// paragraph carrying a `w:numPr` of its own prints "1. bubble sort"
+    /// *inside* the item, indented under a bullet, and the question's own
+    /// leading space goes with it.
+    fn a_prompt_opening_with_a_list_numbers_the_question_not_the_bullet() {
+        let document = part(
+            &to_docx(&exam_asking("- bubble sort\n- merge sort")).expect("renders"),
+            "word/document.xml",
+        );
+        let numbered = properties_of(&document, "1. ");
+        assert!(
+            !numbered.contains("<w:numPr>"),
+            "the question number is inside a bullet: {document}"
+        );
+        assert!(
+            numbered.contains(r#"<w:spacing w:before="240"/>"#),
+            "the question lost its leading space: {document}"
+        );
+        assert_eq!(
+            document.matches("<w:numPr>").count(),
+            2,
+            "an item lost its marker: {document}"
+        );
+    }
+
+    #[test]
+    /// A start value on a *nested* ordered list is overridden at the `w:ilvl`
+    /// its items actually sit on. `w:lvlOverride` names a level, and one
+    /// naming a level no item uses is ignored outright — the authored `5.`
+    /// then prints as `a.`, which reads as a perfectly ordinary list.
+    fn a_nested_ordered_lists_start_is_overridden_at_its_own_level() {
+        let package = to_docx(&exam_asking("Steps:\n\n- outer\n\n  5. five")).expect("renders");
+        let document = part(&package, "word/document.xml");
+        let inner = document
+            .split(r#"<w:ilvl w:val="1"/><w:numId w:val=""#)
+            .nth(1)
+            .and_then(|rest| rest.split_once('"'))
+            .map_or_else(String::new, |(id, _)| id.to_owned());
+        assert!(!inner.is_empty(), "no nested item at all: {document}");
+        let numbering = part(&package, "word/numbering.xml");
+        let instance = numbering
+            .split(&format!(r#"<w:num w:numId="{inner}">"#))
+            .nth(1)
+            .and_then(|rest| rest.split_once("</w:num>"))
+            .map_or_else(String::new, |(body, _)| body.to_owned());
+        assert!(
+            instance.contains(r#"<w:lvlOverride w:ilvl="1">"#),
+            "the start is overridden at a level no item uses: {instance}"
+        );
+        assert!(
+            instance.contains(r#"<w:startOverride w:val="5"/>"#),
+            "{instance}"
+        );
+    }
+
+    #[test]
+    /// Two ordered lists in one document count separately. The counter lives
+    /// on the `w:numId`, so sharing one makes the second continue the first —
+    /// a header ending "1. 2." and a prompt opening "1." prints "3.". The
+    /// end-to-end version of this lives behind `#[ignore]` in
+    /// `tests/docx_package.rs`, so without this one the whole-document wiring
+    /// for the module's headline invariant never runs in the gate.
+    fn two_ordered_lists_do_not_continue_each_other() {
+        let mut quiz = exam_asking("Then:\n\n1. weigh it\n2. record it");
+        quiz.header = Some("1. read the rules\n2. sign the sheet".to_owned());
+        let package = to_docx(&quiz).expect("renders");
+        let document = part(&package, "word/document.xml");
+        let mut ids = numbering_ids(&document);
+        ids.dedup();
+        assert_eq!(ids.len(), 2, "the two lists share a counter: {document}");
+        let numbering = part(&package, "word/numbering.xml");
+        for id in ids {
+            assert!(
+                numbering.contains(&format!(
+                    r#"<w:num w:numId="{id}"><w:abstractNumId w:val="1"/>"#
+                )),
+                "numId {id} is not an ordered list: {numbering}"
+            );
+        }
+    }
+
+    #[test]
+    /// An empty item in body prose keeps its paragraph. It is a marker with
+    /// nothing after it, and dropping it as a runless paragraph shortens the
+    /// list and renumbers everything below, so `1.` followed by `2. second`
+    /// prints "second" as item 1.
+    fn an_empty_list_item_is_not_filtered_out_of_the_body() {
+        let mut quiz = exam(None, 1);
+        quiz.header = Some("1.\n2. second\n3. third".to_owned());
+        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        assert_eq!(document.matches("<w:numPr>").count(), 3, "{document}");
+    }
+
+    #[test]
+    /// A continuation paragraph inside a *nested* item is indented to its own
+    /// level. Indenting every continuation to level 0 puts an inner item's
+    /// second paragraph out at the outer list's margin, under the wrong
+    /// marker — and the existing level-0 test passes either way.
+    fn a_nested_continuation_is_indented_to_its_own_level() {
+        let mut quiz = exam(None, 1);
+        quiz.header = Some("- outer\n\n  - inner\n\n    still inner".to_owned());
+        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let tail = properties_of(&document, "still inner");
+        assert!(!tail.contains("<w:numPr>"), "a second marker: {tail}");
+        assert!(tail.contains(r#"<w:ind w:left="1440"/>"#), "{tail}");
+    }
+
+    /// `(level, marked, sticky)` and the `w:pPr` it must produce, for list id
+    /// 7. Spelled out rather than rebuilt from the writer's own pieces: an
+    /// expectation assembled the way the code assembles it agrees with any
+    /// bug the code has.
+    const ITEM_SHAPES: [(u8, bool, bool, &str); 5] = [
+        (
+            0,
+            true,
+            true,
+            concat!(
+                r#"<w:keepNext/><w:keepLines/>"#,
+                r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr>"#,
+                r#"<w:spacing w:after="60"/>"#,
+            ),
+        ),
+        (
+            3,
+            true,
+            false,
+            concat!(
+                r#"<w:numPr><w:ilvl w:val="3"/><w:numId w:val="7"/></w:numPr>"#,
+                r#"<w:spacing w:after="60"/>"#,
+            ),
+        ),
+        (
+            0,
+            false,
+            false,
+            r#"<w:spacing w:after="60"/><w:ind w:left="720"/>"#,
+        ),
+        (
+            2,
+            false,
+            true,
+            concat!(
+                r#"<w:keepNext/><w:keepLines/>"#,
+                r#"<w:spacing w:after="60"/><w:ind w:left="2160"/>"#,
+            ),
+        ),
+        (
+            8,
+            false,
+            false,
+            r#"<w:spacing w:after="60"/><w:ind w:left="6480"/>"#,
+        ),
+    ];
+
+    #[test]
+    /// The shapes a list-item `w:pPr` comes in, asserted together. A marked
+    /// paragraph takes its indent from the numbering definition and must not
+    /// repeat it; an unmarked one has no definition to inherit from and must
+    /// carry *its own level's* indent by hand. Stickiness is orthogonal to
+    /// both, and `CT_PPrBase` fixes the order they appear in.
+    fn an_item_paragraph_is_marked_or_indented_but_never_both() {
+        for (level, marked, sticky, expected) in ITEM_SHAPES {
+            assert_eq!(
+                item_properties(7, level, marked, sticky),
+                expected,
+                "level {level}, marked {marked}, sticky {sticky}"
+            );
+        }
+    }
+
     /// The exam of [`exam`] with its single prompt replaced by `prompt`.
     fn exam_asking(prompt: &str) -> Exam {
         let mut quiz = exam(None, 1);
@@ -1199,6 +1471,62 @@ mod tests {
         assert!(
             styles.contains(r#"<w:outlineLvl w:val="0"/>"#),
             "no outline level: {styles}"
+        );
+    }
+
+    #[test]
+    /// A list reaches the document as real Word numbering — a `w:numPr`
+    /// pointing at a defined `w:num` — rather than as bullet characters
+    /// typed into the text.
+    fn a_list_becomes_word_numbering() {
+        let package = to_docx(&exam_asking("- first\n- second")).expect("renders");
+        let document = part(&package, "word/document.xml");
+        assert_eq!(document.matches("<w:numPr>").count(), 2, "{document}");
+        // Every id used must be defined, or Word opens the file with the
+        // list silently flattened to plain paragraphs.
+        let numbering = part(&package, "word/numbering.xml");
+        for id in numbering_ids(&document) {
+            assert!(
+                numbering.contains(&format!(r#"<w:num w:numId="{id}">"#)),
+                "numId {id} is used but not defined: {numbering}"
+            );
+        }
+    }
+
+    /// Every `w:numId` the document references.
+    fn numbering_ids(document: &str) -> Vec<String> {
+        numbering::tests::values_of(document, "numId")
+    }
+
+    #[test]
+    /// An item's second paragraph carries no marker, and is indented by hand
+    /// to where the marker would have put it. Without the indent it hangs
+    /// out to the left of the item it belongs to.
+    fn an_item_continuation_is_indented_but_unmarked() {
+        let document = part(
+            &to_docx(&exam_asking("- one\n\n  still one")).expect("renders"),
+            "word/document.xml",
+        );
+        let tail = properties_of(&document, "still one");
+        assert!(!tail.contains("<w:numPr>"), "a second marker: {tail}");
+        assert!(tail.contains(r#"<w:ind w:left="720"/>"#), "{tail}");
+    }
+
+    #[test]
+    /// A list inside a prompt is held to its answer space, exactly as the
+    /// prompt's own paragraphs are; one in the header is free to break
+    /// across a page.
+    fn a_list_in_a_prompt_is_sticky_and_one_in_the_header_is_not() {
+        let mut quiz = exam_asking("Pick one:\n\n- alpha");
+        quiz.header = Some("- loose".to_owned());
+        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        assert!(
+            properties_of(&document, "alpha").contains("<w:keepNext/>"),
+            "{document}"
+        );
+        assert!(
+            !properties_of(&document, "loose").contains("<w:keepNext/>"),
+            "{document}"
         );
     }
 
