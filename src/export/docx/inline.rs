@@ -359,15 +359,15 @@ fn item_paragraphs(
         marked = false;
     }
     for segment in segments {
-        let kind = item_kind(id, level, marked);
         match segment {
-            Segment::Text(events) => match runs(events, kind)? {
-                Some(runs) => {
-                    rendered.push(Paragraph { kind, runs });
-                    marked = false;
-                }
-                None => return Ok(None),
-            },
+            Segment::Text(events) => {
+                let kind = item_kind(id, level, marked);
+                let Some(runs) = runs(events, kind)? else {
+                    return Ok(None);
+                };
+                rendered.push(Paragraph { kind, runs });
+                marked = false;
+            }
             Segment::Nested(nested, events) => {
                 let deeper = level.saturating_add(1).min(MAX_LEVEL);
                 let Some(paragraphs) = list(events, nested, deeper, numbering)? else {
@@ -532,9 +532,10 @@ fn refuse_math(events: &[Event<'_>]) -> Result<()> {
         if let Event::InlineMath(latex) | Event::DisplayMath(latex) = event {
             return Err(Error::UnsupportedMath {
                 latex: latex.to_string(),
-                reason: "it sits inside Markdown the Word writer cannot lay out yet — a list, \
-                         table, quote, link or image — where it would print as LaTeX source. \
-                         Move it into a paragraph of its own."
+                reason: "it sits inside Markdown the Word writer cannot lay out yet — a \
+                         table, quote, link or image, or a list holding one of those — \
+                         where it would print as LaTeX source. Move it into a paragraph \
+                         of its own."
                     .to_owned(),
             });
         }
@@ -929,6 +930,47 @@ mod tests {
         paragraphs("5. five\n6. six", &mut numbering).expect("renders");
         let xml = numbering.to_xml();
         assert!(xml.contains(r#"<w:startOverride w:val="5"/>"#), "{xml}");
+    }
+
+    #[test]
+    /// `nested` reports the index *past* the tag it closed, and stops at the
+    /// end of the events when that tag is never closed. Nothing pulldown emits
+    /// is unterminated, so the second case pins a guard the parser makes
+    /// unnecessary — but this is the index `items` advances by, and one that
+    /// fails to advance turns that walk into a loop that never ends rather
+    /// than a page that is merely wrong.
+    fn nested_always_advances_past_what_it_consumed() {
+        let closed = [
+            Event::Start(Tag::Item),
+            Event::Text("only".into()),
+            Event::End(TagEnd::Item),
+            Event::SoftBreak,
+        ];
+        let (inner, next) = nested(&closed, 0);
+        assert_eq!(inner.len(), 1, "{inner:?}");
+        assert_eq!(next, 3, "the closing tag would be walked a second time");
+
+        let dangling = [Event::Start(Tag::Item), Event::Text("dangling".into())];
+        let (rest, end) = nested(&dangling, 0);
+        assert_eq!(rest.len(), 1, "{rest:?}");
+        assert_eq!(end, dangling.len(), "an unterminated item did not finish");
+    }
+
+    #[test]
+    /// An item holding a *block* this writer cannot lay out — a fenced code
+    /// block, a quote, a table — falls the whole list back to source, the same
+    /// as an item holding an unrenderable inline does. It reaches that
+    /// decision by a different route: the block's events ride along inside a
+    /// text segment rather than becoming a segment of their own.
+    fn an_item_holding_a_block_falls_the_whole_list_back() {
+        let blocks = rendered("- run this:\n\n  ```\n  make all\n  ```\n").expect("renders");
+        let block = blocks.first().expect("one paragraph");
+        assert!(matches!(block.kind, Kind::Prose), "{block:?}");
+        assert!(block.runs.contains("- run this:"), "{block:?}");
+        assert!(
+            block.runs.contains("make all"),
+            "the code was lost: {block:?}"
+        );
     }
 
     /// The `w:ilvl` of every list-item paragraph in `blocks`, in order.

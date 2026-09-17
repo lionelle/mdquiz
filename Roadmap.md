@@ -411,7 +411,29 @@ existing pattern.
    formatted and half printed as Markdown is worse than either.
 
    This also narrows the Part 6 math refusal — math in a list now renders, so
-   only tables, quotes, links and images still refuse it.
+   only tables, quotes, links and images still refuse it. A list still reaches
+   the refusal when it *falls back*, which is what the restored test pins.
+
+   **Found by review**, both of them the quiet kind — the page looks
+   plausible and is wrong only on paper:
+
+   - **The question number printed inside the first bullet.** `question_xml`
+     prepends "6. " to the prompt's first paragraph so a wrapped prompt hangs
+     off its own number. When the prompt *opens* with a list, that paragraph
+     carries a `w:numPr` of its own, so the number landed inside the item —
+     and, displacing `ParagraphStyle::Question`, took the question's leading
+     space with it. `opening_paragraphs` now gives the number its own line
+     there and lets the list start underneath.
+   - **`w:startOverride` was pinned to `w:ilvl="0"`.** `w:lvlOverride` names a
+     level, and one naming a level no item carries is ignored outright, so a
+     nested list authored `5.` quietly started at the definition's 1. The
+     level an ordered list's items sit on is now threaded through
+     `Numbering::open` and the override is written against it.
+
+   The `w:numId` a paragraph carries and the one the part defines were also
+   computed by two separate expressions; both now go through `numbering::id_of`,
+   because drift between them resolves a `w:numPr` to nothing, which is a
+   document Word will not open.
 
 8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal
    text in a monospace style. See "Tables in v1" below; folding them together is

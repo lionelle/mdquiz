@@ -891,20 +891,43 @@ mod tests {
         "w:outlineLvl",
     ];
 
-    /// The `w:pPr` child elements of `xml`, in the order they appear.
+    /// The *direct* `w:pPr` child elements of `xml`, in the order they appear.
+    ///
+    /// Direct children only: `w:numPr` carries `w:ilvl` and `w:numId` of its
+    /// own, and those belong to `CT_NumPr` rather than to the `CT_PPrBase`
+    /// sequence [`PPR_ORDER`] describes.
     fn ppr_children(xml: &str) -> Vec<Vec<String>> {
         xml.split("<w:pPr>")
             .skip(1)
             .filter_map(|rest| rest.split_once("</w:pPr>"))
-            .map(|(block, _)| {
-                block
-                    .split('<')
-                    .filter_map(|tag| tag.split([' ', '/', '>']).next())
-                    .filter(|name| name.starts_with("w:"))
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
+            .map(|(block, _)| top_level_tags(block))
             .collect()
+    }
+
+    /// The names of the elements at depth zero in `xml`.
+    fn top_level_tags(xml: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut depth = 0_usize;
+        for piece in xml.split('<').skip(1) {
+            let Some((tag, _)) = piece.split_once('>') else {
+                continue;
+            };
+            let closing = tag.starts_with('/');
+            let name = tag
+                .trim_start_matches('/')
+                .split([' ', '/'])
+                .next()
+                .unwrap_or_default();
+            if !closing && depth == 0 && name.starts_with("w:") {
+                names.push(name.to_owned());
+            }
+            if closing {
+                depth = depth.saturating_sub(1);
+            } else if !tag.ends_with('/') {
+                depth = depth.saturating_add(1);
+            }
+        }
+        names
     }
 
     #[test]
@@ -912,26 +935,48 @@ mod tests {
     /// of order is invalid OOXML that `xmllint --noout` cannot see and Word
     /// refuses the document for — so check the order here, in both the document
     /// and the styles part.
+    ///
+    /// Checked against an exam *with* a list as well as one without: a list
+    /// item is the only paragraph that emits `w:numPr` or `w:ind` at all, so
+    /// two of the nine positions go unvisited otherwise.
     fn paragraph_properties_follow_the_schema_sequence() {
-        let bytes = to_docx(&exam(Some("A"), 2)).expect("renders");
-        for name in ["word/document.xml", "word/styles.xml"] {
-            for children in ppr_children(&part(&bytes, name)) {
-                let positions: Vec<Option<usize>> = children
-                    .iter()
-                    .map(|child| PPR_ORDER.iter().position(|known| known == child))
-                    .collect();
-                assert!(
-                    positions.iter().all(Option::is_some),
-                    "{name}: w:pPr child outside the known order: {children:?}"
-                );
-                let ordered = positions
-                    .windows(2)
-                    .all(|pair| matches!((pair.first(), pair.get(1)), (Some(a), Some(b)) if a < b));
-                assert!(
-                    ordered,
-                    "{name}: w:pPr children out of schema order: {children:?}"
-                );
+        let mut listed = exam(Some("A"), 2);
+        // A marked item, an unmarked continuation and a nested item: between
+        // them they emit every `w:pPr` child the list writer can produce, and
+        // an exam without a list leaves `w:numPr` and `w:ind` unvisited.
+        listed.header = Some("- one\n\n  still one\n\n  - deeper".to_owned());
+        let listed = to_docx(&listed).expect("renders");
+        let document = part(&listed, "word/document.xml");
+        assert!(
+            document.contains("<w:numPr>") && document.contains("<w:ind "),
+            "the fixture no longer lays a list out, so two of the nine \
+             positions go unchecked again: {document}"
+        );
+        for bytes in [to_docx(&exam(Some("A"), 2)).expect("renders"), listed] {
+            for name in ["word/document.xml", "word/styles.xml"] {
+                assert_schema_order(&part(&bytes, name), name);
             }
+        }
+    }
+
+    /// Assert every `w:pPr` in `xml` lists its children in `PPR_ORDER` order.
+    fn assert_schema_order(xml: &str, name: &str) {
+        for children in ppr_children(xml) {
+            let positions: Vec<Option<usize>> = children
+                .iter()
+                .map(|child| PPR_ORDER.iter().position(|known| known == child))
+                .collect();
+            assert!(
+                positions.iter().all(Option::is_some),
+                "{name}: w:pPr child outside the known order: {children:?}"
+            );
+            let ordered = positions
+                .windows(2)
+                .all(|pair| matches!((pair.first(), pair.get(1)), (Some(a), Some(b)) if a < b));
+            assert!(
+                ordered,
+                "{name}: w:pPr children out of schema order: {children:?}"
+            );
         }
     }
 

@@ -223,23 +223,30 @@ fn assert_furniture(rendered: &str) {
     assert!(rendered.contains("Instructions"), "header heading missing");
     assert!(
         rendered.contains("No calculators."),
-        "the header list lost its text"
+        "the header list lost its text: {rendered}"
     );
     assert!(
         rendered.contains("one index card"),
-        "the nested list lost its text"
+        "the nested list lost its text: {rendered}"
     );
     // Both ordered lists must start at 1. Sharing a `w:numId` would make the
     // second continue the first, printing "3." and "4." in the prompt.
     for opener in ["1. Write in ink.", "1. State the rule."] {
         assert!(
             rendered.contains(opener),
-            "an ordered list did not restart: {rendered}"
+            "the ordered list opening {opener:?} did not restart: {rendered}"
         );
     }
     assert!(rendered.contains("End of exam."), "footer missing");
     assert!(rendered.contains("Page 1 of"), "page footer missing");
-    assert!(rendered.contains("Page 2 of 2"), "the page count is wrong");
+    // `${pages}` is resolved by the word processor, so this proves the field
+    // updated rather than printing a stale count. Two pages is simply what this
+    // exam fills today; adding a prompt means updating the number here.
+    assert!(
+        rendered.contains("Page 2 of 2"),
+        "the total-pages field did not resolve, or the sample exam no longer \
+         fills exactly two pages: {rendered}"
+    );
 }
 
 /// Assert every prompt printed as the writer claims to render it.
