@@ -29,6 +29,55 @@ pub(super) enum Marker {
     Ordered(u64),
 }
 
+/// One paragraph's place in a list: which list, how deep, and whether it
+/// prints the marker.
+///
+/// Declared here rather than beside the paragraph writer because all three
+/// fields are `numbering.xml`'s — a `w:numId`, a `w:ilvl`, and whether the
+/// `w:numPr` binding them is emitted at all — and because this is the one
+/// place that knows what those resolve against.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Item {
+    /// The `w:numId` of the list this paragraph counts in.
+    pub(super) list: u32,
+    /// The nesting depth, as `w:ilvl`, clamped to [`MAX_LEVEL`].
+    pub(super) level: u8,
+    /// Whether the marker sits on this paragraph.
+    ///
+    /// An item may hold several paragraphs, and only the first is bulleted or
+    /// numbered. Marking the rest would print an item's own second paragraph
+    /// as a second item.
+    pub(super) marked: bool,
+}
+
+impl Item {
+    /// The `w:numPr` binding this paragraph to its list, or nothing when the
+    /// paragraph carries no marker.
+    pub(super) fn marker(self) -> String {
+        if !self.marked {
+            return String::new();
+        }
+        format!(
+            r#"<w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{list}"/></w:numPr>"#,
+            level = self.level,
+            list = self.list,
+        )
+    }
+
+    /// The `w:ind` this paragraph needs of its own, or nothing when its
+    /// `w:numPr` already supplies one.
+    ///
+    /// A marked paragraph takes its indent from the level definition. An
+    /// unmarked one carries no `w:numPr`, so it inherits nothing from the
+    /// level and has to be told the same number by hand.
+    pub(super) fn indent(self) -> String {
+        if self.marked {
+            return String::new();
+        }
+        format!(r#"<w:ind w:left="{}"/>"#, indent(usize::from(self.level)))
+    }
+}
+
 /// The `w:abstractNumId` of the bulleted definition.
 const BULLET_ABSTRACT: u32 = 0;
 
@@ -54,11 +103,12 @@ const INDENT: u32 = 720;
 
 /// The left indent, in twips, of a list item's text at `level`.
 ///
-/// Shared with the paragraph writer because a *continuation* paragraph — an
-/// item's second paragraph, which must not repeat the marker — carries no
-/// `w:numPr`, and so inherits none of the level's indent. It has to be told
-/// the same number, or it hangs out to the left of the item it belongs to.
-pub(super) fn indent(level: usize) -> u32 {
+/// Used twice here, and that is the point of naming it: [`level_xml`] puts it
+/// in the level definition a `w:numPr` resolves against, and [`Item::indent`]
+/// gives the same number to a paragraph that carries no `w:numPr` and so
+/// inherits nothing from the level. Drifting apart leaves an item's second
+/// paragraph hanging to the left of its first.
+fn indent(level: usize) -> u32 {
     INDENT.saturating_mul(u32::try_from(level).unwrap_or(u32::MAX).saturating_add(1))
 }
 

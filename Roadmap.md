@@ -406,6 +406,15 @@ existing pattern.
    that they agree; drifting apart leaves an item's second paragraph hanging
    to the left of its first.
 
+   **What a list-item paragraph is lives in one place.** `numbering::Item`
+   holds the three fields — `w:numId`, `w:ilvl`, and whether the marker
+   prints — and emits its own `w:numPr` and `w:ind`. They were previously
+   spelled out in four (`inline::Kind::Item`, `ParagraphStyle::Item`,
+   `item_properties`, and an `item_kind` constructor), so adding an attribute
+   to a list item meant four edits that nothing made fail together. `docx.rs`
+   keeps only the `CT_PPrBase` ordering, which is the container's business;
+   `indent`, `INDENT` and `HANGING` are private to `numbering` again.
+
    The fallback rule is unchanged and now has a sharper edge: one item the
    writer cannot lay out sends the *whole* list back to source. Half a list
    formatted and half printed as Markdown is worse than either.

@@ -36,7 +36,7 @@ use std::ops::Range;
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
-use super::numbering::{MAX_LEVEL, Marker, Numbering};
+use super::numbering::{Item, MAX_LEVEL, Marker, Numbering};
 use super::omml::{self, Display};
 use crate::export::escape_xml;
 use crate::{Error, Result};
@@ -62,19 +62,8 @@ pub(super) enum Kind {
     /// — a question number, in particular — may apply it. See
     /// [`Paragraph::centred`].
     Equation,
-    /// A paragraph inside a list item.
-    Item {
-        /// The `w:numId` of the list it counts in.
-        numbering: u32,
-        /// Its nesting depth, as `w:ilvl`.
-        level: u8,
-        /// Whether it is the paragraph the marker sits on.
-        ///
-        /// An item may hold several paragraphs, and only the first is
-        /// bulleted or numbered. Marking the rest would print an item's own
-        /// second paragraph as a second item.
-        marked: bool,
-    },
+    /// A paragraph inside a list item, in the list [`Item`] names.
+    Item(Item),
 }
 
 /// One rendered paragraph.
@@ -95,7 +84,7 @@ impl Paragraph {
     pub(super) fn centred(&self) -> String {
         match self.kind {
             Kind::Equation => format!("<m:oMathPara>{}</m:oMathPara>", self.runs),
-            Kind::Prose | Kind::Heading(_) | Kind::Item { .. } => self.runs.clone(),
+            Kind::Prose | Kind::Heading(_) | Kind::Item(_) => self.runs.clone(),
         }
     }
 }
@@ -258,9 +247,12 @@ fn inside<'a>(events: &mut impl Iterator<Item = (Event<'a>, Range<usize>)>) -> V
     let mut inner = Vec::new();
     for (event, _) in events {
         match event {
-            Event::Start(_) => depth += 1,
+            Event::Start(_) => depth = depth.saturating_add(1),
             Event::End(_) => {
-                depth -= 1;
+                // Saturating, as in `nested`: the two count the same tags to
+                // the same rule, and the `break` is the only reason a bare
+                // decrement cannot go below zero here.
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
                     break;
                 }
@@ -330,8 +322,13 @@ fn list(
 ) -> Result<Option<Vec<Paragraph>>> {
     let id = numbering.open(marker, level);
     let mut rendered = Vec::new();
-    for item in items(events) {
-        let Some(paragraphs) = item_paragraphs(item, id, level, numbering)? else {
+    for item_events in items(events) {
+        let item = Item {
+            list: id,
+            level,
+            marked: true,
+        };
+        let Some(paragraphs) = item_paragraphs(item_events, item, numbering)? else {
             return Ok(None);
         };
         rendered.extend(paragraphs);
@@ -347,29 +344,27 @@ fn list(
 /// rendered.
 fn item_paragraphs(
     events: &[Event<'_>],
-    id: u32,
-    level: u8,
+    mut item: Item,
     numbering: &mut Numbering,
 ) -> Result<Option<Vec<Paragraph>>> {
-    let mut marked = true;
     let mut rendered = Vec::new();
     let segments = segments(events);
     if !matches!(segments.first(), Some(Segment::Text(_))) {
-        rendered.push(empty_marker(id, level));
-        marked = false;
+        rendered.push(empty_marker(item));
+        item.marked = false;
     }
     for segment in segments {
         match segment {
             Segment::Text(events) => {
-                let kind = item_kind(id, level, marked);
+                let kind = Kind::Item(item);
                 let Some(runs) = runs(events, kind)? else {
                     return Ok(None);
                 };
                 rendered.push(Paragraph { kind, runs });
-                marked = false;
+                item.marked = false;
             }
             Segment::Nested(nested, events) => {
-                let deeper = level.saturating_add(1).min(MAX_LEVEL);
+                let deeper = item.level.saturating_add(1).min(MAX_LEVEL);
                 let Some(paragraphs) = list(events, nested, deeper, numbering)? else {
                     return Ok(None);
                 };
@@ -386,19 +381,10 @@ fn item_paragraphs(
 /// Without it the item vanishes: the list comes out a line shorter, and in a
 /// numbered one every item after it moves up, so `1.` followed by
 /// `2. second` prints "second" as item 1.
-fn empty_marker(id: u32, level: u8) -> Paragraph {
+fn empty_marker(item: Item) -> Paragraph {
     Paragraph {
-        kind: item_kind(id, level, true),
+        kind: Kind::Item(item),
         runs: String::new(),
-    }
-}
-
-/// The kind of one paragraph in list `id` at depth `level`.
-const fn item_kind(id: u32, level: u8, marked: bool) -> Kind {
-    Kind::Item {
-        numbering: id,
-        level,
-        marked,
     }
 }
 
@@ -487,7 +473,7 @@ fn nested<'a, 'e>(events: &'a [Event<'e>], start: usize) -> (&'a [Event<'e>], us
 fn runs(events: &[Event<'_>], kind: Kind) -> Result<Option<String>> {
     let display = match kind {
         Kind::Equation => Display::Block,
-        Kind::Prose | Kind::Heading(_) | Kind::Item { .. } => Display::Inline,
+        Kind::Prose | Kind::Heading(_) | Kind::Item(_) => Display::Inline,
     };
     let mut xml = String::new();
     let mut marks = Marks::default();
@@ -838,7 +824,7 @@ mod tests {
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         for block in &rendered {
             assert!(
-                matches!(block.kind, Kind::Item { level: 0, .. }),
+                matches!(block.kind, Kind::Item(Item { level: 0, .. })),
                 "{block:?}"
             );
             assert!(!block.runs.contains('-'), "the marker is text: {block:?}");
@@ -868,7 +854,7 @@ mod tests {
         let levels: Vec<u8> = rendered
             .iter()
             .filter_map(|block| match block.kind {
-                Kind::Item { level, .. } => Some(level),
+                Kind::Item(item) => Some(item.level),
                 _ => None,
             })
             .collect();
@@ -883,7 +869,7 @@ mod tests {
         let marks: Vec<bool> = rendered
             .iter()
             .filter_map(|block| match block.kind {
-                Kind::Item { marked, .. } => Some(marked),
+                Kind::Item(item) => Some(item.marked),
                 _ => None,
             })
             .collect();
@@ -900,7 +886,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .all(|block| matches!(block.kind, Kind::Item { marked: true, .. })),
+                .all(|block| matches!(block.kind, Kind::Item(Item { marked: true, .. }))),
             "{rendered:?}"
         );
     }
@@ -913,7 +899,7 @@ mod tests {
         let levels: Vec<u8> = rendered
             .iter()
             .filter_map(|block| match block.kind {
-                Kind::Item { level, .. } => Some(level),
+                Kind::Item(item) => Some(item.level),
                 _ => None,
             })
             .collect();
@@ -978,7 +964,7 @@ mod tests {
         blocks
             .iter()
             .filter_map(|block| match block.kind {
-                Kind::Item { level, .. } => Some(level),
+                Kind::Item(item) => Some(item.level),
                 _ => None,
             })
             .collect()
@@ -1012,7 +998,7 @@ mod tests {
         let shape: Vec<(u8, bool)> = blocks
             .iter()
             .filter_map(|block| match block.kind {
-                Kind::Item { level, marked, .. } => Some((level, marked)),
+                Kind::Item(item) => Some((item.level, item.marked)),
                 _ => None,
             })
             .collect();

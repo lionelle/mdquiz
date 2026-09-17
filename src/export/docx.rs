@@ -34,7 +34,7 @@ use std::fmt::Write as _;
 
 use crate::Result;
 use crate::export::docx::inline::Kind;
-use crate::export::docx::numbering::Numbering;
+use crate::export::docx::numbering::{Item, Numbering};
 use crate::export::zip_package;
 use crate::quiz::exam::{Exam, ExamItem};
 use crate::quiz::spec::{TEMPLATE_CLOSE, TEMPLATE_OPEN, TemplateKey};
@@ -324,7 +324,7 @@ fn opening_paragraphs(lead: &str, first: Option<inline::Paragraph>) -> String {
     let Some(first) = first else {
         return paragraph(lead, ParagraphStyle::Question);
     };
-    if matches!(first.kind, Kind::Item { .. }) {
+    if matches!(first.kind, Kind::Item(_)) {
         return paragraph(lead, ParagraphStyle::Question)
             + &paragraph(
                 &first.runs,
@@ -404,7 +404,7 @@ fn prose(markdown: &str, lists: &mut Numbering) -> Result<String> {
         // An empty *list item* is kept: it is a bullet with nothing after
         // it, and dropping it renumbers everything below. Anything else with
         // no runs is a blank paragraph nobody authored.
-        .filter(|block| !block.runs.is_empty() || matches!(block.kind, Kind::Item { .. }))
+        .filter(|block| !block.runs.is_empty() || matches!(block.kind, Kind::Item(_)))
         .map(|block| paragraph(&block.centred(), ParagraphStyle::Body.or_block(block.kind)))
         .collect())
 }
@@ -423,18 +423,14 @@ enum ParagraphStyle {
     Continuation,
     /// A Markdown heading, at the given level.
     Heading(u8),
-    /// A list item, counting in `numbering` at depth `level`.
+    /// A list item, in the list [`Item`] names.
     ///
     /// `sticky` is inherited from the style the caller asked for, so a list
     /// inside a prompt holds together with its answer space while one in the
     /// exam's header is free to break across a page.
     Item {
-        /// The `w:numId` the item counts in.
-        numbering: u32,
-        /// The nesting depth, as `w:ilvl`.
-        level: u8,
-        /// Whether this paragraph carries the item's marker.
-        marked: bool,
+        /// Which list the paragraph counts in, and how it is marked.
+        item: Item,
         /// Whether the item is held to the paragraph after it.
         sticky: bool,
     },
@@ -451,14 +447,8 @@ impl ParagraphStyle {
     const fn or_block(self, kind: Kind) -> Self {
         match kind {
             Kind::Heading(level) => Self::Heading(level),
-            Kind::Item {
-                numbering,
-                level,
-                marked,
-            } => Self::Item {
-                numbering,
-                level,
-                marked,
+            Kind::Item(item) => Self::Item {
+                item,
                 sticky: self.is_sticky(),
             },
             Kind::Prose | Kind::Equation => self,
@@ -486,12 +476,7 @@ impl ParagraphStyle {
                 format!(r#"{STICKY}<w:spacing w:before="120" w:after="120"/>"#)
             }
             Self::Heading(level) => format!(r#"<w:pStyle w:val="{}"/>"#, heading_style(level)),
-            Self::Item {
-                numbering,
-                level,
-                marked,
-                sticky,
-            } => item_properties(numbering, level, marked, sticky),
+            Self::Item { item, sticky } => item_properties(item, sticky),
         }
     }
 }
@@ -506,30 +491,19 @@ const STICKY: &str = "<w:keepNext/><w:keepLines/>";
 
 /// The `w:pPr` of one list-item paragraph.
 ///
-/// A marked paragraph gets `w:numPr` and takes its indent from the numbering
-/// definition. An unmarked one — an item's second and later paragraphs — has
-/// to be indented by hand to the same place, since without `w:numPr` it
-/// inherits nothing from the level.
-///
-/// `CT_PPrBase` is a sequence: `keepNext`, `keepLines`, `numPr`, `spacing`,
-/// `ind`.
-fn item_properties(numbering: u32, level: u8, marked: bool, sticky: bool) -> String {
+/// The marker and the indent are [`Item`]'s to describe; what belongs here is
+/// the order they go in. `CT_PPrBase` is a sequence — `keepNext`, `keepLines`,
+/// `numPr`, `spacing`, `ind` — so the container's own spacing is interleaved
+/// between the two pieces rather than appended after them.
+fn item_properties(item: Item, sticky: bool) -> String {
     let mut properties = if sticky {
         STICKY.to_owned()
     } else {
         String::new()
     };
-    if marked {
-        let _ = write!(
-            properties,
-            r#"<w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{numbering}"/></w:numPr>"#
-        );
-    }
+    properties.push_str(&item.marker());
     properties.push_str(r#"<w:spacing w:after="60"/>"#);
-    if !marked {
-        let indent = numbering::indent(usize::from(level));
-        let _ = write!(properties, r#"<w:ind w:left="{indent}"/>"#);
-    }
+    properties.push_str(&item.indent());
     properties
 }
 
@@ -1368,8 +1342,13 @@ mod tests {
     /// both, and `CT_PPrBase` fixes the order they appear in.
     fn an_item_paragraph_is_marked_or_indented_but_never_both() {
         for (level, marked, sticky, expected) in ITEM_SHAPES {
+            let item = Item {
+                list: 7,
+                level,
+                marked,
+            };
             assert_eq!(
-                item_properties(7, level, marked, sticky),
+                item_properties(item, sticky),
                 expected,
                 "level {level}, marked {marked}, sticky {sticky}"
             );
