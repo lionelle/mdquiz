@@ -73,7 +73,7 @@ fn sample_exam() -> Exam {
 /// Every entry is something the writer handles differently: escaping, inline
 /// math, display math and a multi-paragraph prompt. Written as prompts on a
 /// real exam rather than as a test fixture, so the converted PDF can be read.
-const PROMPTS: [&str; 7] = [
+const PROMPTS: [&str; 8] = [
     "Is statement 0 true? Consider <a> & \"b\".",
     r"Sort in $O(n \log n)$ time and say **why** it is not $O(n)$.",
     r"Evaluate $$\sum_{i=1}^{n} i^2$$ in closed form.",
@@ -81,6 +81,11 @@ const PROMPTS: [&str; 7] = [
     "Prove the identity:\n\n$$e^{i\\pi} + 1 = 0$$",
     "Answer both parts:\n\n1. State the rule.\n\n   Then name it.\n2. Apply it to $n = 2^{10}$.",
     "Rank these, slowest first:\n\n- bubble sort\n- merge sort\n- counting sort",
+    // A code block and a pipe table: the two constructs set preformatted
+    // rather than laid out. Both are here so the converter reads a document
+    // holding them, and so the rows and the indent are checked on a real page.
+    "Trace the loop and complete the table:\n\n```\nfor i in 0..n:\n    total += i\n```\n\n\
+     | n | total |\n|---|-------|\n| 3 |       |",
 ];
 
 /// One true/false item asking the `n`th prompt.
@@ -154,6 +159,32 @@ fn every_part_is_well_formed_xml() {
     for (name, contents) in parts {
         assert_well_formed(dir.path(), &name, &contents);
     }
+}
+
+#[test]
+/// A preformatted block reaches `document.xml` with its whitespace intact and
+/// in the code style.
+///
+/// Pinned on the XML rather than on the converted page because `LibreOffice`'s
+/// plain-text filter collapses runs of spaces: the conversion can show that
+/// the code block is *there* and says nothing about its indent. Alignment is
+/// the whole reason these blocks are set preformatted, so it is checked where
+/// it is actually observable — and this test runs in the gate, while the
+/// conversion is `#[ignore]`d.
+fn a_preformatted_block_keeps_its_whitespace_in_the_xml() {
+    let document = sample_document();
+    assert!(
+        document.contains(">    total += i<"),
+        "the code block lost its indent: {document}"
+    );
+    assert!(
+        document.contains("| 3 |       |"),
+        "the table lost its column padding: {document}"
+    );
+    assert!(
+        document.contains(r#"<w:rStyle w:val="Code"/>"#),
+        "the preformatted block is not monospace: {document}"
+    );
 }
 
 /// Convert `docx` to a PDF beside it, returning that path.
@@ -276,4 +307,26 @@ fn assert_prompts(rendered: &str) {
         rendered.contains("Then prove it is maintained."),
         "a prompt's second paragraph is missing: {rendered}"
     );
+    // Preformatted blocks reach the page as separate lines rather than one
+    // run-on line, which is what the explicit `w:br` runs buy. Only the
+    // *content* is checked here: LibreOffice's plain-text filter collapses
+    // runs of spaces, so the indent and the column padding are pinned on the
+    // XML instead, by `a_preformatted_block_keeps_its_whitespace_in_the_xml`.
+    assert!(
+        rendered.contains("total += i"),
+        "the code block is missing from the page: {rendered}"
+    );
+    assert!(
+        rendered.contains("| n | total |"),
+        "the table lost its row: {rendered}"
+    );
+}
+
+/// The `word/document.xml` of the sample exam.
+fn sample_document() -> String {
+    package_parts()
+        .into_iter()
+        .find(|(name, _)| name == "word/document.xml")
+        .map(|(_, contents)| String::from_utf8_lossy(&contents).into_owned())
+        .expect("the package holds word/document.xml")
 }

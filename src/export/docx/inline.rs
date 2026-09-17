@@ -13,7 +13,9 @@
 //! Every other block — tables, code blocks, images — is **refused** rather
 //! than dropped: a block this module cannot render is emitted as its own
 //! Markdown source, so a table prints as `| a | b |` instead of silently
-//! losing its columns. That fallback is the same stopgap the print sheet
+//! losing its columns. Tables and code blocks, whose alignment carries
+//! meaning, are set in [`CODE_STYLE`] so the columns and the indent survive;
+//! every other refused block keeps the body face. That fallback is the same stopgap the print sheet
 //! already ships for tables — text that looks like text, which an instructor
 //! can see and work around. One item a list cannot lay out sends the *whole*
 //! list back to source, because half a list formatted and half printed as
@@ -41,11 +43,11 @@ use super::omml::{self, Display};
 use crate::export::escape_xml;
 use crate::{Error, Result};
 
-/// The character style inline code spans are set in.
+/// The character style inline code spans and preformatted blocks are set in.
 ///
 /// A style reference rather than a `w:rFonts` on every run: the preformatted
-/// *block* writer needs the same face, and one definition keeps the two from
-/// drifting apart.
+/// *block* writer uses the same face (see [`Face::properties`]), and one
+/// definition keeps the two from drifting apart.
 pub(super) const CODE_STYLE: &str = "Code";
 
 /// What a rendered paragraph is, beyond the runs it holds.
@@ -135,6 +137,10 @@ enum Block<'a> {
     /// A list, carried as the events inside it. Unlike the others it yields
     /// several paragraphs — one per item, and more where an item holds more.
     List(Marker, Vec<Event<'a>>),
+    /// A code block or a pipe table, carried as the events inside it. Printed
+    /// as its own source in a monospace face — not a fallback from a richer
+    /// rendering, but how v1 renders these two.
+    Preformatted(Vec<Event<'a>>),
     /// Any other block: printed as its own source, never rendered. Its events
     /// are kept all the same, because math among them is refused rather than
     /// printed.
@@ -142,8 +148,9 @@ enum Block<'a> {
 }
 
 impl Block<'_> {
-    /// Append this block's paragraphs to `out`, falling back to `source` if
-    /// its inline structure cannot be rendered.
+    /// Append this block's paragraphs to `out`, falling back to `source` where
+    /// its inline structure cannot be rendered — and printing `source` outright
+    /// for the blocks that are always set that way.
     ///
     /// # Errors
     ///
@@ -155,7 +162,7 @@ impl Block<'_> {
         numbering: &mut Numbering,
         out: &mut Vec<Paragraph>,
     ) -> Result<()> {
-        let events = match self {
+        let (events, face) = match self {
             Self::Prose(kind, events) => match runs(&events, kind)? {
                 Some(runs) => {
                     out.push(Paragraph { kind, runs });
@@ -163,21 +170,22 @@ impl Block<'_> {
                 }
                 // The markers are what prints now, so it is no longer a
                 // heading: `## Part *2*` falls back as `## Part *2*`.
-                None => events,
+                None => (events, Face::Body),
             },
             Self::List(marker, events) => match list(&events, marker, 0, numbering)? {
                 Some(paragraphs) => {
                     out.extend(paragraphs);
                     return Ok(());
                 }
-                None => events,
+                None => (events, Face::Body),
             },
-            Self::Literal(events) => events,
+            Self::Preformatted(events) => (events, Face::Code),
+            Self::Literal(events) => (events, Face::Body),
         };
         refuse_math(&events)?;
         out.push(Paragraph {
             kind: Kind::Prose,
-            runs: literal(source),
+            runs: literal(source, &face.properties()),
         });
         Ok(())
     }
@@ -204,6 +212,9 @@ fn blocks(source: &str) -> Vec<(Range<usize>, Block<'_>)> {
             Event::Start(Tag::List(first)) => {
                 let marker = first.map_or(Marker::Bullet, Marker::Ordered);
                 blocks.push((range, Block::List(marker, inside(&mut events))));
+            }
+            Event::Start(Tag::CodeBlock(_) | Tag::Table(_)) => {
+                blocks.push((range, Block::Preformatted(inside(&mut events))));
             }
             Event::Start(_) => blocks.push((range, Block::Literal(inside(&mut events)))),
             // Nothing else needs an arm. Every inline event is wrapped in a
@@ -290,7 +301,7 @@ fn push_gap(rendered: &mut Vec<Paragraph>, source: &str) {
     if !source.trim().is_empty() {
         rendered.push(Paragraph {
             kind: Kind::Prose,
-            runs: literal(source),
+            runs: literal(source, ""),
         });
     }
 }
@@ -607,12 +618,38 @@ fn run(text: &str, properties: &str) -> String {
     )
 }
 
-/// A block this writer cannot render, as runs of its own Markdown source.
+/// Which character face a block printed as its own source is set in.
+#[derive(Debug, Clone, Copy)]
+enum Face {
+    /// The body face, for a block that merely falls back to source.
+    Body,
+    /// The monospace face, for a block set preformatted on purpose.
+    Code,
+}
+
+impl Face {
+    /// The `w:rPr` every line of the block carries.
+    ///
+    /// The code face is built through the same [`Marks`] path an inline
+    /// `` `code` `` span takes, so the block face and the span face resolve to
+    /// one `w:rStyle` and cannot drift apart.
+    fn properties(self) -> String {
+        match self {
+            Self::Body => String::new(),
+            Self::Code => Marks::default().as_code().properties(),
+        }
+    }
+}
+
+/// A block printed as its own Markdown source, one run per line.
 ///
 /// Line breaks are explicit: a `w:p` collapses newlines, so a list or a pipe
 /// table would otherwise arrive as one run-on line and lose the alignment
 /// that makes it readable at all.
-fn literal(source: &str) -> String {
+///
+/// `properties` is the `w:rPr` every line carries — empty for a block falling
+/// back to source, [`code_marks`] for one set preformatted on purpose.
+fn literal(source: &str, properties: &str) -> String {
     // Blank lines are trimmed from both ends, but *only* newlines from the
     // front: a gap between two blocks starts with the newline that ended the
     // last one, and stripping spaces as well would de-indent a code block —
@@ -621,7 +658,7 @@ fn literal(source: &str) -> String {
         .trim_end()
         .trim_start_matches('\n')
         .lines()
-        .map(text_run)
+        .map(|line| run(line, properties))
         .collect::<Vec<_>>()
         .join("<w:r><w:br/></w:r>")
 }
@@ -957,6 +994,14 @@ mod tests {
             block.runs.contains("make all"),
             "the code was lost: {block:?}"
         );
+        // Deliberate: only a *top-level* code block or table is set
+        // preformatted. Here the whole list falls back together, and setting
+        // an entire list in the code face to carry one fenced block in it
+        // would misreport the prose items around it as code.
+        assert!(
+            !block.runs.contains(r#"<w:rStyle w:val="Code"/>"#),
+            "a list falling back is body face, not code: {block:?}"
+        );
     }
 
     /// The `w:ilvl` of every list-item paragraph in `blocks`, in order.
@@ -1044,6 +1089,89 @@ mod tests {
     }
 
     #[test]
+    /// A code block and a pipe table are set in the monospace character
+    /// style. This is the whole of what makes the fallback usable: a pipe
+    /// table in a proportional face loses column alignment entirely, and so
+    /// does the indentation of a code block.
+    fn a_preformatted_block_is_set_in_the_code_style() {
+        for source in [
+            "| a | b |\n|---|---|\n| 1 | 2 |",
+            "```\nlet x = 1;\n```",
+            // An info string is part of the fence line, which prints too.
+            "```rust\nlet x = 1;\n```",
+            "    let x = 1;",
+            "```\n```",
+        ] {
+            let runs = only(source);
+            assert!(
+                runs.contains(r#"<w:rStyle w:val="Code"/>"#),
+                "{source} is not monospace: {runs}"
+            );
+        }
+    }
+
+    #[test]
+    /// Every line of a preformatted block carries the style, not just the
+    /// first. Word applies a `w:rStyle` per run, and the block is one run per
+    /// line, so styling only the opening run leaves a table with its first
+    /// row aligned and the rest not.
+    fn every_line_of_a_preformatted_block_carries_the_style() {
+        let runs = only("| a | b |\n|---|---|\n| 1 | 2 |");
+        assert_eq!(
+            runs.matches(r#"<w:rStyle w:val="Code"/>"#).count(),
+            3,
+            "{runs}"
+        );
+    }
+
+    #[test]
+    /// A block that merely *falls back* to source is not preformatted. A
+    /// quote or a link is prose the writer cannot lay out, not something
+    /// whose alignment carries meaning, and setting it in Consolas would
+    /// misreport it to the reader as code.
+    fn a_block_that_only_falls_back_is_not_monospace() {
+        for source in [
+            "> recall the rule",
+            "see [the handout](http://a.example)",
+            "see ![alt](plot.png)",
+            "<div>see the handout</div>",
+        ] {
+            let runs = only(source);
+            assert!(
+                !runs.contains(r#"<w:rStyle w:val="Code"/>"#),
+                "{source} was set as code: {runs}"
+            );
+        }
+    }
+
+    #[test]
+    /// Math inside a fenced code block prints as source, and that is correct:
+    /// inside a fence `$x^2$` *is* the code. The no-degrading rule is about
+    /// math the author meant as math, and pulldown reports a fence's content
+    /// as plain text, so `refuse_math` never sees a math event here. Pinned
+    /// because a change that re-parsed a fence's content would start refusing
+    /// exports that are fine today.
+    fn math_inside_a_fence_is_code_not_math() {
+        let runs = only("```\n$x^2$\n```");
+        assert!(runs.contains("$x^2$"), "{runs}");
+    }
+
+    #[test]
+    /// A tab in a preformatted block reaches `w:t` as a tab character.
+    ///
+    /// Pinned rather than endorsed. `WordprocessingML` represents a tab stop
+    /// with `<w:tab/>`, and Word's own writer never puts a raw tab in run
+    /// text, so a tab-indented code block may not align the way a
+    /// space-indented one does. `escape_xml` passes tabs through deliberately,
+    /// and a block is one run per line, so emitting `<w:tab/>` would mean
+    /// splitting the line. Left as is until a real page says it is wrong —
+    /// this test is here so the change is noticed when it happens.
+    fn a_tab_in_a_preformatted_block_survives_as_a_tab() {
+        let runs = only("```\n\tlet x = 1;\n```");
+        assert!(runs.contains(">\tlet x = 1;<"), "{runs:?}");
+    }
+
+    #[test]
     /// A pipe table keeps its rows on separate lines, which is the whole of
     /// what makes it readable as a table.
     fn a_table_falls_back_line_by_line() {
@@ -1085,10 +1213,16 @@ mod tests {
         let rendered = rendered("text\n| a |\n|---|\n| b |").expect("renders");
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         let table = rendered.last().expect("two paragraphs");
-        assert!(
-            table
-                .runs
-                .starts_with(r#"<w:r><w:t xml:space="preserve">| a |</w:t>"#),
+        // The text of the first run, whatever `w:rPr` it carries: a table is
+        // set preformatted, so asserting the bare `<w:r><w:t>` shape here
+        // would pin the face rather than the boundary this test is about.
+        let first = table
+            .runs
+            .split_once("</w:t>")
+            .and_then(|(head, _)| head.rsplit_once('>'))
+            .map_or_else(String::new, |(_, text)| text.to_owned());
+        assert_eq!(
+            first, "| a |",
             "the paragraph bled into the table: {table:?}"
         );
     }

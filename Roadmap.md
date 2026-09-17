@@ -444,9 +444,42 @@ existing pattern.
    because drift between them resolves a `w:numPr` to nothing, which is a
    document Word will not open.
 
-8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal
-   text in a monospace style. See "Tables in v1" below; folding them together is
-   what removes a whole part from this plan.
+8. **Preformatted blocks.** *Done* — code blocks *and* tables are emitted as
+   literal text in the monospace `Code` character style. See "Tables in v1"
+   below; folding them together is what removed a whole part from this plan.
+
+   Half of this had already landed for Part 7's list fallback: `literal` joins
+   lines with explicit `<w:r><w:br/></w:r>` runs, because a `w:p` collapses
+   newlines and a multi-row table would otherwise arrive as one run-on line.
+   What Part 8 adds is the face. `Block::Preformatted` is the two constructs
+   that are *set* this way rather than falling back to it, so a quote or a
+   link still prints in the body face rather than being misreported as code.
+   The run properties are built through the same `Marks` path an inline code
+   span takes, so the block face and the span face resolve to one `w:rStyle`.
+
+   **Only a top-level block is set this way.** A code block or table inside a
+   list item rides along in the list's own fallback, which prints the whole
+   list as source in the body face — setting an entire list in the code face
+   to carry one fenced block would misreport the prose items around it. Both
+   the test and `docs/quizzes.md` say so, so it is a decision rather than an
+   accident.
+
+   **Known gap: tabs.** `WordprocessingML` represents a tab stop with
+   `<w:tab/>`, and a block is written one run per line, so a tab-indented code
+   block reaches `w:t` as a raw tab character. `escape_xml` passes tabs
+   through deliberately and the document is well-formed, but a tab may not
+   align the way the equivalent spaces do. Pinned by
+   `a_tab_in_a_preformatted_block_survives_as_a_tab` rather than changed,
+   because emitting `<w:tab/>` means splitting a line into several runs and no
+   real page has yet said the current output is wrong.
+
+   **Whitespace is pinned on the XML, not on the converted page.**
+   `LibreOffice`'s plain-text filter collapses runs of spaces, so the
+   conversion shows a code block is *present* and says nothing about its
+   indent — it reported `total += i` for a line authored with four leading
+   spaces, and `|3|` for a padded table cell. The document itself is correct;
+   `a_preformatted_block_keeps_its_whitespace_in_the_xml` checks it where it
+   is observable, and runs in the gate rather than behind `#[ignore]`.
 9. **The six question kinds** + the answer-key document. This is where the
    matching/ordering freeze gap closes: their presented order is currently
    derived inside `export/markdown.rs` at render time rather than stored, so

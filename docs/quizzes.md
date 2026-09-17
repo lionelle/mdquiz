@@ -177,16 +177,32 @@ intact:
 | merge sort | n log n |
 ```
 
-prints as three lines still carrying their pipes. This is deliberate: a table
-that is *visibly* unformatted is something you can see and work around, where
-one silently flattened into a run-on line is not. The same blocks render
-properly on the Canvas export; the print sheet catches up over the releases
-tracked in [`../Roadmap.md`](../Roadmap.md).
+prints as three lines still carrying their pipes.
+
+**Tables and code blocks are set in a monospace face.** Those two are the
+blocks whose alignment carries meaning — a pipe table in a proportional font
+loses its columns entirely, and so does the indentation of a code block — so
+they print in the same face as an inline `` `code` `` span. The other blocks
+that fall back keep the body face: a quote or a link is prose the writer
+cannot lay out, not something to misreport as code.
+
+This is deliberate: a table that is *visibly* unformatted is something you can
+see and work around, where one silently flattened into a run-on line is not.
+The same blocks render properly on the Canvas export, which builds real
+bordered HTML tables; that divergence is accepted for now, and the print sheet
+catches up over the releases tracked in [`../Roadmap.md`](../Roadmap.md).
 
 Note that inline formatting inside such a block is printed too — a
-`~~struck~~` table cell shows its tildes — because the whole block falls back
-together. A list holding a link is the same: one item the writer cannot lay
-out sends the whole list back to source, rather than formatting half of it.
+`~~struck~~` table cell shows its tildes — because the whole block is printed
+as source together. A list holding a link is the same: one item the writer
+cannot lay out sends the whole list back to source, rather than formatting
+half of it.
+
+A code block or table written *inside a list item* is part of that fallback:
+the whole list prints as source in the body face, not the monospace one.
+Setting an entire list in a monospace face to carry one fenced block would
+misreport every prose item around it as code. Write the block at the top
+level, outside the list, if you need its alignment kept.
 
 **Math is the exception, and it is never printed as source.** The export
 **fails**, naming the expression, if:
