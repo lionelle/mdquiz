@@ -12,6 +12,7 @@
 
 use std::io::{Cursor, Write as _};
 
+use pulldown_cmark::Options;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
@@ -20,6 +21,17 @@ use crate::Result;
 pub mod canvas;
 pub mod docx;
 pub mod markdown;
+
+/// The Markdown dialect the exporters that parse Markdown read.
+///
+/// Shared rather than built per call site: what a prompt *means* cannot differ
+/// between the Canvas package and the Word document. Turning an extension on
+/// for one and not the other makes the same file two questions. The print
+/// *Markdown* sheet is not a reader — it interpolates the authored source
+/// verbatim — and `parse.rs` needs only front-matter, so neither uses this.
+pub(crate) const MARKDOWN: Options = Options::ENABLE_TABLES
+    .union(Options::ENABLE_STRIKETHROUGH)
+    .union(Options::ENABLE_MATH);
 
 /// Escape `text` for inclusion in an XML text node or attribute value.
 ///

@@ -131,6 +131,69 @@ The delimiter is `${...}`, **not** `{{...}}`, because `{{name}}` is already the
 became a question partial would otherwise sprout blanks where it meant to name
 the exam.
 
+## What your Markdown looks like on the printed sheet
+
+The spec's `header:` and `footer:` files and every question prompt are
+Markdown, and the Word document renders them as formatting rather than
+printing the markers. (`page_footer` is the exception: it is plain text plus
+`${...}` placeholders, not Markdown.)
+
+**Rendered as formatting:**
+
+| You write | You get |
+|---|---|
+| `**bold**` | **bold** |
+| `*italic*` | *italic* |
+| `~~struck~~` | struck-through text |
+| `` `code` `` | a monospace span |
+| `# Heading` … `### Heading` | Word's built-in Heading 1–3 styles |
+| `$x^2$`, `$$…$$` | a real Word equation |
+
+Headings deeper than `###` are set as Heading 3. Because the built-in styles
+are used, headings also appear in Word's navigation pane and in a generated
+table of contents.
+
+Math becomes a genuine Word equation, not a picture: it is selectable,
+searchable, and editable in Word. Display math (`$$…$$`) written on a line of
+its own is centred on that line. Written mid-sentence, or as the whole of a
+question's first line, it stays inline — centring it there would drag the
+sentence, or the question's number, into the middle of the page.
+
+**Printed as you typed it** — lists, tables, block quotes, links, images,
+fenced and indented code blocks, horizontal rules and raw HTML are not laid
+out yet, so the block appears as its own Markdown source, indentation and line
+breaks intact:
+
+```markdown
+- No calculators.
+- No notes.
+```
+
+prints as two lines still carrying their `-`. This is deliberate: an
+unformatted list that is *visibly* unformatted is something you can see and
+work around, where a list silently flattened into one run-on sentence is not.
+The same blocks render properly on the Canvas export; the print sheet catches
+up over the releases tracked in [`../Roadmap.md`](../Roadmap.md).
+
+Note that inline formatting inside such a block is printed too — a
+`~~struck~~` list item shows its tildes — because the whole block falls back
+together.
+
+**Math is the exception, and it is never printed as source.** The export
+**fails**, naming the expression, if:
+
+- the formula uses something the Word writer cannot render (see
+  [math.md](math.md)); or
+- the formula sits inside one of the blocks above — a list, table, quote,
+  link or image — which would otherwise print it as raw LaTeX.
+
+So `- solve $x^2$` is an error today, not a sheet with `$x^2$` on it. The
+reason math alone is treated this way: an unformatted list is visibly
+unformatted, but a student who meets `$\frac{a}{b}$` on a printed page sees
+something that is not a formula, and nobody finds out until the copies are
+run off. Move the math into a paragraph of its own until lists and tables
+land.
+
 ## Unknown keys are errors
 
 A spec is validated strictly: a misspelled key is rejected rather than ignored.

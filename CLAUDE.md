@@ -83,8 +83,12 @@ own folder, which that helper cannot do.
 - `src/export/markdown.rs` — print sheet (no solutions).
 - `src/export/canvas.rs` — Canvas New Quizzes QTI bytes.
 - `src/export/docx.rs` — Word document bytes for printing, built from a
-  `quiz::exam::Exam`. Shares the zip/XML-escape helpers in `export.rs` with the
-  Canvas exporter.
+  `quiz::exam::Exam`. Owns the *container* — parts, styles, page furniture —
+  and delegates content: `docx::inline` turns authored Markdown into `w:r`
+  runs, `docx::omml` turns LaTeX into OOXML math. (`docx.rs` still writes runs
+  of its own for page furniture — page breaks, answer space, footer fields —
+  which carry no authored text.) Shares the zip/XML-escape helpers in
+  `export.rs` with the Canvas exporter.
 - `src/quiz/` — the printable-exam pipeline: `spec` (the authored YAML
   blueprint and its validation) → `assemble` (the one place randomness happens)
   → `exam` (the frozen `Exam` the print writers consume), with `sample` for the

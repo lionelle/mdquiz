@@ -4,10 +4,11 @@
 //! does — as bytes, through the shared `zip_package` helper, with no process and no temporary
 //! directory. That keeps the whole writer unit-testable.
 //!
-//! This module owns the *container*: the parts a Word document must have before
-//! any question appears, plus the page furniture that is the same on every
-//! sheet. Question content, lists, tables and math arrive in later changes and
-//! slot into the body builder.
+//! This module owns the *container*: the parts a Word document must have
+//! before any question appears, plus the page furniture that is the same on
+//! every sheet. Authored content is delegated — [`inline`] renders Markdown to
+//! runs and [`omml`] renders LaTeX to math. The per-question answer structures
+//! arrive in a later change and slot into the body builder.
 //!
 //! # What Word actually requires
 //!
@@ -24,10 +25,14 @@
 //! * Children of `w:pPr` are a *sequence*, not a set: out-of-order elements are
 //!   a schema violation even though they look harmless.
 
+mod inline;
 pub mod omml;
 
+use std::fmt::Write as _;
+
 use crate::Result;
-use crate::export::{escape_xml, zip_package};
+use crate::export::docx::inline::Kind;
+use crate::export::zip_package;
 use crate::quiz::exam::{Exam, ExamItem};
 use crate::quiz::spec::{TEMPLATE_CLOSE, TEMPLATE_OPEN, TemplateKey};
 
@@ -65,6 +70,20 @@ const TWIPS_PER_LINE: u32 = 320;
 /// Distance from the page edge to the header and footer.
 const EDGE_GAP: u32 = 720;
 
+/// The heading styles the document defines, as (style id, half-point size).
+///
+/// Three, not six: past the third level a printed exam has no useful
+/// distinction left to draw, and deeper headings clamp onto the last one.
+/// `w:sz` is in half-points, so 28 is 14pt.
+///
+/// The ids are OOXML's *built-in* heading ids, and [`heading_styles`] gives
+/// each its built-in `w:name` (`heading 1`, lower-case and spaced) and a
+/// `w:outlineLvl`. Word matches a style to its built-in by that name, so a
+/// plausible-looking `Heading1` instead makes a private style that looks
+/// right on the page but never reaches the navigation pane or a contents
+/// table.
+const HEADING_STYLES: [(&str, u32); 3] = [("Heading1", 28), ("Heading2", 26), ("Heading3", 24)];
+
 /// The tallest answer block that can be laid out: the page's text column.
 ///
 /// An exact line height taller than the column cannot be placed on any page.
@@ -76,18 +95,20 @@ const MAX_ANSWER_TWIPS: u32 = PAGE_HEIGHT - 2 * MARGIN;
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Export`] if the zip container cannot be written, or
-/// [`crate::Error::Io`] from the underlying writer.
+/// Returns [`crate::Error::UnsupportedMath`] if a prompt contains math this
+/// writer cannot convert, [`crate::Error::Export`] if the zip container cannot
+/// be written, or [`crate::Error::Io`] from the underlying writer.
 pub fn to_docx(exam: &Exam) -> Result<Vec<u8>> {
-    let document = document_xml(exam);
+    let document = document_xml(exam)?;
     let footer = footer_xml(exam);
     let rels = document_rels();
+    let styles = styles();
     let parts: Vec<(&str, &[u8])> = vec![
         ("[Content_Types].xml", CONTENT_TYPES.as_bytes()),
         ("_rels/.rels", ROOT_RELS.as_bytes()),
         ("word/_rels/document.xml.rels", rels.as_bytes()),
         ("word/document.xml", document.as_bytes()),
-        ("word/styles.xml", STYLES.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
         ("word/numbering.xml", NUMBERING.as_bytes()),
         ("word/settings.xml", SETTINGS.as_bytes()),
         ("word/footer1.xml", footer.as_bytes()),
@@ -140,34 +161,96 @@ fn document_rels() -> String {
     )
 }
 
-/// Document defaults plus the named styles later parts rely on.
+/// Document defaults plus the named styles the writers rely on.
+///
+/// Built at runtime, like [`document_rels`], so [`inline::CODE_STYLE`] is the
+/// single source of the code style's id: a `w:rStyle` naming a style that is
+/// not defined here silently loses its formatting.
 ///
 /// `w:sz` is in half-points: 22 is the 11pt body face that [`TWIPS_PER_LINE`]
 /// reasons about, 32 the 16pt title. `w:spacing` is in twips, so 120 is 6pt and
 /// 240 is 12pt.
 ///
 /// Fonts are spelled inline because `concat!` takes literals only. Calibri is
-/// the body face; the monospace style preformatted blocks will need arrives
-/// with them, since adding a style is a one-line change that needs no
-/// coordinated edit elsewhere.
-const STYLES: &str = concat!(
-    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-    r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
-    r#"<w:docDefaults><w:rPrDefault><w:rPr>"#,
-    r#"<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>"#,
-    r#"<w:sz w:val="22"/><w:szCs w:val="22"/>"#,
-    r#"</w:rPr></w:rPrDefault></w:docDefaults>"#,
-    r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal">"#,
-    r#"<w:name w:val="Normal"/></w:style>"#,
-    r#"<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/>"#,
-    // `w:pPr` children are a sequence: `spacing` must precede `jc`. Emitting
-    // them the other way round is a schema violation `xmllint --noout` cannot
-    // see and Word rejects the document for.
-    r#"<w:basedOn w:val="Normal"/><w:pPr><w:spacing w:after="240"/>"#,
-    r#"<w:jc w:val="center"/></w:pPr>"#,
-    r#"<w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>"#,
-    r"</w:styles>",
-);
+/// the body face and Consolas the monospace one — Word has shipped both since
+/// 2007, and a reader without them substitutes by class rather than failing.
+fn styles() -> String {
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:docDefaults><w:rPrDefault><w:rPr>"#,
+            r#"<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:cs="Calibri"/>"#,
+            r#"<w:sz w:val="22"/><w:szCs w:val="22"/>"#,
+            r#"</w:rPr></w:rPrDefault></w:docDefaults>"#,
+            r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal">"#,
+            r#"<w:name w:val="Normal"/></w:style>"#,
+            r#"<w:style w:type="character" w:styleId="{code}">"#,
+            r#"<w:name w:val="{code}"/>"#,
+            r#"<w:rPr><w:rFonts w:ascii="Consolas" w:hAnsi="Consolas" w:cs="Consolas"/></w:rPr>"#,
+            r"</w:style>",
+            "{title}{headings}",
+            r"</w:styles>",
+        ),
+        code = inline::CODE_STYLE,
+        title = paragraph_style(
+            "Title",
+            "Title",
+            // `w:pPr` children are a sequence: `spacing` must precede `jc`.
+            // Emitting them the other way round is a schema violation
+            // `xmllint --noout` cannot see and Word rejects the document for.
+            r#"<w:spacing w:after="240"/><w:jc w:val="center"/>"#,
+            r#"<w:b/><w:sz w:val="32"/>"#,
+        ),
+        headings = heading_styles(),
+    )
+}
+
+/// One paragraph style based on `Normal`.
+///
+/// `properties` and `run_properties` are inserted verbatim, and both are
+/// schema *sequences* — see [`ParagraphStyle::properties`] for `w:pPr`'s
+/// order and `inline`'s module docs for `w:rPr`'s.
+fn paragraph_style(id: &str, name: &str, properties: &str, run_properties: &str) -> String {
+    format!(
+        concat!(
+            r#"<w:style w:type="paragraph" w:styleId="{id}"><w:name w:val="{name}"/>"#,
+            r#"<w:basedOn w:val="Normal"/><w:pPr>{properties}</w:pPr>"#,
+            r#"<w:rPr>{run_properties}</w:rPr></w:style>"#,
+        ),
+        id = id,
+        name = name,
+        properties = properties,
+        run_properties = run_properties,
+    )
+}
+
+/// The definitions for every style in [`HEADING_STYLES`].
+///
+/// `w:keepNext` on all of them: a heading stranded at the foot of a page,
+/// with the section it names overleaf, is the one layout fault a heading can
+/// have. `w:outlineLvl` is 0-based where the heading level is 1-based.
+fn heading_styles() -> String {
+    HEADING_STYLES
+        .iter()
+        .enumerate()
+        .fold(String::new(), |mut xml, (index, (id, size))| {
+            let _ = write!(
+                xml,
+                "{}",
+                paragraph_style(
+                    id,
+                    &format!("heading {}", index + 1),
+                    // `w:outlineLvl` comes after `w:spacing` in `CT_PPrBase`.
+                    &format!(
+                        r#"<w:keepNext/><w:spacing w:before="240" w:after="120"/><w:outlineLvl w:val="{index}"/>"#
+                    ),
+                    &format!(r#"<w:b/><w:sz w:val="{size}"/>"#),
+                )
+            );
+            xml
+        })
+}
 
 /// An empty numbering part.
 ///
@@ -195,14 +278,19 @@ const SETTINGS: &str = concat!(
 );
 
 /// The whole `word/document.xml` part.
-fn document_xml(exam: &Exam) -> String {
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if a prompt, header or footer
+/// contains math that cannot be converted.
+fn document_xml(exam: &Exam) -> Result<String> {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W_NS}" xmlns:m="{M_NS}" xmlns:r="{R_NS}"><w:body>"#
     );
-    xml.push_str(&body_xml(exam));
+    xml.push_str(&body_xml(exam)?);
     xml.push_str(&section_xml());
     xml.push_str("</w:body></w:document>");
-    xml
+    Ok(xml)
 }
 
 /// Everything above the closing section properties: title, header, questions,
@@ -211,34 +299,51 @@ fn document_xml(exam: &Exam) -> String {
 /// Question rendering is deliberately shallow for now — a numbered prompt and
 /// its answer space. The per-kind answer structures land with the question
 /// writers.
-fn body_xml(exam: &Exam) -> String {
-    let mut xml = paragraph(&exam.title(), ParagraphStyle::Title);
+fn body_xml(exam: &Exam) -> Result<String> {
+    let mut xml = paragraph(&inline::text_run(&exam.title()), ParagraphStyle::Title);
     if let Some(header) = &exam.header {
-        xml.push_str(&markdown_block(header));
+        xml.push_str(&prose(header)?);
     }
     for (index, item) in exam.items.iter().enumerate() {
         xml.push_str(&question_xml(
             index + 1,
             item,
             exam.layout.page_break_between,
-        ));
+        )?);
     }
     if let Some(footer) = &exam.footer {
-        xml.push_str(&markdown_block(footer));
+        xml.push_str(&prose(footer)?);
     }
-    xml
+    Ok(xml)
 }
 
 /// One numbered question: its prompt, then the blank space to answer in.
-fn question_xml(number: usize, item: &ExamItem, page_break: bool) -> String {
+///
+/// The number shares the first paragraph with the prompt rather than standing
+/// alone, so a wrapped prompt still hangs off its own number.
+fn question_xml(number: usize, item: &ExamItem, page_break: bool) -> Result<String> {
     let mut xml = String::new();
     if page_break && number > 1 {
         xml.push_str(r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
     }
-    let prompt = format!("{number}. {}", item.question.prompt);
-    xml.push_str(&paragraph(&prompt, ParagraphStyle::Question));
+    let mut prompt = inline::paragraphs(&item.question.prompt)?.into_iter();
+    let lead = inline::text_run(&format!("{number}. "));
+    match prompt.next() {
+        // `runs`, not `centred`: the number shares this line, and setting a
+        // display equation apart would take the number to the middle of the
+        // page with it.
+        Some(first) => xml.push_str(&paragraph(
+            &(lead + &first.runs),
+            ParagraphStyle::Question.or_heading(first.kind),
+        )),
+        None => xml.push_str(&paragraph(&lead, ParagraphStyle::Question)),
+    }
+    for block in prompt {
+        let style = ParagraphStyle::Continuation.or_heading(block.kind);
+        xml.push_str(&paragraph(&block.centred(), style));
+    }
     xml.push_str(&answer_space(item.answer_space));
-    xml
+    Ok(xml)
 }
 
 /// A blank run of `lines` for the student to write in.
@@ -267,25 +372,23 @@ fn answer_space(lines: usize) -> String {
     )
 }
 
-/// Render an already-loaded Markdown block as plain paragraphs.
+/// Render an already-loaded Markdown block as body paragraphs.
 ///
-/// Inline formatting, lists and tables are the later writers' work; splitting
-/// on blank lines is enough for a header or footer to reach the page intact.
-fn markdown_block(markdown: &str) -> String {
-    // Normalised first: a `header:` authored on Windows arrives CRLF, which
-    // would not match the blank-line split and would collapse the whole block
-    // into one paragraph. Stray `\r` also cannot survive inside `<w:t>`, which
-    // XML line-ending normalisation rewrites on read.
-    markdown
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|block| !block.is_empty())
-        .fold(String::new(), |mut xml, block| {
-            xml.push_str(&paragraph(block, ParagraphStyle::Body));
-            xml
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if the block contains math that
+/// cannot be converted.
+fn prose(markdown: &str) -> Result<String> {
+    Ok(inline::paragraphs(markdown)?
+        .iter()
+        .filter(|block| !block.runs.is_empty())
+        .map(|block| {
+            paragraph(
+                &block.centred(),
+                ParagraphStyle::Body.or_heading(block.kind),
+            )
         })
+        .collect())
 }
 
 /// How a paragraph is presented.
@@ -297,26 +400,55 @@ enum ParagraphStyle {
     Body,
     /// A question prompt: kept whole so it does not straddle a page break.
     Question,
+    /// A prompt's second and later paragraphs: kept with the first, and
+    /// separated from it, but without the wide gap that opens a question.
+    Continuation,
+    /// A Markdown heading, at the given level.
+    Heading(u8),
 }
 
 impl ParagraphStyle {
+    /// This style, or the heading style for `kind` if the block is a heading.
+    ///
+    /// The heading styles carry `w:keepNext` of their own, so a heading used
+    /// partway through a prompt still holds together with what follows it.
+    const fn or_heading(self, kind: Kind) -> Self {
+        match kind {
+            Kind::Heading(level) => Self::Heading(level),
+            Kind::Prose | Kind::Equation => self,
+        }
+    }
+
     /// The `w:pPr` contents for this style, in schema order.
-    const fn properties(self) -> &'static str {
+    fn properties(self) -> String {
         match self {
-            Self::Title => r#"<w:pStyle w:val="Title"/>"#,
-            Self::Body => r#"<w:spacing w:after="120"/>"#,
-            Self::Question => r#"<w:keepNext/><w:keepLines/><w:spacing w:before="240"/>"#,
+            Self::Title => r#"<w:pStyle w:val="Title"/>"#.to_owned(),
+            Self::Body => r#"<w:spacing w:after="120"/>"#.to_owned(),
+            Self::Question => {
+                r#"<w:keepNext/><w:keepLines/><w:spacing w:before="240"/>"#.to_owned()
+            }
+            Self::Continuation => {
+                r#"<w:keepNext/><w:keepLines/><w:spacing w:before="120" w:after="120"/>"#.to_owned()
+            }
+            Self::Heading(level) => format!(r#"<w:pStyle w:val="{}"/>"#, heading_style(level)),
         }
     }
 }
 
-/// One paragraph holding `text`.
-fn paragraph(text: &str, style: ParagraphStyle) -> String {
-    format!(
-        "<w:p><w:pPr>{}</w:pPr>{}</w:p>",
-        style.properties(),
-        text_run(text)
-    )
+/// The style id for a Markdown heading at `level`.
+///
+/// Levels below the deepest defined style are clamped rather than dropped: a
+/// `w:pStyle` naming a style the document does not define is ignored, so an
+/// `######` heading would print as plain body text.
+fn heading_style(level: u8) -> &'static str {
+    let deepest = HEADING_STYLES.len().saturating_sub(1);
+    let index = usize::from(level).saturating_sub(1).min(deepest);
+    HEADING_STYLES.get(index).map_or("", |(id, _)| *id)
+}
+
+/// One paragraph holding already-rendered `runs`.
+fn paragraph(runs: &str, style: ParagraphStyle) -> String {
+    format!("<w:p><w:pPr>{}</w:pPr>{runs}</w:p>", style.properties())
 }
 
 /// The section properties: page geometry and the footer reference.
@@ -362,19 +494,19 @@ fn footer_runs(template: &str, exam: &Exam) -> String {
     let mut runs = String::new();
     let mut rest = template;
     while let Some((before, after_open)) = rest.split_once(TEMPLATE_OPEN) {
-        push_text_run(&mut runs, before);
+        runs.push_str(&inline::text_run(before));
         let Some((key, after_close)) = after_open.split_once(TEMPLATE_CLOSE) else {
             // Unterminated. `rest` still holds the text before the `${`, so it
             // must be advanced past the marker or the trailing push below
             // emits that text a second time.
-            push_text_run(&mut runs, TEMPLATE_OPEN);
+            runs.push_str(&inline::text_run(TEMPLATE_OPEN));
             rest = after_open;
             break;
         };
         runs.push_str(&placeholder_run(key.trim(), exam));
         rest = after_close;
     }
-    push_text_run(&mut runs, rest);
+    runs.push_str(&inline::text_run(rest));
     runs
 }
 
@@ -389,27 +521,12 @@ fn placeholder_run(key: &str, exam: &Exam) -> String {
     // Matched exhaustively on the shared key type, so adding a placeholder to
     // `TemplateKey` fails to compile here rather than silently printing nothing.
     match TemplateKey::parse(key) {
-        Some(TemplateKey::Name) => text_run(&exam.name),
-        Some(TemplateKey::Variant) => text_run(exam.variant.as_deref().unwrap_or_default()),
+        Some(TemplateKey::Name) => inline::text_run(&exam.name),
+        Some(TemplateKey::Variant) => inline::text_run(exam.variant.as_deref().unwrap_or_default()),
         Some(TemplateKey::Page) => field_run("PAGE"),
         Some(TemplateKey::Pages) => field_run("NUMPAGES"),
         None => String::new(),
     }
-}
-
-/// Append a text run for `text`, if there is any.
-fn push_text_run(runs: &mut String, text: &str) {
-    if !text.is_empty() {
-        runs.push_str(&text_run(text));
-    }
-}
-
-/// One literal text run.
-fn text_run(text: &str) -> String {
-    format!(
-        r#"<w:r><w:t xml:space="preserve">{}</w:t></w:r>"#,
-        escape_xml(text)
-    )
 }
 
 /// One field run, e.g. `PAGE` or `NUMPAGES`.
@@ -623,6 +740,13 @@ mod tests {
     /// page's text column, because a line box taller than the column cannot be
     /// laid out on any page.
     fn answer_space_is_capped_rather_than_overflowing() {
+        // A literal, not `PAGE_HEIGHT - 2 * MARGIN` again: an expectation
+        // written as the constant's own expression agrees with it however it
+        // is defined, including a cap taller than the paper it must fit on.
+        assert_eq!(
+            MAX_ANSWER_TWIPS, 12_960,
+            "the cap is no longer US Letter less its margins"
+        );
         let capped = format!(r#"w:line="{MAX_ANSWER_TWIPS}""#);
         assert!(answer_space(usize::MAX).contains(&capped));
         assert!(answer_space(100_000).contains(&capped));
@@ -657,13 +781,14 @@ mod tests {
 
     /// The `CT_PPrBase` child sequence, in schema order. Only the elements this
     /// writer emits need listing; an unknown one fails the check loudly.
-    const PPR_ORDER: [&str; 6] = [
+    const PPR_ORDER: [&str; 7] = [
         "w:pStyle",
         "w:keepNext",
         "w:keepLines",
         "w:pageBreakBefore",
         "w:spacing",
         "w:jc",
+        "w:outlineLvl",
     ];
 
     /// The `w:pPr` child elements of `xml`, in the order they appear.
@@ -733,11 +858,27 @@ mod tests {
         }
     }
 
+    /// The visible text of `xml`: every `w:t`, concatenated.
+    ///
+    /// Runs split at every formatting boundary, so a sentence that reads as
+    /// one phrase on the page is several runs in the XML, and asserting on the
+    /// raw markup would test where the writer happened to break them.
+    fn text_of(xml: &str) -> String {
+        xml.split("<w:t")
+            // `<w:t>` and `<w:t …>`, but not `<w:tbl>` or the self-closing
+            // `<w:t/>` that holds answer space open.
+            .filter(|rest| rest.starts_with('>') || rest.starts_with(' '))
+            .filter_map(|rest| rest.split_once('>'))
+            .filter_map(|(_, body)| body.split_once("</w:t>"))
+            .map(|(text, _)| text)
+            .collect()
+    }
+
     /// The `w:pPr` of the paragraph whose text begins with `lead`.
     fn properties_of(document: &str, lead: &str) -> String {
         document
             .split("<w:p><w:pPr>")
-            .find(|block| block.contains(&format!(r#"<w:t xml:space="preserve">{lead}"#)))
+            .find(|block| text_of(block).starts_with(lead))
             .and_then(|block| block.split_once("</w:pPr>"))
             .map_or_else(String::new, |(properties, _)| properties.to_owned())
     }
@@ -918,6 +1059,149 @@ mod tests {
         assert!(!document.contains(r#"w:lineRule="exact""#), "{document}");
     }
 
+    /// The exam of [`exam`] with its single prompt replaced by `prompt`.
+    fn exam_asking(prompt: &str) -> Exam {
+        let mut quiz = exam(None, 1);
+        if let Some(item) = quiz.items.first_mut() {
+            item.question.prompt = prompt.to_owned();
+        }
+        quiz
+    }
+
+    #[test]
+    /// Math authored in a prompt reaches the page as math. Everything below
+    /// `omml` is tested against LaTeX; this is the one test that the writer
+    /// is actually wired to a prompt at all.
+    fn math_in_a_prompt_reaches_the_document() {
+        let quiz = exam_asking(r"Sort in $O(n \log n)$ time.");
+        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        assert!(document.contains("<m:oMath>"), "{document}");
+        assert!(
+            !text_of(&document).contains(r"\log"),
+            "LaTeX source printed: {document}"
+        );
+    }
+
+    #[test]
+    /// Math the writer cannot convert fails the export outright rather than
+    /// producing a sheet with a wrong or missing formula on it.
+    fn unconvertible_math_fails_the_export() {
+        let quiz = exam_asking(r"Evaluate $\begin{unknown}x\end{unknown}$.");
+        assert!(matches!(
+            to_docx(&quiz),
+            Err(crate::Error::UnsupportedMath { .. })
+        ));
+    }
+
+    #[test]
+    /// A prompt spanning several paragraphs keeps its number on the first and
+    /// holds the rest together: `w:keepNext` on every part is what stops the
+    /// tail, and the answer space after it, sliding onto the next page.
+    fn a_multi_paragraph_prompt_stays_together() {
+        let document = part(
+            &to_docx(&exam_asking("First half.\n\nSecond half.")).expect("renders"),
+            "word/document.xml",
+        );
+        assert!(text_of(&document).contains("1. First half."), "{document}");
+        let tail = properties_of(&document, "Second half.");
+        assert!(tail.contains("<w:keepNext/>"), "tail lost keepNext: {tail}");
+    }
+
+    #[test]
+    /// Every style a run or paragraph names must be defined, or Word drops
+    /// the formatting silently — the document still opens, just wrong.
+    fn every_style_referenced_is_defined() {
+        let package = to_docx(&exam_asking("`code` and\n\n# A heading")).expect("renders");
+        let styles = part(&package, "word/styles.xml");
+        let used = referenced_styles(&part(&package, "word/document.xml"));
+        // Named, not just counted: a scanner that silently found nothing
+        // would assert over an empty list and pass. Containment rather than
+        // equality, so adding a style elsewhere does not fail this test.
+        for expected in ["Title", "Code", "Heading1"] {
+            assert!(used.iter().any(|id| id == expected), "{used:?}");
+        }
+        for id in used {
+            assert!(
+                styles.contains(&format!(r#"w:styleId="{id}""#)),
+                "{id} is used but not defined: {styles}"
+            );
+        }
+    }
+
+    /// Every style id the document references, from `w:pStyle` and `w:rStyle`.
+    fn referenced_styles(document: &str) -> Vec<String> {
+        document
+            .split("Style w:val=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"'))
+            .map(|(id, _)| id.to_owned())
+            .collect()
+    }
+
+    #[test]
+    /// A prompt that is nothing but a display equation keeps its number at
+    /// the margin. `m:oMathPara` centres everything on its line, so wrapping
+    /// the paragraph that also holds "1." puts the number in the middle of
+    /// the page.
+    fn a_numbered_equation_is_not_centred() {
+        let document = part(
+            &to_docx(&exam_asking(r"$$\frac{a}{b}$$")).expect("renders"),
+            "word/document.xml",
+        );
+        assert!(document.contains("<m:oMath>"), "the equation is missing");
+        assert!(
+            !document.contains("oMathPara"),
+            "the question number was centred with the equation: {document}"
+        );
+    }
+
+    #[test]
+    /// A display equation in a later paragraph of a prompt *is* set apart:
+    /// nothing else shares its line, so centring costs nothing.
+    fn a_standalone_equation_is_centred() {
+        let document = part(
+            &to_docx(&exam_asking("Prove:\n\n$$e^{i\\pi} + 1 = 0$$")).expect("renders"),
+            "word/document.xml",
+        );
+        assert!(document.contains("<m:oMathPara>"), "{document}");
+    }
+
+    #[test]
+    /// A heading opening a prompt is set as one, exactly as a heading later
+    /// in the same prompt is. Honouring it in one place and not the other
+    /// made the same markup mean two things.
+    fn a_heading_opening_a_prompt_keeps_its_level() {
+        let document = part(
+            &to_docx(&exam_asking("## Part A\n\nWhat is x?")).expect("renders"),
+            "word/document.xml",
+        );
+        assert_eq!(
+            properties_of(&document, "1. Part A"),
+            r#"<w:pStyle w:val="Heading2"/>"#,
+            "{document}"
+        );
+    }
+
+    #[test]
+    /// The heading styles are OOXML's built-ins, not private styles that
+    /// merely look like them. Word matches by `w:name`, so `Heading1` where
+    /// `heading 1` belongs gives a style that prints correctly but never
+    /// reaches the navigation pane or a contents table.
+    fn heading_styles_are_the_built_in_ones() {
+        let styles = part(
+            &to_docx(&exam(None, 1)).expect("renders"),
+            "word/styles.xml",
+        );
+        for (level, id) in HEADING_STYLES.iter().enumerate() {
+            let name = format!(r#"<w:name w:val="heading {}"/>"#, level + 1);
+            assert!(styles.contains(&name), "{} lacks {name}: {styles}", id.0);
+        }
+        assert!(
+            styles.contains(r#"<w:outlineLvl w:val="0"/>"#),
+            "no outline level: {styles}"
+        );
+    }
+
     #[test]
     /// A placeholder written in a *prompt* is ordinary text. Only the page
     /// footer is a template; substituting in body text would let a question
@@ -928,7 +1212,10 @@ mod tests {
             item.question.prompt = "What does ${page} mean?".to_owned();
         }
         let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
-        assert!(document.contains("What does ${page} mean?"), "{document}");
+        assert!(
+            text_of(&document).contains("What does ${page} mean?"),
+            "{document}"
+        );
         assert!(!document.contains("PAGE"), "a prompt became a field");
     }
 

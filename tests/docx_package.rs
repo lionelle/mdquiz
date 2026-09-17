@@ -29,6 +29,15 @@ use mdquiz::quiz::spec::Layout;
 /// A page-footer template exercising every placeholder.
 const FOOTER: &str = "${name} (${variant}) — Page ${page} of ${pages}";
 
+/// A header block exercising a heading, inline marks and a list fallback.
+const HEADER: &str = "\
+# Instructions
+
+Answer every question. Show your *working* and mark the final answer in `ink`.
+
+- No calculators.
+- ~~No~~ notes.";
+
 /// Whether `tool` can be run on this machine.
 ///
 /// Spawning is the test, not the exit status: `pdftotext --version` reads
@@ -43,23 +52,36 @@ fn sample_exam() -> Exam {
     Exam {
         name: "CS 3500 — Exam 1".to_owned(),
         variant: Some("A".to_owned()),
-        header: Some("Answer every question.\n\nShow your working.".to_owned()),
+        header: Some(HEADER.to_owned()),
         footer: Some("End of exam.".to_owned()),
         layout: Layout {
             page_footer: Some(FOOTER.to_owned()),
             ..Layout::default()
         },
-        items: (0..3).map(sample_item).collect(),
+        items: (0..PROMPTS.len()).map(sample_item).collect(),
     }
 }
 
-/// One true/false item whose prompt carries XML-significant characters.
+/// The prompts the sample exam asks, one per construct worth rendering.
+///
+/// Every entry is something the writer handles differently: escaping, inline
+/// math, display math and a multi-paragraph prompt. Written as prompts on a
+/// real exam rather than as a test fixture, so the converted PDF can be read.
+const PROMPTS: [&str; 5] = [
+    "Is statement 0 true? Consider <a> & \"b\".",
+    r"Sort in $O(n \log n)$ time and say **why** it is not $O(n)$.",
+    r"Evaluate $$\sum_{i=1}^{n} i^2$$ in closed form.",
+    "State the invariant.\n\nThen prove it is *maintained*.",
+    "Prove the identity:\n\n$$e^{i\\pi} + 1 = 0$$",
+];
+
+/// One true/false item asking the `n`th prompt.
 fn sample_item(n: usize) -> ExamItem {
     ExamItem {
         question: Question {
             id: format!("q{n}"),
             title: None,
-            prompt: format!("Is statement {n} true? Consider <a> & \"b\"."),
+            prompt: PROMPTS.get(n).copied().unwrap_or_default().to_owned(),
             points: 1.0,
             tags: Vec::new(),
             feedback: Feedback::default(),
@@ -183,16 +205,47 @@ fn assert_pdf_reads_as_the_exam(pdf: &Path) {
         .output()
         .expect("pdftotext runs");
     let rendered = String::from_utf8_lossy(&text.stdout);
+    assert_furniture(&rendered);
+    assert_prompts(&rendered);
+}
+
+/// Assert the page furniture — title, header, footer, page numbers — printed.
+fn assert_furniture(rendered: &str) {
     assert!(rendered.contains("CS 3500"), "title missing: {rendered}");
+    assert!(rendered.contains("Instructions"), "header heading missing");
     assert!(
-        rendered.contains("Answer every question."),
-        "header missing"
+        rendered.contains("No calculators."),
+        "the list fallback lost its text"
     );
     assert!(rendered.contains("End of exam."), "footer missing");
     assert!(rendered.contains("Page 1 of"), "page footer missing");
+}
+
+/// Assert every prompt printed as the writer claims to render it.
+///
+/// Math is checked from both sides: that the LaTeX source did *not* print,
+/// and that the symbols it stands for did. Either alone passes on a page
+/// where the equation silently vanished.
+fn assert_prompts(rendered: &str) {
     // The prompt's XML-significant characters survive as themselves.
     assert!(
         rendered.contains("<a> & \"b\""),
         "escaping round-trip failed"
+    );
+    for source in [r"\log", r"\sum", r"\pi"] {
+        assert!(
+            !rendered.contains(source),
+            "LaTeX source printed: {rendered}"
+        );
+    }
+    for symbol in ['∑', 'π'] {
+        assert!(
+            rendered.contains(symbol),
+            "{symbol} is missing from the page: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("Then prove it is maintained."),
+        "a prompt's second paragraph is missing: {rendered}"
     );
 }

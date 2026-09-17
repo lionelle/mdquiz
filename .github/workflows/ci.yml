@@ -27,9 +27,12 @@ jobs:
       # Tool-backed tests skip themselves when their tool is absent, so CI
       # installs them to keep those paths actually covered: `dot` for the
       # Graphviz diagram tests, `xmllint` for the docx package's XML
-      # well-formedness check.
+      # well-formedness check, and LibreOffice plus `pdftotext` for the
+      # `#[ignore]`d round-trip that opens the document for real.
       - name: Install test tools
-        run: sudo apt-get update && sudo apt-get install -y graphviz libxml2-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz libxml2-utils libreoffice-writer poppler-utils
 
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -39,3 +42,10 @@ jobs:
 
       - name: Tests
         run: cargo test --all-features
+
+      # The round-trip is `#[ignore]`d so a laptop without LibreOffice still
+      # has a fast `cargo test`. It is the only check that the document
+      # actually opens, so CI must ask for it explicitly — and asking means
+      # run it or fail, not skip.
+      - name: Round-trip through LibreOffice
+        run: cargo test --all-features -- --ignored

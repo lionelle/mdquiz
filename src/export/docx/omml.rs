@@ -73,8 +73,11 @@ fn nesting_depth(latex: &str) -> usize {
 
 /// Convert `latex` to an OMML fragment.
 ///
-/// Returns an `<m:oMath>` element, or `<m:oMathPara>` wrapping one for display
-/// math. Either is ready to sit inside a `w:p`.
+/// Always returns a bare `<m:oMath>` element, ready to sit inside a `w:p`.
+/// `display` selects how the math is *set* — whether a sum's limits go above
+/// and below its sign or beside it — and nothing more. Centring display math
+/// on its own line is `m:oMathPara`, which centres the whole paragraph, so
+/// only the paragraph writer can know whether it may be applied.
 ///
 /// # Errors
 ///
@@ -93,10 +96,7 @@ pub fn to_omml(latex: &str, display: Display) -> Result<String> {
         roxmltree::Document::parse(&mathml).map_err(|error| unsupported(latex, &error))?;
     let mut body = String::new();
     render_children(document.root_element(), latex, &mut body)?;
-    Ok(match display {
-        Display::Inline => format!("<m:oMath>{body}</m:oMath>"),
-        Display::Block => format!("<m:oMathPara><m:oMath>{body}</m:oMath></m:oMathPara>"),
-    })
+    Ok(format!("<m:oMath>{body}</m:oMath>"))
 }
 
 /// Run `math-core` over `latex`, containing any panic it may raise.
@@ -972,11 +972,14 @@ mod tests {
     }
 
     #[test]
-    /// Display math is wrapped so Word sets it on its own line.
-    fn display_math_is_wrapped_as_a_paragraph() {
+    /// Display math is *not* wrapped in `m:oMathPara` here. That element
+    /// centres the paragraph around it, so applying it is the paragraph
+    /// writer's call — it is the only one that knows whether a question
+    /// number shares the line.
+    fn display_math_is_not_set_apart_here() {
         let xml = to_omml(r"\frac{a}{b}", Display::Block).expect("converts");
-        assert!(xml.starts_with("<m:oMathPara><m:oMath>"), "{xml}");
-        assert!(xml.ends_with("</m:oMath></m:oMathPara>"), "{xml}");
+        assert!(xml.starts_with("<m:oMath>"), "{xml}");
+        assert!(!xml.contains("oMathPara"), "{xml}");
     }
 
     #[test]

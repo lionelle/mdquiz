@@ -329,11 +329,68 @@ existing pattern.
      Cambria Math is not installed here, and pandoc's own output shows the same
      symptom for `\lim`. Needs checking in real Word before being treated as a
      defect in this crate.
-   - **Not wired in.** `docx::markdown_block` still pushes prompts through as
-     plain text, so `$x^2$` prints literally in today's `.docx`. Part 6 wires
-     it, and that is where the first end-to-end math test belongs.
-6. **Inline runs** — bold, italic, code, strikethrough.
-7. **Lists** — including `numbering.xml` abstract/concrete definitions.
+6. **Inline runs.** *Done* — `src/export/docx/inline.rs`. Bold, italic,
+   strikethrough, code spans and headings become `w:r` runs with the right
+   `w:rPr`; headings use OOXML's built-in `Heading1`–`Heading3` so they reach
+   the navigation pane and a contents table. Math becomes `m:oMath`. This is
+   where math is finally wired in; the end-to-end check is in
+   `tests/docx_package.rs`.
+
+   **The rule that shaped it: nothing is dropped silently.** A block the
+   writer cannot lay out (list, table, block quote, image, link, fenced or
+   indented code, rule, raw HTML) is emitted as *its own Markdown source*,
+   indentation and line breaks preserved. One `match` arm in `runs`
+   enumerates what is renderable and its fallback refuses the whole
+   paragraph, so that set cannot drift from what is handled. `blocks` makes
+   the same call at block level, and anything the parser reports *no event
+   for at all* is covered by comparing each block's span against the source —
+   a link reference definition (`[id]: https://…`) is the live case, and a
+   `***` rule falls out of the same mechanism rather than needing an arm of
+   its own.
+
+   **Math is the deliberate exception, and the rule is now enforced on every
+   path**: unconvertible math fails, *and so does math inside a block that
+   would fall back to source*. `- solve $x^2$` is an error rather than a
+   sheet with `$x^2$` printed on it. `to_docx` is fallible for this reason.
+
+   **Found by rendering and by review, not by assertion.** Every defect below
+   passed the unit tests, `xmllint --noout`, *and* schema validation:
+   - `m:oMathPara` centres the **whole paragraph**. Two separate bugs: `$$…$$`
+     mid-sentence dragged the surrounding words to the middle of the page,
+     and — after the first fix — a prompt that was *only* display math still
+     dragged its question number there, because `question_xml` prepends the
+     number after the decision is made. `to_omml` no longer emits the wrapper
+     at all; setting an equation apart is now the paragraph writer's call, as
+     only it knows what else shares the line.
+   - **Same-kind emphasis cancelled itself.** Marks were a flag toggled per
+     event, but CommonMark *nests*: `****very****` rendered with no bold, and
+     in `**a __b__ c**` the inner word was the only plain one. Marks are
+     depth counters now. (The Canvas path renders these correctly, so this
+     was also a divergence between the two exporters.)
+   - A multi-paragraph prompt had no space between its paragraphs.
+   - A heading opening a prompt silently lost its level, while a heading
+     later in the same prompt kept it.
+   - An indented code block lost the indent on its first line only: the
+     parser reports the block from its content, not its marker.
+   - The gap covering opened its paragraph with a blank line, because a gap
+     between two blocks begins with the newline that ended the last one.
+
+   **Known gaps, deliberately left:**
+   - **Inline marks inside a fallen-back block print their markers** — a
+     `~~struck~~` list item shows its tildes, because the block falls back
+     whole. Part 7 closes it for lists, Part 8 for tables.
+   - **No hyperlinks.** A link paragraph falls back to source, so the URL
+     prints for inline links; a *reference* link prints its definition line
+     instead. Real `w:hyperlink` needs a relationship per link and belongs
+     with Part 10, which already has to write rels.
+   - **Emphasis around math is dropped** — `**$x$**` renders unbolded, since
+     marks are not carried into `m:r`.
+   - **Headings are capped at three levels**, deeper ones clamping onto
+     `Heading3` rather than naming a style the document does not define.
+
+7. **Lists** — including `numbering.xml` abstract/concrete definitions. The
+   fallback in Part 6 is what this replaces; `inline::runs` already has the
+   single `match` arm to extend.
 8. **Preformatted blocks** — code blocks *and* tables, both emitted as literal
    text in a monospace style. See "Tables in v1" below; folding them together is
    what removes a whole part from this plan.
@@ -410,6 +467,30 @@ children, or a `numId` with no matching `w:num`; none of that is visible to
    diff rather than silent drift.
 4. An `#[ignore]`d, tool-gated test that converts via `soffice` and asserts
    `pdftotext` output contains expected strings. CI, not every `cargo test`.
+
+**Schema validation is not automated, and should be.** `xmllint --noout`
+proves only well-formedness; it cannot see that `w:pPr` children are a
+*sequence*, which is how two of this plan's bugs got in. Validation against
+ECMA-376's `wml.xsd` does catch them, but it has only ever been run by hand
+against a vendored copy of the schema, which is not in the repo. The schema is
+~19 MB of generated XSD across twenty files and its licence terms have not
+been checked, so vendoring it is a decision, not an oversight — but until it
+is made, every claim that a part "validates" is a claim about a manual run,
+not about the gate. The `w:pPr` and `w:rPr` orderings do at least have unit
+tests asserting the sequence directly (`paragraph_properties_follow_the_schema_sequence`).
+
+**Mutation testing is what found the Part 6 defects the other checks
+missed** — 118 of 119 viable mutants are now caught across `docx.rs` and
+`docx/inline.rs`; the one survivor is equivalent (pointing `line_start` at
+the newline instead of just past it changes nothing, because `literal` trims
+leading newlines — verified by diffing both versions over twelve inputs).
+
+**`--ignored` now runs in CI** (Part 6): the workflow installs
+`libreoffice-writer` and `poppler-utils` and runs the round-trip as its own
+step, so the only check that the document actually opens is no longer
+optional. **Mutation testing is still manual**, and it has found most of the
+real test gaps in Parts 3–6 — including two in Part 6 that every other check
+passed.
 
 ### Deferred
 

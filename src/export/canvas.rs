@@ -12,7 +12,7 @@
 
 use std::fmt::Write as _;
 
-use pulldown_cmark::{Event, Options, Parser, Tag, html};
+use pulldown_cmark::{Event, Parser, Tag, html};
 
 use crate::Result;
 use crate::export::{escape_xml, zip_package};
@@ -1010,9 +1010,8 @@ fn general_condition_xml(feedback: &Feedback) -> String {
 /// `~~strikethrough~~` — renders as real HTML rather than literal text. Tables
 /// are then given visible rules by [`style_tables`].
 fn prompt_html(markdown: &str) -> String {
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
     let mut rendered = String::new();
-    let parser = Parser::new_ext(markdown, options)
+    let parser = Parser::new_ext(markdown, crate::export::MARKDOWN)
         .map(rewrite_local_image)
         .map(rewrite_math);
     html::push_html(&mut rendered, parser);
