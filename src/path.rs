@@ -36,6 +36,19 @@ pub fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
+/// Join a bank-relative directory and a path inside it.
+///
+/// A `.` or empty directory yields the path unchanged, so `./topics` and
+/// `topics` name the same place — the same rule [`nests`] compares by, rather
+/// than gluing a `./` prefix onto every path below it.
+#[must_use]
+pub fn join_dir(dir: &str, path: &str) -> String {
+    match dir.trim_end_matches('/') {
+        "" | "." => path.to_owned(),
+        dir => format!("{dir}/{path}"),
+    }
+}
+
 /// The meaningful name components of a bank-relative directory.
 ///
 /// Drops `.` and any root/prefix component so two spellings of the same folder
@@ -135,6 +148,19 @@ mod tests {
         ] {
             assert!(!nests(one, other), "{one} should not nest with {other}");
         }
+    }
+
+    #[test]
+    /// A path below a folder carries it; a `.` or empty folder adds nothing,
+    /// so the two spellings of "here" do not produce two different paths for
+    /// the same file.
+    fn join_dir_prefixes_only_a_real_directory() {
+        assert_eq!(join_dir("topics", "q1.md"), "topics/q1.md");
+        assert_eq!(join_dir("topics/trees", "q1.md"), "topics/trees/q1.md");
+        assert_eq!(join_dir("topics/", "q1.md"), "topics/q1.md");
+        assert_eq!(join_dir("./topics", "q1.md"), "./topics/q1.md");
+        assert_eq!(join_dir(".", "q1.md"), "q1.md");
+        assert_eq!(join_dir("", "q1.md"), "q1.md");
     }
 
     #[test]

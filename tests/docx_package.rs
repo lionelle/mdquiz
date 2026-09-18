@@ -32,6 +32,40 @@ use mdquiz::quiz::spec::Layout;
 /// A page-footer template exercising every placeholder.
 const FOOTER: &str = "${name} (${variant}) — Page ${page} of ${pages}";
 
+/// The authored path of the figure one prompt embeds.
+const FIGURE: &str = "figures/maple.png";
+
+/// A real 120x60 PNG, stated at 96 DPI, as hex.
+///
+/// A genuine file rather than a synthetic header: this is the one test that
+/// hands the package to a real word processor, and a converter decodes the
+/// image it is asked to place. Hex because a `.docx` is built from bytes in
+/// memory, with no fixture directory for a reader to fall out of step with.
+const FIGURE_PNG_HEX: &str = concat!(
+    "89504e470d0a1a0a0000000d49484452000000780000003c080200000022cfe9ff000000",
+    "097048597300000ec400000ec401952b0e1b000000804944415478daeddb410d00400803",
+    "41e4e05f05ae0e0bbc488ecca60ae6df785a291080062dd0a0410b346881fe14ba326d38",
+    "d0a04183060d1a3468d0a04183060d1a3468d0a04183060d1a3468d0a04183060d1a3468",
+    "d0a04183060d1a3468d0a04183060d1a3468d0a04183060dfa1ab43c67410b3468d0020d",
+    "5aa0419faf01aa3674abd7588d250000000049454e44ae426082",
+);
+
+/// The figure's bytes, as the exporter is handed them.
+fn figure_png() -> Vec<u8> {
+    (0..FIGURE_PNG_HEX.len() / 2)
+        .map(|byte| {
+            let at = byte * 2;
+            let pair = FIGURE_PNG_HEX.get(at..at + 2).expect("a whole byte");
+            u8::from_str_radix(pair, 16).expect("hex")
+        })
+        .collect()
+}
+
+/// The images the sample exam references, as the CLI would supply them.
+fn sample_images() -> Vec<(String, Vec<u8>)> {
+    vec![(FIGURE.to_owned(), figure_png())]
+}
+
 /// A header block exercising a heading, inline marks, and bulleted, nested and
 /// ordered lists — including two ordered lists that must each start at 1.
 const HEADER: &str = "\
@@ -76,7 +110,7 @@ fn sample_exam() -> Exam {
 /// Every entry is something the writer handles differently: escaping, inline
 /// math, display math and a multi-paragraph prompt. Written as prompts on a
 /// real exam rather than as a test fixture, so the converted PDF can be read.
-const PROMPTS: [&str; 8] = [
+const PROMPTS: [&str; 9] = [
     "Is statement 0 true? Consider <a> & \"b\".",
     r"Sort in $O(n \log n)$ time and say **why** it is not $O(n)$.",
     r"Evaluate $$\sum_{i=1}^{n} i^2$$ in closed form.",
@@ -89,6 +123,10 @@ const PROMPTS: [&str; 8] = [
     // holding them, and so the rows and the indent are checked on a real page.
     "Trace the loop and complete the table:\n\n```\nfor i in 0..n:\n    total += i\n```\n\n\
      | n | total |\n|---|-------|\n| 3 |       |",
+    // An embedded figure: the drawing, its relationship and the media part
+    // have to agree, and a converter is the only reader here that proves the
+    // picture actually lands on the page.
+    "Name this tree:\n\n![a red maple](figures/maple.png)",
 ];
 
 /// One item asking the `n`th prompt, of the `n`th kind.
@@ -150,12 +188,12 @@ fn sample_kind(n: usize) -> QuestionKind {
 
 /// Every `(name, contents)` part of the generated package.
 fn package_parts() -> Vec<(String, Vec<u8>)> {
-    parts_of(to_docx(&sample_exam()).expect("the exam renders"))
+    parts_of(to_docx(&sample_exam(), &sample_images()).expect("the exam renders"))
 }
 
 /// Every `(name, contents)` part of the generated answer key.
 fn key_parts() -> Vec<(String, Vec<u8>)> {
-    parts_of(to_answer_key(&sample_exam()).expect("the key renders"))
+    parts_of(to_answer_key(&sample_exam(), &sample_images()).expect("the key renders"))
 }
 
 /// Every `(name, contents)` part of the package in `bytes`.
@@ -211,10 +249,58 @@ fn every_part_is_well_formed_xml() {
     // Word refuses a malformed one just as readily as a malformed sheet.
     for (label, parts) in [("sheet", package_parts()), ("key", key_parts())] {
         assert!(!parts.is_empty(), "the {label} holds no parts");
-        for (name, contents) in parts {
-            assert_well_formed(dir.path(), &format!("{label}-{name}"), &contents);
+        // Media parts are the exception, and the only one: they are declared
+        // by extension in `[Content_Types].xml`, so anything else that is not
+        // XML here is a part Word would reject.
+        let xml = parts
+            .iter()
+            .filter(|(name, _)| Path::new(name).extension() != Some("png".as_ref()));
+        for (name, contents) in xml {
+            assert_well_formed(dir.path(), &format!("{label}-{name}"), contents);
         }
     }
+}
+
+#[test]
+/// The embedded figure reaches the package intact, and the document draws it.
+///
+/// Byte-for-byte: a writer that re-encoded an image, or truncated it, would
+/// still produce a zip full of well-formed XML.
+fn an_embedded_image_reaches_the_package_intact() {
+    // `concat!` takes literals only, so the path is spelled twice; this is
+    // what keeps the prompt and the supplied image naming the same file.
+    assert!(
+        PROMPTS.iter().any(|prompt| prompt.contains(FIGURE)),
+        "no prompt references {FIGURE}"
+    );
+    let parts = package_parts();
+    let stored = parts
+        .iter()
+        .find(|(name, _)| name == "word/media/image1.png")
+        .map(|(_, bytes)| bytes.clone());
+    assert_eq!(stored, Some(figure_png()), "the image did not survive");
+    let document = text_part(&parts, "word/document.xml");
+    assert!(
+        document.contains(r#"descr="a red maple""#),
+        "no description"
+    );
+    let rels = text_part(&parts, "word/_rels/document.xml.rels");
+    assert!(rels.contains(r#"Target="media/image1.png""#), "{rels}");
+    // 120px at the stated 96 DPI is 1.25in, which fits the column untouched.
+    let expected = 120 * 914_400 / 96;
+    assert!(
+        document.contains(&format!(r#"cx="{expected}""#)),
+        "wrong size"
+    );
+}
+
+/// One part of `parts` as text.
+fn text_part(parts: &[(String, Vec<u8>)], name: &str) -> String {
+    let (_, bytes) = parts
+        .iter()
+        .find(|(part, _)| part == name)
+        .expect("the part is in the package");
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 #[test]
@@ -276,7 +362,7 @@ fn libreoffice_converts_the_document() {
     );
     let dir = tempfile::tempdir().expect("temp dir");
     let docx = dir.path().join("exam.docx");
-    let bytes = to_docx(&sample_exam()).expect("the exam renders");
+    let bytes = to_docx(&sample_exam(), &sample_images()).expect("the exam renders");
     std::fs::write(&docx, bytes).expect("the document is written");
 
     let pdf = convert_to_pdf(dir.path(), &docx);
@@ -302,6 +388,34 @@ fn assert_pdf_reads_as_the_exam(pdf: &Path) {
     let rendered = String::from_utf8_lossy(&text.stdout);
     assert_furniture(&rendered);
     assert_prompts(&rendered);
+    assert_figure_is_on_the_page(pdf);
+}
+
+/// The embedded figure reaches the printed page, at its authored size.
+///
+/// `pdftotext` cannot see a picture, so the whole drawing could be silently
+/// dropped by a reader and every text assertion above would still pass. This
+/// is the only check in the suite that a drawing *renders* rather than merely
+/// being well-formed.
+fn assert_figure_is_on_the_page(pdf: &Path) {
+    assert!(
+        available("pdfimages"),
+        "pdfimages is required to check the figure reached the page"
+    );
+    let listing = Command::new("pdfimages")
+        .arg("-list")
+        .arg(pdf)
+        .output()
+        .expect("pdfimages runs");
+    let rendered = String::from_utf8_lossy(&listing.stdout);
+    // Width and height as authored: a reader that rescaled the picture, or
+    // placed the wrong one, would not report 120 by 60.
+    // Columns: page, num, type, width, height, ...
+    let placed = rendered.lines().any(|line| {
+        let mut fields = line.split_whitespace().skip(3);
+        (fields.next(), fields.next()) == (Some("120"), Some("60"))
+    });
+    assert!(placed, "the figure is not on the page:\n{rendered}");
 }
 
 /// Assert the page furniture — title, header, footer, page numbers — printed.

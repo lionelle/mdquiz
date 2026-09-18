@@ -50,20 +50,31 @@ pub struct OutputFile {
 /// `seed` is the one thing here that is not derivable from `assembly`: it is
 /// what reproduces the run, so the manifest has to be told it.
 ///
+/// `images` supplies the bytes behind every local image the questions
+/// reference, keyed by the authored path — rendered diagrams included. The
+/// library never reads a file, so an image with no entry here is one the
+/// writer prints the Markdown source of instead. The same set is handed to
+/// every variant; each document embeds only the images it actually drew.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error`] if any variant holds content the Word writer
 /// cannot render, or if the manifest cannot be serialised.
-pub fn render(assembly: &Assembly, stem: &str, seed: u64) -> Result<Vec<OutputFile>> {
+pub fn render(
+    assembly: &Assembly,
+    stem: &str,
+    seed: u64,
+    images: &[(String, Vec<u8>)],
+) -> Result<Vec<OutputFile>> {
     let mut files = Vec::new();
     for exam in &assembly.exams {
         files.push(OutputFile {
             name: file_name(stem, exam.variant.as_deref(), false),
-            bytes: docx::to_docx(exam)?,
+            bytes: docx::to_docx(exam, images)?,
         });
         files.push(OutputFile {
             name: file_name(stem, exam.variant.as_deref(), true),
-            bytes: docx::to_answer_key(exam)?,
+            bytes: docx::to_answer_key(exam, images)?,
         });
     }
     files.push(OutputFile {
@@ -137,8 +148,13 @@ mod tests {
     /// two papers — a letter circled on variant B means something else on A —
     /// so a missing key here is a pile of exams nobody can mark.
     fn every_variant_gets_a_sheet_and_a_key() {
-        let files =
-            render(&assembly(&[Some("A"), Some("B"), Some("C")]), "midterm", 1).expect("renders");
+        let files = render(
+            &assembly(&[Some("A"), Some("B"), Some("C")]),
+            "midterm",
+            1,
+            &[],
+        )
+        .expect("renders");
         let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
         assert_eq!(
             names,
@@ -158,7 +174,7 @@ mod tests {
     /// A lone sheet carries no variant in its name: an `-A` implies a `-B`
     /// that does not exist.
     fn a_single_variant_is_named_for_its_stem_alone() {
-        let files = render(&assembly(&[None]), "quiz", 1).expect("renders");
+        let files = render(&assembly(&[None]), "quiz", 1, &[]).expect("renders");
         let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
         assert_eq!(names, ["quiz.docx", "quiz-key.docx", "quiz-manifest.yaml"]);
     }
@@ -174,7 +190,7 @@ mod tests {
         {
             item.question.kind = QuestionKind::TrueFalse(TrueFalse { answer: false });
         }
-        let files = render(&quiz, "exam", 1).expect("renders");
+        let files = render(&quiz, "exam", 1, &[]).expect("renders");
         let key_of = |name: &str| {
             files
                 .iter()
@@ -203,7 +219,7 @@ mod tests {
     /// A file name is a bare name, never a path: the library has no business
     /// reaching outside the directory the caller chose.
     fn a_file_name_never_escapes_its_directory() {
-        let files = render(&assembly(&[Some("A"), None]), "exam", 1).expect("renders");
+        let files = render(&assembly(&[Some("A"), None]), "exam", 1, &[]).expect("renders");
         for file in &files {
             assert!(
                 !file.name.contains('/') && !file.name.contains('\\'),
@@ -219,7 +235,7 @@ mod tests {
     /// manifest is still written: a run that drew nothing is worth a record
     /// saying so, with the seed that did it.
     fn an_assembly_with_no_variants_produces_only_a_manifest() {
-        let files = render(&assembly(&[]), "exam", 1).expect("renders");
+        let files = render(&assembly(&[]), "exam", 1, &[]).expect("renders");
         let names: Vec<&str> = files.iter().map(|file| file.name.as_str()).collect();
         assert_eq!(
             names,

@@ -24,7 +24,7 @@
 
 use crate::model::Question;
 use crate::parse::{self, PartialReader};
-use crate::path::parent_dir;
+use crate::path::{join_dir, parent_dir};
 use crate::quiz::exam::{Exam, ExamItem};
 use crate::quiz::sample::{self, SampleRng, Source};
 use crate::quiz::spec::{Group, Spec, Take, group_at};
@@ -46,6 +46,28 @@ pub struct Assembly {
     pub exams: Vec<Exam>,
     /// Warnings from validating the spec against the real question pools.
     pub warnings: Vec<String>,
+}
+
+impl Assembly {
+    /// Every question on every variant, in variant then item order.
+    ///
+    /// Variants hold their own copies, so the same question appears once per
+    /// variant that drew it. Callers that scan for something shared — the
+    /// images to bundle, the diagrams to render — want the whole run in one
+    /// pass rather than variant by variant, because the dedupe is theirs to
+    /// do and doing it per variant does not dedupe at all.
+    pub fn questions(&self) -> impl Iterator<Item = &Question> {
+        self.exams
+            .iter()
+            .flat_map(|exam| exam.items.iter().map(|item| &item.question))
+    }
+
+    /// The same, for a pass that rewrites the questions in place.
+    pub fn questions_mut(&mut self) -> impl Iterator<Item = &mut Question> {
+        self.exams
+            .iter_mut()
+            .flat_map(|exam| exam.items.iter_mut().map(|item| &mut item.question))
+    }
 }
 
 /// One group's questions, parsed once and shared by every variant.
@@ -182,7 +204,7 @@ fn pool_for(spec: &Spec, group: &Group, questions: Vec<(String, Question)>) -> P
 /// Returns the parse failure with the offending file named.
 fn parse_one(path: &str, contents: &str, read: &PartialReader<'_>) -> Result<Question> {
     let base = parent_dir(path).to_owned();
-    let scoped = |relative: &str| read(&join(&base, relative));
+    let scoped = |relative: &str| read(&join_dir(&base, relative));
     let mut question =
         parse::parse_question_with(contents, &scoped).map_err(|error| Error::QuestionFile {
             file: path.to_owned(),
@@ -190,14 +212,6 @@ fn parse_one(path: &str, contents: &str, read: &PartialReader<'_>) -> Result<Que
         })?;
     parse::rebase_local_paths(&mut question, &base);
     Ok(question)
-}
-
-/// Join a spec-relative `base` folder and a `relative` path.
-fn join(base: &str, relative: &str) -> String {
-    if base.is_empty() {
-        return relative.to_owned();
-    }
-    format!("{base}/{relative}")
 }
 
 /// Read an optional spec-relative file, naming the key if it cannot be read.

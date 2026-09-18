@@ -10,7 +10,12 @@
 //! math) and part is block-level. Lists are laid out: [`list`] and
 //! [`item_paragraphs`] hand each item a `w:numId` from [`super::numbering`],
 //! so the markers are Word's own rather than characters typed into the text.
-//! Every other block — tables, code blocks, images — is **refused** rather
+//! Images are placed: an `![alt](path.png)` whose bytes were supplied becomes
+//! a `w:drawing` from [`super::media`], carrying its alt text as the
+//! description. One that was not — a remote URL, a missing file, a format
+//! that is not PNG — falls back with the rest.
+//!
+//! Every other block — tables, code blocks, links — is **refused** rather
 //! than dropped: a block this module cannot render is emitted as its own
 //! Markdown source, so a table prints as `| a | b |` instead of silently
 //! losing its columns. Tables and code blocks, whose alignment carries
@@ -38,7 +43,8 @@ use std::ops::Range;
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
-use super::numbering::{Item, MAX_LEVEL, Marker, Numbering};
+use super::Refs;
+use super::numbering::{Item, MAX_LEVEL, Marker};
 use super::omml::{self, Display};
 use crate::export::escape_xml;
 use crate::{Error, Result};
@@ -96,15 +102,16 @@ impl Paragraph {
 /// Only the runs are decided here. The caller picks the `w:pPr` to wrap them
 /// in, because the same prose is set differently as a header and as a prompt.
 ///
-/// `numbering` accumulates the document's lists; it is threaded in rather
-/// than built here because `w:numId`s must be unique across the whole
-/// document, and a prompt does not know what the header already opened.
+/// `refs` accumulates the lists and images the document uses; it is threaded
+/// in rather than built here because a `w:numId` and an `r:embed` must be
+/// unique across the whole document, and a prompt does not know what the
+/// header already opened.
 ///
 /// # Errors
 ///
 /// Returns [`Error::UnsupportedMath`] if a `$…$` span cannot be converted to
 /// OOXML math, or sits in a block that would be printed as source.
-pub(super) fn paragraphs(markdown: &str, numbering: &mut Numbering) -> Result<Vec<Paragraph>> {
+pub(super) fn paragraphs(markdown: &str, refs: &mut Refs<'_>) -> Result<Vec<Paragraph>> {
     // Normalised first: authored text arriving CRLF would otherwise carry a
     // stray `\r` into `<w:t>`, which XML line-ending normalisation rewrites on
     // read — the document would not round-trip through its own reader.
@@ -117,7 +124,7 @@ pub(super) fn paragraphs(markdown: &str, numbering: &mut Numbering) -> Result<Ve
         covered = range.end.max(covered);
         block.render(
             source.get(from..range.end).unwrap_or_default(),
-            numbering,
+            refs,
             &mut rendered,
         )?;
     }
@@ -147,7 +154,7 @@ enum Block<'a> {
     Literal(Vec<Event<'a>>),
 }
 
-impl Block<'_> {
+impl<'e> Block<'e> {
     /// Append this block's paragraphs to `out`, falling back to `source` where
     /// its inline structure cannot be rendered — and printing `source` outright
     /// for the blocks that are always set that way.
@@ -156,38 +163,57 @@ impl Block<'_> {
     ///
     /// Returns [`Error::UnsupportedMath`] if the block holds math that cannot
     /// be rendered or would fall back to source.
-    fn render(
-        self,
-        source: &str,
-        numbering: &mut Numbering,
-        out: &mut Vec<Paragraph>,
-    ) -> Result<()> {
-        let (events, face) = match self {
-            Self::Prose(kind, events) => match runs(&events, kind)? {
-                Some(runs) => {
-                    out.push(Paragraph { kind, runs });
-                    return Ok(());
-                }
-                // The markers are what prints now, so it is no longer a
-                // heading: `## Part *2*` falls back as `## Part *2*`.
-                None => (events, Face::Body),
-            },
-            Self::List(marker, events) => match list(&events, marker, 0, numbering)? {
-                Some(paragraphs) => {
-                    out.extend(paragraphs);
-                    return Ok(());
-                }
-                None => (events, Face::Body),
-            },
-            Self::Preformatted(events) => (events, Face::Code),
-            Self::Literal(events) => (events, Face::Body),
+    fn render(self, source: &str, refs: &mut Refs<'_>, out: &mut Vec<Paragraph>) -> Result<()> {
+        // A block is laid out speculatively: the runs are built, and a later
+        // event can still send the whole block to source. Anything those runs
+        // registered goes back with them — an image bundled into a package
+        // that no longer draws it is a part nothing cites.
+        let mark = refs.media.mark();
+        let Some((events, face)) = self.laid_out(refs, out)? else {
+            return Ok(());
         };
+        refs.media.rewind(mark);
         refuse_math(&events)?;
         out.push(Paragraph {
             kind: Kind::Prose,
             runs: literal(source, &face.properties()),
         });
         Ok(())
+    }
+
+    /// Lay this block out into `out`, or report the events and face it must
+    /// be printed as source with.
+    ///
+    /// `Ok(None)` means it was laid out and there is nothing left to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedMath`] if the block holds math that cannot
+    /// be rendered.
+    fn laid_out(
+        self,
+        refs: &mut Refs<'_>,
+        out: &mut Vec<Paragraph>,
+    ) -> Result<Option<(Vec<Event<'e>>, Face)>> {
+        match self {
+            Self::Prose(kind, events) => {
+                let Some(runs) = runs(&events, kind, refs)? else {
+                    // The markers are what prints now, so it is no longer a
+                    // heading: `## Part *2*` falls back as `## Part *2*`.
+                    return Ok(Some((events, Face::Body)));
+                };
+                out.push(Paragraph { kind, runs });
+            }
+            Self::List(marker, events) => {
+                let Some(paragraphs) = list(&events, marker, 0, refs)? else {
+                    return Ok(Some((events, Face::Body)));
+                };
+                out.extend(paragraphs);
+            }
+            Self::Preformatted(events) => return Ok(Some((events, Face::Code))),
+            Self::Literal(events) => return Ok(Some((events, Face::Body))),
+        }
+        Ok(None)
     }
 }
 
@@ -329,9 +355,9 @@ fn list(
     events: &[Event<'_>],
     marker: Marker,
     level: u8,
-    numbering: &mut Numbering,
+    refs: &mut Refs<'_>,
 ) -> Result<Option<Vec<Paragraph>>> {
-    let id = numbering.open(marker, level);
+    let id = refs.lists.open(marker, level);
     let mut rendered = Vec::new();
     for item_events in items(events) {
         let item = Item {
@@ -339,7 +365,7 @@ fn list(
             level,
             marked: true,
         };
-        let Some(paragraphs) = item_paragraphs(item_events, item, numbering)? else {
+        let Some(paragraphs) = item_paragraphs(item_events, item, refs)? else {
             return Ok(None);
         };
         rendered.extend(paragraphs);
@@ -356,7 +382,7 @@ fn list(
 fn item_paragraphs(
     events: &[Event<'_>],
     mut item: Item,
-    numbering: &mut Numbering,
+    refs: &mut Refs<'_>,
 ) -> Result<Option<Vec<Paragraph>>> {
     let mut rendered = Vec::new();
     let segments = segments(events);
@@ -368,7 +394,7 @@ fn item_paragraphs(
         match segment {
             Segment::Text(events) => {
                 let kind = Kind::Item(item);
-                let Some(runs) = runs(events, kind)? else {
+                let Some(runs) = runs(events, kind, refs)? else {
                     return Ok(None);
                 };
                 rendered.push(Paragraph { kind, runs });
@@ -376,7 +402,7 @@ fn item_paragraphs(
             }
             Segment::Nested(nested, events) => {
                 let deeper = item.level.saturating_add(1).min(MAX_LEVEL);
-                let Some(paragraphs) = list(events, nested, deeper, numbering)? else {
+                let Some(paragraphs) = list(events, nested, deeper, refs)? else {
                     return Ok(None);
                 };
                 rendered.extend(paragraphs);
@@ -474,44 +500,89 @@ fn nested<'a, 'e>(events: &'a [Event<'e>], start: usize) -> (&'a [Event<'e>], us
 /// Render one paragraph's inline events as runs.
 ///
 /// `Ok(None)` means the paragraph holds something this writer does not render
-/// — an image, a link, raw HTML — and the caller should fall back to literal
-/// source.
+/// — a link, raw HTML, an image whose bytes were not supplied — and the
+/// caller should fall back to literal source.
 ///
 /// # Errors
 ///
 /// Returns [`Error::UnsupportedMath`] if a math span cannot be converted, or
 /// if the paragraph is falling back and holds math.
-fn runs(events: &[Event<'_>], kind: Kind) -> Result<Option<String>> {
+fn runs(events: &[Event<'_>], kind: Kind, refs: &mut Refs<'_>) -> Result<Option<String>> {
     let display = match kind {
         Kind::Equation => Display::Block,
         Kind::Prose | Kind::Heading(_) | Kind::Item(_) => Display::Inline,
     };
     let mut xml = String::new();
     let mut marks = Marks::default();
-    for event in events {
+    let mut at = 0_usize;
+    while let Some(event) = events.get(at) {
+        let opened = at;
+        at = at.saturating_add(1);
         if marks.apply(event) {
             continue;
         }
-        match event {
-            Event::Text(text) => xml.push_str(&run(text, &marks.properties())),
-            Event::Code(text) => xml.push_str(&run(text, &marks.as_code().properties())),
-            // A soft break is a line wrap in the source, not in the output;
-            // the paragraph reflows, so it is a space. A hard break is
-            // authored on purpose and keeps its line.
-            Event::SoftBreak => xml.push_str(&run(" ", &marks.properties())),
-            Event::HardBreak => xml.push_str("<w:r><w:br/></w:r>"),
-            Event::InlineMath(latex) => xml.push_str(&omml::to_omml(latex, Display::Inline)?),
-            Event::DisplayMath(latex) => xml.push_str(&omml::to_omml(latex, display)?),
-            // One arm, so the set of constructs this writer claims to render
-            // cannot drift from the set it actually renders. The whole
-            // paragraph falls back, and `refuse_math` is given *every* event
-            // rather than only those reached so far — otherwise whether an
-            // exam exported would depend on which came first, the math or the
-            // link.
-            _ => return refuse_math(events).map(|()| None),
+        // An image is the one construct here that spans several events: its
+        // alt text sits between the `Start` and the `End`, so the walk steps
+        // over the whole span rather than meeting the inner text again as
+        // prose the picture already carries.
+        if let Event::Start(Tag::Image { dest_url, .. }) = event {
+            let (inner, past) = nested(events, opened);
+            at = past;
+            let Some(drawing) = refs.media.drawing(dest_url, &alt_text(inner)) else {
+                return refuse_math(events).map(|()| None);
+            };
+            xml.push_str(&drawing);
+            continue;
         }
+        // One fallback, so the set of constructs this writer claims to render
+        // cannot drift from the set it actually renders. The whole paragraph
+        // falls back, and `refuse_math` is given *every* event rather than
+        // only those reached so far — otherwise whether an exam exported
+        // would depend on which came first, the math or the link.
+        let Some(rendered) = character_run(event, marks, display)? else {
+            return refuse_math(events).map(|()| None);
+        };
+        xml.push_str(&rendered);
     }
     Ok(Some(xml))
+}
+
+/// One run for an event that carries nothing but character-level structure.
+///
+/// `Ok(None)` for anything else — a link, raw HTML — which sends the whole
+/// paragraph to literal source.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedMath`] if a math span cannot be converted.
+fn character_run(event: &Event<'_>, marks: Marks, display: Display) -> Result<Option<String>> {
+    Ok(Some(match event {
+        Event::Text(text) => run(text, &marks.properties()),
+        Event::Code(text) => run(text, &marks.as_code().properties()),
+        // A soft break is a line wrap in the source, not in the output; the
+        // paragraph reflows, so it is a space. A hard break is authored on
+        // purpose and keeps its line.
+        Event::SoftBreak => run(" ", &marks.properties()),
+        Event::HardBreak => "<w:r><w:br/></w:r>".to_owned(),
+        Event::InlineMath(latex) => omml::to_omml(latex, Display::Inline)?,
+        Event::DisplayMath(latex) => omml::to_omml(latex, display)?,
+        _ => return Ok(None),
+    }))
+}
+
+/// The alt text of an image: the plain text authored inside its `![…]`.
+///
+/// It becomes the picture's description in the document, which is what a
+/// screen reader announces — so an unlabelled figure on an exam paper is
+/// unlabelled for the student who needs the label most.
+fn alt_text(events: &[Event<'_>]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Text(text) | Event::Code(text) => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Refuse `events` if any of them is math.
@@ -667,12 +738,34 @@ fn literal(source: &str, properties: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Render `markdown` into a document with no other lists in it.
+    /// Render `markdown` into a document with nothing else in it and no
+    /// images supplied.
     ///
-    /// Each call gets a fresh [`Numbering`], so a test's `w:numId`s start at
-    /// 1 and do not depend on what another test rendered.
+    /// Each call gets a fresh [`Refs`], so a test's `w:numId`s start at 1 and
+    /// do not depend on what another test rendered.
     fn rendered(markdown: &str) -> Result<Vec<Paragraph>> {
-        paragraphs(markdown, &mut Numbering::new())
+        paragraphs(markdown, &mut Refs::new(&[]))
+    }
+
+    /// Render `markdown` with `images` available to place.
+    fn rendered_with(markdown: &str, images: &[(String, Vec<u8>)]) -> Result<Vec<Paragraph>> {
+        paragraphs(markdown, &mut Refs::new(images))
+    }
+
+    /// One supplied image, a one-inch square named `figure.png`.
+    fn figure() -> Vec<(String, Vec<u8>)> {
+        vec![(
+            "figure.png".to_owned(),
+            super::super::media::tests::png(96, 96, None),
+        )]
+    }
+
+    /// The runs of the single paragraph `markdown` renders to, with `figure`
+    /// supplied.
+    fn only_with_figure(markdown: &str) -> String {
+        let mut rendered = rendered_with(markdown, &figure()).expect("renders");
+        assert_eq!(rendered.len(), 1, "expected one paragraph: {rendered:?}");
+        rendered.pop().map(|block| block.runs).unwrap_or_default()
     }
 
     /// The runs of the single paragraph `markdown` renders to.
@@ -949,9 +1042,9 @@ mod tests {
     /// `w:startOverride`; dropping it renumbers the list to start at 1, which
     /// looks deliberate on the page.
     fn an_authored_start_value_reaches_the_numbering() {
-        let mut numbering = Numbering::new();
-        paragraphs("5. five\n6. six", &mut numbering).expect("renders");
-        let xml = numbering.to_xml();
+        let mut refs = Refs::new(&[]);
+        paragraphs("5. five\n6. six", &mut refs).expect("renders");
+        let xml = refs.lists.to_xml();
         assert!(xml.contains(r#"<w:startOverride w:val="5"/>"#), "{xml}");
     }
 
@@ -1349,5 +1442,203 @@ mod tests {
     fn empty_markdown_renders_no_paragraphs() {
         assert!(rendered("").expect("renders").is_empty());
         assert!(rendered("   \n\n  ").expect("renders").is_empty());
+    }
+
+    #[test]
+    /// A supplied image is placed as a drawing, carrying its alt text as the
+    /// description a screen reader announces.
+    fn a_supplied_image_becomes_a_drawing() {
+        let runs = only_with_figure("Look: ![a red maple](figure.png)");
+        assert!(runs.contains("<w:drawing>"), "{runs}");
+        assert!(runs.contains(r#"descr="a red maple""#), "{runs}");
+        assert!(runs.contains(r#"r:embed="rIdImage1""#), "{runs}");
+    }
+
+    #[test]
+    /// The alt text describes the picture; it is not also printed beside it.
+    /// The walk steps over the whole image span, and one that did not would
+    /// set every caption twice — once as a description, once as prose.
+    fn alt_text_is_not_printed_as_well_as_described() {
+        let runs = only_with_figure("![a red maple](figure.png)");
+        assert!(runs.contains(r#"descr="a red maple""#), "{runs}");
+        assert!(!runs.contains("<w:t"), "the alt text printed too: {runs}");
+    }
+
+    #[test]
+    /// Text either side of an image keeps its place, and is rendered once.
+    fn text_around_an_image_survives_it() {
+        let runs = only_with_figure("before ![f](figure.png) after");
+        let text: Vec<&str> = runs.split("<w:t").skip(1).collect();
+        assert_eq!(text.len(), 2, "{runs}");
+        assert!(runs.contains(">before <"), "{runs}");
+        assert!(runs.contains("> after<"), "{runs}");
+    }
+
+    #[test]
+    /// An image nobody supplied bytes for falls back to its Markdown source,
+    /// so the path stays visible on the page for the author to chase.
+    fn an_unsupplied_image_falls_back_to_its_source() {
+        let mut rendered = rendered_with("![fig](missing.png)", &figure()).expect("renders");
+        let runs = rendered.pop().map(|block| block.runs).unwrap_or_default();
+        assert!(!runs.contains("<w:drawing>"), "{runs}");
+        assert!(runs.contains("![fig](missing.png)"), "{runs}");
+    }
+
+    #[test]
+    /// A remote image falls back too: the library never fetches, so the URL
+    /// prints rather than vanishing.
+    fn a_remote_image_falls_back_to_its_source() {
+        let source = "![fig](https://example.test/f.png)";
+        let mut rendered = rendered_with(source, &figure()).expect("renders");
+        let runs = rendered.pop().map(|block| block.runs).unwrap_or_default();
+        assert!(!runs.contains("<w:drawing>"), "{runs}");
+        assert!(runs.contains("example.test"), "{runs}");
+    }
+
+    #[test]
+    /// An image in a list item is placed, and the item keeps its numbering.
+    /// The list is the case that used to send a whole list to source because
+    /// one item held a picture.
+    fn an_image_in_a_list_item_is_placed() {
+        let rendered =
+            rendered_with("- see ![f](figure.png)\n- and this", &figure()).expect("renders");
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        let first = rendered.first().expect("an item");
+        assert!(matches!(first.kind, Kind::Item(_)), "{first:?}");
+        assert!(first.runs.contains("<w:drawing>"), "{first:?}");
+    }
+
+    #[test]
+    /// Math beside an image that *can* be placed is rendered, not refused.
+    /// The refusal exists because the fallback prints LaTeX as source; once
+    /// the paragraph no longer falls back, there is nothing to refuse.
+    fn math_beside_a_placed_image_is_rendered() {
+        let runs = only_with_figure(r"Given ![f](figure.png), find $x^2$.");
+        assert!(runs.contains("<w:drawing>"), "{runs}");
+        assert!(runs.contains("<m:oMath>"), "{runs}");
+    }
+
+    #[test]
+    /// Math beside an image that cannot be placed is still refused. The
+    /// paragraph falls back to source, which is the path that would print
+    /// `$x^2$` on the page for a student to read as a question.
+    fn math_beside_an_unplaceable_image_is_still_refused() {
+        let refused = rendered_with(r"Given ![f](missing.png), find $x^2$.", &figure());
+        assert!(
+            matches!(refused, Err(Error::UnsupportedMath { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    /// Two images in one paragraph are both placed, each with its own
+    /// relationship — the walk must not stop at the first.
+    fn two_images_in_one_paragraph_are_both_placed() {
+        let images = vec![
+            (
+                "one.png".to_owned(),
+                super::super::media::tests::png(96, 96, None),
+            ),
+            (
+                "two.png".to_owned(),
+                super::super::media::tests::png(48, 48, None),
+            ),
+        ];
+        let mut rendered =
+            rendered_with("![a](one.png) then ![b](two.png)", &images).expect("renders");
+        let runs = rendered.pop().map(|block| block.runs).unwrap_or_default();
+        assert_eq!(runs.matches("<w:drawing>").count(), 2, "{runs}");
+        assert!(runs.contains(r#"r:embed="rIdImage1""#), "{runs}");
+        assert!(runs.contains(r#"r:embed="rIdImage2""#), "{runs}");
+    }
+
+    #[test]
+    /// A paragraph that places an image and *then* falls back registers
+    /// nothing. The runs are thrown away, so the bundled bytes have to go
+    /// with them — otherwise the package carries a picture it never draws.
+    fn an_image_in_a_paragraph_that_falls_back_is_not_registered() {
+        let images = figure();
+        let mut refs = Refs::new(&images);
+        let source = "see ![f](figure.png) and [the rubric](https://x.example)";
+        let rendered = paragraphs(source, &mut refs).expect("renders");
+        let runs = rendered
+            .first()
+            .map(|block| block.runs.clone())
+            .unwrap_or_default();
+        assert!(!runs.contains("<w:drawing>"), "{runs}");
+        assert!(runs.contains("![f](figure.png)"), "{runs}");
+        assert!(
+            refs.media.parts().is_empty(),
+            "an image was bundled for a paragraph that prints as source"
+        );
+    }
+
+    #[test]
+    /// The same, for a list: one item's link sends the whole list to source,
+    /// and another item's image must not stay bundled.
+    fn an_image_in_a_list_that_falls_back_is_not_registered() {
+        let images = figure();
+        let mut refs = Refs::new(&images);
+        let source = "- see ![f](figure.png)\n- read [this](https://x.example)";
+        paragraphs(source, &mut refs).expect("renders");
+        assert!(refs.media.parts().is_empty(), "the list's image stayed");
+    }
+
+    #[test]
+    /// An image inside a link falls back with the link, and bundles nothing.
+    fn an_image_wrapped_in_a_link_falls_back() {
+        let images = figure();
+        let mut refs = Refs::new(&images);
+        let source = "[![alt](figure.png)](https://x.example)";
+        let rendered = paragraphs(source, &mut refs).expect("renders");
+        let runs = rendered
+            .first()
+            .map(|block| block.runs.clone())
+            .unwrap_or_default();
+        assert!(!runs.contains("<w:drawing>"), "{runs}");
+        assert!(refs.media.parts().is_empty());
+    }
+
+    #[test]
+    /// Alt text authored with emphasis reaches the description as its text.
+    /// Dropping the whole alt because it held a `*` would leave the figure
+    /// undescribed for the reader who most needs it described.
+    fn marked_up_alt_text_becomes_its_plain_text() {
+        let runs = only_with_figure("![a *red* maple](figure.png)");
+        assert!(runs.contains(r#"descr="a red maple""#), "{runs}");
+    }
+
+    #[test]
+    /// An image in a heading is placed, and the heading stays a heading.
+    fn an_image_in_a_heading_is_placed() {
+        let mut rendered = rendered_with("# See ![f](figure.png)", &figure()).expect("renders");
+        let block = rendered.pop().expect("one paragraph");
+        assert!(matches!(block.kind, Kind::Heading(1)), "{block:?}");
+        assert!(block.runs.contains("<w:drawing>"), "{block:?}");
+    }
+
+    #[test]
+    /// Bytes that are not a PNG leave the reference visible as source. This
+    /// is what the signature check buys: an injected diagram renderer that
+    /// ignored the format it was asked for lands SVG behind a `.png` path,
+    /// and the author sees the path rather than a document that will not
+    /// open.
+    fn a_non_png_behind_a_png_path_falls_back_visibly() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>"#;
+        let images = vec![("generated/mermaid-ab.png".to_owned(), svg.to_vec())];
+        let mut rendered =
+            rendered_with("![flow](generated/mermaid-ab.png)", &images).expect("renders");
+        let runs = rendered.pop().map(|block| block.runs).unwrap_or_default();
+        assert!(!runs.contains("<w:drawing>"), "{runs}");
+        assert!(runs.contains("generated/mermaid-ab.png"), "{runs}");
+    }
+
+    #[test]
+    /// An emphasised image is still an image. The marks around it apply to
+    /// text, and a picture carries none — but the walk must not lose the
+    /// picture while tracking them.
+    fn an_image_inside_emphasis_is_still_placed() {
+        let runs = only_with_figure("**![f](figure.png)**");
+        assert!(runs.contains("<w:drawing>"), "{runs}");
     }
 }

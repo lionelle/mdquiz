@@ -1160,10 +1160,12 @@ fn percent_encode_component(text: &str) -> String {
 /// exporter bundles these under `web_resources/`; the CLI resolves them to bytes
 /// relative to the question directory.
 ///
-/// Operates on a question slice; a caller holding an [`ItemBank`] passes
-/// `&bank.items`.
+/// Operates on any run of questions, so a caller holding an [`ItemBank`]
+/// passes `bank.items.iter()` and one holding several assembled variants
+/// passes a chain across all of them — which is what dedupes a figure two
+/// variants both drew down to one bundled copy.
 #[must_use]
-pub fn local_image_paths(items: &[Question]) -> Vec<String> {
+pub fn local_image_paths<'a>(items: impl IntoIterator<Item = &'a Question>) -> Vec<String> {
     let mut paths = Vec::new();
     for question in items {
         for field in question.rich_text_fields() {

@@ -558,8 +558,110 @@ existing pattern.
    Part 9 is complete. `export/markdown.rs` keeps deriving its own order for
    the bank path, correctly — it never sees an `ExamItem`. What it must not do
    is derive a *different* order, which is what the bug above was.
-10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
-    (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.
+10. **Images and diagrams.** *Done* — PNG only, placed as real drawings.
+
+    `export::docx::media` owns the third thing an image needs beyond a run: a
+    *part* in the package and a relationship pointing at it. A `w:drawing`
+    carries no image, it carries an `r:embed` naming a relationship, so a
+    picture only appears if three files agree — and one module decides all
+    three.
+
+    **The id is minted at the moment the drawing is written.** That is the
+    whole reason `Media` is a mutable registry threaded through the writers
+    rather than a scan of the same Markdown done separately: a second scan
+    that disagreed with the renderer by one image would leave a dangling
+    `r:embed`, and Word does not lose the picture for that — it refuses to
+    open the document. `relationships_resolve_in_both_directions` now checks
+    `r:embed` as well as `r:id`; it only checked the latter, which is exactly
+    the half that images do not use.
+
+    **`Refs` replaced the threaded `Numbering`.** Lists and images are the
+    same kind of thing — an id minted while the body is written, redeemed by
+    a part written afterwards — and both are needed together, since authored
+    Markdown can hold a list holding an image. Bundling them kept one
+    parameter across the twenty-three signatures that had it rather than
+    growing a second.
+
+    **SVG-in-DOCX is out of scope, and enforced by signature.** Word places
+    SVG through `asvg:svgBlip`, an *extension* that needs a rasterised copy
+    beside it for readers that do not understand it — so shipping SVG means
+    shipping a PNG anyway. `media` therefore reads the PNG magic number
+    rather than trusting the file extension, which is load-bearing: the
+    diagram renderer is injected, and one that ignores the format it was
+    asked for lands SVG bytes behind a `generated/….png` path. An extension
+    check would pass that straight through into a document that will not
+    open. The quiz path has no `--diagram-format` flag at all; it forces PNG
+    by not offering the choice.
+
+    **Sizing reads the PNG.** Pixels are not a physical size, so a `pHYs`
+    chunk is honoured where present and 96 DPI — Word's own assumption —
+    where it is not. Without that a 300 DPI screenshot prints three times too
+    wide. Anything larger than the text column is scaled in one step, by
+    whichever dimension overruns by more; clamping width and height
+    separately is the tempting version and it squashes the picture. The
+    height cap matters too: a `wp:inline` picture does not paginate, it is
+    cut off at the bottom margin.
+
+    Alt text becomes `descr` on both `wp:docPr` and `pic:cNvPr`, which is what
+    a screen reader announces. An image whose bytes were not supplied — a
+    remote URL, a missing file, a non-PNG — falls back to its Markdown source
+    with the rest, so the path stays visible for the author to chase.
+
+    **A real bug came out of the first end-to-end run.** `cli.rs` was handing
+    `assemble` *group*-relative source paths (`q1.md`) where the library
+    documents spec-relative ones (`topics/q1.md`). `assemble` recovers a
+    question's own folder from the directory part of its path and rebases its
+    images and `file:` partials against it, so every image beside a question
+    in a group folder was looked for beside the *spec* — and two groups'
+    identically named figures would have collided. Both spellings of the join
+    now go through one `path::join_dir`, replacing a private copy in
+    `assemble`.
+
+    Verified end to end, not just in the suite: a two-variant spec with an
+    authored PNG and a ` ```mermaid ` block produced sheets holding both
+    images, and `pdfimages -list` on the LibreOffice conversion reports them
+    on the page at 96 ppi, unscaled. The `#[ignore]`d conversion test now
+    asserts that — `pdftotext` cannot see a picture, so every text assertion
+    would have passed with the drawing silently dropped.
+
+    **Three more defects came out of the review pass.**
+
+    *An image placed in a paragraph that then fell back stayed bundled.* A
+    block is laid out speculatively — the runs are built, and a later link or
+    raw HTML still sends the whole block to Markdown source. Those runs are
+    discarded; the registered image was not, so the package carried a part
+    and a relationship nothing cited. `Media::mark`/`rewind` now bracket the
+    attempt, and `Block::render` rewinds on each fallback arm. Exact, because
+    `used` only grows by one push per image first drawn — an image an earlier
+    paragraph placed is found by the lookup and never pushed again, so
+    truncating cannot discard it.
+
+    *`fit` returned an unclamped extent when a dimension rounded to zero.*
+    A `pHYs` chunk states its two resolutions independently, so a corrupt one
+    reaches the sizing with a width that rounds away and a height that does
+    not. The zero shortcut returned both untouched: `cx="0"`, which Word
+    draws as nothing, beside a `cy` past what the schema admits, which Word
+    rejects the file over. Each axis is now clamped on its own there, and
+    `shrink`'s one-EMU floor applies on every path.
+
+    *A failing diagram was retried once per variant.* `render_diagrams`
+    remembered successes but not failures, so a missing `mmdc` was shelled
+    out to — and warned about — once per copy of the question. `Seen` now
+    holds both. This reverses a documented decision (`Failures are not cached
+    the way renders are`), and deliberately: that rationale was "each block
+    needing attention is named", which variants broke. The warning names the
+    *question*, so four clones produce four byte-identical lines reporting
+    one problem. Two genuinely different failing diagrams still warn twice.
+
+    Also from the review: the relationship `Target` and the media part path
+    are now derived from one `MEDIA_DIR` rather than two spellings that
+    happened to agree; the registry stores the supplied entries rather than
+    indices into them, so `parts` cannot resolve fewer than `relationships`
+    declares; `Assembly::questions`/`questions_mut` moved the variant walk
+    out of `cli.rs`; and `parse::rebase_images` joins through `path::join_dir`
+    like `assemble` does, because the Word writer matches a supplied image by
+    its authored path *as a string* — a `./` one adds and the other does not
+    is a picture that silently fails to place.
 11. **`mdquiz quiz` subcommand.** *Done* — sheets, keys and the run manifest.
 
     `quiz::output::render` pairs every variant with its answer key and names
@@ -717,6 +819,10 @@ passed.
 - **Real DOCX tables.** `w:tbl`/`w:tblGrid`/`w:tblPr`/`w:tblBorders`, to reach
   parity with the Canvas exporter's bordered tables. v1 emits table text
   instead; see "Tables in v1".
+- **SVG in DOCX.** Needs `asvg:svgBlip` inside `a:blip`'s extension list
+  *plus* a rasterised `r:embed` fallback, so it is strictly more work than PNG
+  and never less — see Part 10. The Canvas path still offers
+  `--diagram-format svg`, where it is a plain `<img>`.
 - **Per-question points on the sheet.** `Question::points` exists but no
   exporter prints it. A paper exam wants per-question points and a per-variant
   total.

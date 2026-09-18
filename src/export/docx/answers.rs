@@ -27,8 +27,8 @@
 
 use std::fmt::Write as _;
 
+use super::Refs;
 use super::inline;
-use super::numbering::Numbering;
 use crate::Result;
 use crate::label::sequence as choice_label;
 use crate::model::{Choice, Matching, Ordering, Question, QuestionKind};
@@ -72,16 +72,16 @@ pub(super) fn prompt(question: &Question) -> String {
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an option holds math that
 /// cannot be rendered.
-pub(super) fn lines(item: &ExamItem, lists: &mut Numbering) -> Result<Vec<String>> {
+pub(super) fn lines(item: &ExamItem, refs: &mut Refs<'_>) -> Result<Vec<String>> {
     match &item.question.kind {
-        QuestionKind::TrueFalse(_) => true_false(lists),
-        QuestionKind::MultipleChoice(set) => choices(&set.choices, false, lists),
-        QuestionKind::MultipleSelect(set) => choices(&set.choices, true, lists),
+        QuestionKind::TrueFalse(_) => true_false(refs),
+        QuestionKind::MultipleChoice(set) => choices(&set.choices, false, refs),
+        QuestionKind::MultipleSelect(set) => choices(&set.choices, true, refs),
         QuestionKind::FillInBlank(_) => Ok(Vec::new()),
         QuestionKind::Matching(matching) => {
-            matching_lines(matching, &item.presented_options(), lists)
+            matching_lines(matching, &item.presented_options(), refs)
         }
-        QuestionKind::Ordering(_) => ordering_lines(&item.presented_options(), lists),
+        QuestionKind::Ordering(_) => ordering_lines(&item.presented_options(), refs),
     }
 }
 
@@ -90,10 +90,10 @@ pub(super) fn lines(item: &ExamItem, lists: &mut Numbering) -> Result<Vec<String
 /// # Errors
 ///
 /// Propagates from [`option_line`], which cannot fail for these two literals.
-fn true_false(lists: &mut Numbering) -> Result<Vec<String>> {
+fn true_false(refs: &mut Refs<'_>) -> Result<Vec<String>> {
     ["True", "False"]
         .into_iter()
-        .map(|answer| option_line(CHECKBOX, answer, lists))
+        .map(|answer| option_line(CHECKBOX, answer, refs))
         .collect()
 }
 
@@ -106,14 +106,14 @@ fn true_false(lists: &mut Numbering) -> Result<Vec<String>> {
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a choice holds math that
 /// cannot be rendered.
-fn choices(choices: &[Choice], multiple: bool, lists: &mut Numbering) -> Result<Vec<String>> {
+fn choices(choices: &[Choice], multiple: bool, refs: &mut Refs<'_>) -> Result<Vec<String>> {
     choices
         .iter()
         .enumerate()
         .map(|(index, choice)| {
             let box_ = if multiple { CHECKBOX } else { "" };
             let label = format!("{box_}{}. ", choice_label(index));
-            option_line(&label, &choice.text, lists)
+            option_line(&label, &choice.text, refs)
         })
         .collect()
 }
@@ -131,11 +131,11 @@ fn choices(choices: &[Choice], multiple: bool, lists: &mut Numbering) -> Result<
 fn matching_lines(
     matching: &Matching,
     options: &[String],
-    lists: &mut Numbering,
+    refs: &mut Refs<'_>,
 ) -> Result<Vec<String>> {
-    let mut lines = matching_prompts(matching, lists)?;
+    let mut lines = matching_prompts(matching, refs)?;
     lines.push(String::new());
-    lines.extend(matching_options(options, lists)?);
+    lines.extend(matching_options(options, refs)?);
     Ok(lines)
 }
 
@@ -145,12 +145,12 @@ fn matching_lines(
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt holds math that
 /// cannot be rendered.
-fn matching_prompts(matching: &Matching, lists: &mut Numbering) -> Result<Vec<String>> {
+fn matching_prompts(matching: &Matching, refs: &mut Refs<'_>) -> Result<Vec<String>> {
     matching
         .pairs
         .iter()
         .enumerate()
-        .map(|(index, pair)| option_line(&format!("{BLANK}{}. ", index + 1), &pair.left, lists))
+        .map(|(index, pair)| option_line(&format!("{BLANK}{}. ", index + 1), &pair.left, refs))
         .collect()
 }
 
@@ -163,12 +163,12 @@ fn matching_prompts(matching: &Matching, lists: &mut Numbering) -> Result<Vec<St
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an option holds math that
 /// cannot be rendered.
-fn matching_options(options: &[String], lists: &mut Numbering) -> Result<Vec<String>> {
+fn matching_options(options: &[String], refs: &mut Refs<'_>) -> Result<Vec<String>> {
     options
         .iter()
         .enumerate()
         .map(|(position, option)| {
-            option_line(&format!("{}. ", choice_label(position)), option, lists)
+            option_line(&format!("{}. ", choice_label(position)), option, refs)
         })
         .collect()
 }
@@ -179,10 +179,10 @@ fn matching_options(options: &[String], lists: &mut Numbering) -> Result<Vec<Str
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an item holds math that cannot
 /// be rendered.
-fn ordering_lines(items: &[String], lists: &mut Numbering) -> Result<Vec<String>> {
+fn ordering_lines(items: &[String], refs: &mut Refs<'_>) -> Result<Vec<String>> {
     items
         .iter()
-        .map(|item| option_line(BLANK, item, lists))
+        .map(|item| option_line(BLANK, item, refs))
         .collect()
 }
 
@@ -201,9 +201,9 @@ fn ordering_lines(items: &[String], lists: &mut Numbering) -> Result<Vec<String>
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if `text` holds math that cannot
 /// be rendered.
-fn option_line(label: &str, text: &str, lists: &mut Numbering) -> Result<String> {
+fn option_line(label: &str, text: &str, refs: &mut Refs<'_>) -> Result<String> {
     let mut runs = inline::text_run(label);
-    for block in inline::paragraphs(text, lists)? {
+    for block in inline::paragraphs(text, refs)? {
         let _ = write!(runs, "{}", block.runs);
     }
     Ok(runs)
@@ -220,18 +220,16 @@ fn option_line(label: &str, text: &str, lists: &mut Numbering) -> Result<String>
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an answer holds math that
 /// cannot be rendered.
-pub(super) fn key_line(item: &ExamItem, lists: &mut Numbering) -> Result<String> {
+pub(super) fn key_line(item: &ExamItem, refs: &mut Refs<'_>) -> Result<String> {
     match &item.question.kind {
         QuestionKind::TrueFalse(tf) => {
             Ok(inline::text_run(if tf.answer { "True" } else { "False" }))
         }
-        QuestionKind::MultipleChoice(set) => correct_choices(&set.choices, lists),
-        QuestionKind::MultipleSelect(set) => correct_choices(&set.choices, lists),
-        QuestionKind::FillInBlank(fitb) => blank_answers(&fitb.blanks, lists),
-        QuestionKind::Matching(matching) => {
-            matching_key(matching, &item.presented_options(), lists)
-        }
-        QuestionKind::Ordering(ordering) => ordering_key(ordering, lists),
+        QuestionKind::MultipleChoice(set) => correct_choices(&set.choices, refs),
+        QuestionKind::MultipleSelect(set) => correct_choices(&set.choices, refs),
+        QuestionKind::FillInBlank(fitb) => blank_answers(&fitb.blanks, refs),
+        QuestionKind::Matching(matching) => matching_key(matching, &item.presented_options(), refs),
+        QuestionKind::Ordering(ordering) => ordering_key(ordering, refs),
     }
 }
 
@@ -245,7 +243,7 @@ pub(super) fn key_line(item: &ExamItem, lists: &mut Numbering) -> Result<String>
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a choice holds math that
 /// cannot be rendered.
-fn correct_choices(choices: &[Choice], lists: &mut Numbering) -> Result<String> {
+fn correct_choices(choices: &[Choice], refs: &mut Refs<'_>) -> Result<String> {
     let correct: Vec<(usize, &Choice)> = choices
         .iter()
         .enumerate()
@@ -254,7 +252,7 @@ fn correct_choices(choices: &[Choice], lists: &mut Numbering) -> Result<String> 
     let mut lines = Vec::new();
     for (index, choice) in correct {
         let label = format!("{}. ", choice_label(index));
-        lines.push(option_line(&label, &choice.text, lists)?);
+        lines.push(option_line(&label, &choice.text, refs)?);
     }
     Ok(joined(&lines))
 }
@@ -268,11 +266,11 @@ fn correct_choices(choices: &[Choice], lists: &mut Numbering) -> Result<String> 
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an answer holds math that
 /// cannot be rendered.
-fn blank_answers(blanks: &[crate::model::Blank], lists: &mut Numbering) -> Result<String> {
+fn blank_answers(blanks: &[crate::model::Blank], refs: &mut Refs<'_>) -> Result<String> {
     let mut lines = Vec::new();
     for blank in blanks {
         let label = format!("{}: ", blank.id);
-        lines.push(option_line(&label, &blank.answers.join(", "), lists)?);
+        lines.push(option_line(&label, &blank.answers.join(", "), refs)?);
     }
     Ok(joined(&lines))
 }
@@ -288,12 +286,12 @@ fn blank_answers(blanks: &[crate::model::Blank], lists: &mut Numbering) -> Resul
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt holds math that
 /// cannot be rendered.
-fn matching_key(matching: &Matching, options: &[String], lists: &mut Numbering) -> Result<String> {
+fn matching_key(matching: &Matching, options: &[String], refs: &mut Refs<'_>) -> Result<String> {
     let mut lines = Vec::new();
     for (index, pair) in matching.pairs.iter().enumerate() {
         let label = label_of(&pair.right, options);
         let prefix = format!("{}. ", index + 1);
-        let mut runs = option_line(&prefix, &pair.left, lists)?;
+        let mut runs = option_line(&prefix, &pair.left, refs)?;
         let _ = write!(runs, "{}", inline::text_run(&format!(" → {label}")));
         lines.push(runs);
     }
@@ -322,11 +320,11 @@ fn label_of(right: &str, options: &[String]) -> String {
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an item holds math that cannot
 /// be rendered.
-fn ordering_key(ordering: &Ordering, lists: &mut Numbering) -> Result<String> {
+fn ordering_key(ordering: &Ordering, refs: &mut Refs<'_>) -> Result<String> {
     let mut lines = Vec::new();
     for (index, item) in ordering.items.iter().enumerate() {
         let label = format!("{}. ", index + 1);
-        lines.push(option_line(&label, item, lists)?);
+        lines.push(option_line(&label, item, refs)?);
     }
     Ok(joined(&lines))
 }

@@ -28,6 +28,7 @@
 
 mod answers;
 mod inline;
+mod media;
 mod numbering;
 pub mod omml;
 
@@ -35,6 +36,7 @@ use std::fmt::Write as _;
 
 use crate::Result;
 use crate::export::docx::inline::Kind;
+use crate::export::docx::media::Media;
 use crate::export::docx::numbering::{Item, Numbering};
 use crate::export::zip_package;
 use crate::quiz::exam::{Exam, ExamItem};
@@ -50,8 +52,48 @@ const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 /// The relationship namespace, used for `r:id` references.
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
+/// The `WordprocessingML` drawing namespace, which `wp:inline` lives in.
+///
+/// Declared on the document root because a `w:drawing` can appear in any run;
+/// the two namespaces below are declared on the elements that use them, which
+/// is how Word itself writes them.
+const WP_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+
+/// The `DrawingML` namespace, which the geometry inside a picture lives in.
+const A_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+
+/// The `DrawingML` picture namespace, used both as a namespace and as the
+/// `a:graphicData/@uri` naming what kind of graphic the frame holds.
+const PIC_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
+
 /// The relationship id of the page footer.
 const FOOTER_REL: &str = "rIdFooter";
+
+/// What a document's body refers to by id, and the package must therefore
+/// define: the lists a `w:numPr` counts in, and the images an `r:embed`
+/// resolves to.
+///
+/// Threaded through every writer as one value rather than as two parameters.
+/// Both are the same kind of thing — an id minted while the body is written,
+/// redeemed by a part written afterwards — and they are always needed
+/// together, because authored Markdown can hold a list, an image, or a list
+/// holding an image.
+pub(super) struct Refs<'a> {
+    /// The list definitions, accumulated as lists are opened.
+    lists: Numbering,
+    /// The images, accumulated as drawings are written.
+    media: Media<'a>,
+}
+
+impl<'a> Refs<'a> {
+    /// An empty set of references over the `images` the caller supplied.
+    fn new(images: &'a [(String, Vec<u8>)]) -> Self {
+        Self {
+            lists: Numbering::new(),
+            media: Media::new(images),
+        }
+    }
+}
 
 /// Page geometry, all in twips (twentieths of a point).
 ///
@@ -102,8 +144,8 @@ const MAX_ANSWER_TWIPS: u32 = PAGE_HEIGHT - 2 * MARGIN;
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt contains math this
 /// writer cannot convert, [`crate::Error::Export`] if the zip container cannot
 /// be written, or [`crate::Error::Io`] from the underlying writer.
-pub fn to_docx(exam: &Exam) -> Result<Vec<u8>> {
-    package(exam, Solutions::Hide)
+pub fn to_docx(exam: &Exam, images: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    package(exam, Solutions::Hide, images)
 }
 
 /// Render `exam` as the instructor's answer key.
@@ -117,8 +159,8 @@ pub fn to_docx(exam: &Exam) -> Result<Vec<u8>> {
 ///
 /// Returns [`crate::Error`] if an answer holds math or Markdown the writer
 /// cannot render, or if the package cannot be zipped.
-pub fn to_answer_key(exam: &Exam) -> Result<Vec<u8>> {
-    package(exam, Solutions::Show)
+pub fn to_answer_key(exam: &Exam, images: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    package(exam, Solutions::Show, images)
 }
 
 /// Whether a document prints the answers or the room to write them in.
@@ -140,23 +182,28 @@ enum Solutions {
 ///
 /// Returns [`crate::Error`] if the body cannot be rendered or the package
 /// cannot be zipped.
-fn package(exam: &Exam, solutions: Solutions) -> Result<Vec<u8>> {
-    let mut lists = Numbering::new();
-    let document = document_xml(exam, solutions, &mut lists)?;
-    let numbering = lists.to_xml();
+fn package(exam: &Exam, solutions: Solutions, images: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut refs = Refs::new(images);
+    // The body is rendered first because writing it is what mints the ids the
+    // other parts redeem: a list that was never opened needs no definition,
+    // and an image that was never drawn needs no relationship.
+    let document = document_xml(exam, solutions, &mut refs)?;
+    let numbering = refs.lists.to_xml();
     let footer = footer_xml(exam);
-    let rels = document_rels();
+    let relationships = document_rels(&refs.media);
     let styles = styles();
-    let parts: Vec<(&str, &[u8])> = vec![
+    let mut parts: Vec<(&str, &[u8])> = vec![
         ("[Content_Types].xml", CONTENT_TYPES.as_bytes()),
         ("_rels/.rels", ROOT_RELS.as_bytes()),
-        ("word/_rels/document.xml.rels", rels.as_bytes()),
+        ("word/_rels/document.xml.rels", relationships.as_bytes()),
         ("word/document.xml", document.as_bytes()),
         ("word/styles.xml", styles.as_bytes()),
         ("word/numbering.xml", numbering.as_bytes()),
         ("word/settings.xml", SETTINGS.as_bytes()),
         ("word/footer1.xml", footer.as_bytes()),
     ];
+    let media = refs.media.parts();
+    parts.extend(media.iter().map(|(path, bytes)| (path.as_str(), *bytes)));
     zip_package("Word document", &parts)
 }
 
@@ -167,6 +214,7 @@ const CONTENT_TYPES: &str = concat!(
     r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
     r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
     r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+    r#"<Default Extension="png" ContentType="image/png"/>"#,
     r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#,
     r#"<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>"#,
     r#"<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>"#,
@@ -189,7 +237,7 @@ const ROOT_RELS: &str = concat!(
 /// Built at runtime rather than as a `const` so [`FOOTER_REL`] is the single
 /// source of that id: `concat!` takes literals only, which would mean spelling
 /// it twice and relying on a test to catch them drifting apart.
-fn document_rels() -> String {
+fn document_rels(media: &Media<'_>) -> String {
     let relationship = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
     format!(
         concat!(
@@ -199,9 +247,12 @@ fn document_rels() -> String {
             r#"<Relationship Id="rIdNumbering" Type="{0}/numbering" Target="numbering.xml"/>"#,
             r#"<Relationship Id="rIdSettings" Type="{0}/settings" Target="settings.xml"/>"#,
             r#"<Relationship Id="{1}" Type="{0}/footer" Target="footer1.xml"/>"#,
+            "{2}",
             r"</Relationships>",
         ),
-        relationship, FOOTER_REL
+        relationship,
+        FOOTER_REL,
+        media.relationships()
     )
 }
 
@@ -317,11 +368,11 @@ const SETTINGS: &str = concat!(
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt, header or footer
 /// contains math that cannot be converted.
-fn document_xml(exam: &Exam, solutions: Solutions, lists: &mut Numbering) -> Result<String> {
+fn document_xml(exam: &Exam, solutions: Solutions, refs: &mut Refs<'_>) -> Result<String> {
     let mut xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W_NS}" xmlns:m="{M_NS}" xmlns:r="{R_NS}"><w:body>"#
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W_NS}" xmlns:m="{M_NS}" xmlns:r="{R_NS}" xmlns:wp="{WP_NS}"><w:body>"#
     );
-    xml.push_str(&body_xml(exam, solutions, lists)?);
+    xml.push_str(&body_xml(exam, solutions, refs)?);
     xml.push_str(&section_xml());
     xml.push_str("</w:body></w:document>");
     Ok(xml)
@@ -333,24 +384,24 @@ fn document_xml(exam: &Exam, solutions: Solutions, lists: &mut Numbering) -> Res
 /// Each question is a numbered prompt, the answer structure its kind calls
 /// for, then the blank space the item asked for. What that structure *is* is
 /// [`answers`]'s to decide; this builder only sets the lines it hands back.
-fn body_xml(exam: &Exam, solutions: Solutions, lists: &mut Numbering) -> Result<String> {
+fn body_xml(exam: &Exam, solutions: Solutions, refs: &mut Refs<'_>) -> Result<String> {
     if solutions == Solutions::Show {
-        return key_body(exam, lists);
+        return key_body(exam, refs);
     }
     let mut xml = paragraph(&inline::text_run(&exam.title()), ParagraphStyle::Title);
     if let Some(header) = &exam.header {
-        xml.push_str(&prose(header, lists)?);
+        xml.push_str(&prose(header, refs)?);
     }
     for (index, item) in exam.items.iter().enumerate() {
         xml.push_str(&question_xml(
             index + 1,
             item,
             exam.layout.page_break_between,
-            lists,
+            refs,
         )?);
     }
     if let Some(footer) = &exam.footer {
-        xml.push_str(&prose(footer, lists)?);
+        xml.push_str(&prose(footer, refs)?);
     }
     Ok(xml)
 }
@@ -366,12 +417,12 @@ fn body_xml(exam: &Exam, solutions: Solutions, lists: &mut Numbering) -> Result<
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an answer holds math that
 /// cannot be rendered.
-fn key_body(exam: &Exam, lists: &mut Numbering) -> Result<String> {
+fn key_body(exam: &Exam, refs: &mut Refs<'_>) -> Result<String> {
     let title = format!("{} — Answer Key", exam.title());
     let mut xml = paragraph(&inline::text_run(&title), ParagraphStyle::Title);
     for (index, item) in exam.items.iter().enumerate() {
         let lead = inline::text_run(&format!("{}. ", index + 1));
-        let answer = answers::key_line(item, lists)?;
+        let answer = answers::key_line(item, refs)?;
         xml.push_str(&paragraph(&(lead + &answer), ParagraphStyle::Body));
     }
     Ok(xml)
@@ -419,20 +470,20 @@ fn question_xml(
     number: usize,
     item: &ExamItem,
     page_break: bool,
-    lists: &mut Numbering,
+    refs: &mut Refs<'_>,
 ) -> Result<String> {
     let mut xml = String::new();
     if page_break && number > 1 {
         xml.push_str(r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
     }
-    let mut prompt = inline::paragraphs(&answers::prompt(&item.question), lists)?.into_iter();
+    let mut prompt = inline::paragraphs(&answers::prompt(&item.question), refs)?.into_iter();
     let lead = inline::text_run(&format!("{number}. "));
     xml.push_str(&opening_paragraphs(&lead, prompt.next()));
     for block in prompt {
         let style = ParagraphStyle::Continuation.or_block(block.kind);
         xml.push_str(&paragraph(&block.centred(), style));
     }
-    for line in answers::lines(item, lists)? {
+    for line in answers::lines(item, refs)? {
         xml.push_str(&paragraph(&line, ParagraphStyle::Answer));
     }
     xml.push_str(&answer_space(item.answer_space));
@@ -474,8 +525,8 @@ fn answer_space(lines: usize) -> String {
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if the block contains math that
 /// cannot be converted.
-fn prose(markdown: &str, lists: &mut Numbering) -> Result<String> {
-    Ok(inline::paragraphs(markdown, lists)?
+fn prose(markdown: &str, refs: &mut Refs<'_>) -> Result<String> {
+    Ok(inline::paragraphs(markdown, refs)?
         .iter()
         // An empty *list item* is kept: it is a bullet with nothing after
         // it, and dropping it renumbers everything below. Anything else with
@@ -765,6 +816,16 @@ mod tests {
         archive.file_names().map(ToOwned::to_owned).collect()
     }
 
+    /// One part's raw bytes, for the parts that are not text.
+    fn part_bytes(bytes: &[u8], name: &str) -> Vec<u8> {
+        use std::io::Read as _;
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec())).expect("valid zip");
+        let mut file = archive.by_name(name).expect("part present");
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw).expect("part readable");
+        raw
+    }
+
     /// One part's contents as text.
     fn part(bytes: &[u8], name: &str) -> String {
         use std::io::Read as _;
@@ -779,7 +840,7 @@ mod tests {
     /// Every part Word requires is present. A missing one makes Word reject the
     /// whole document rather than degrade, so this is the floor.
     fn the_package_holds_every_required_part() {
-        let bytes = to_docx(&exam(Some("A"), 2)).expect("renders");
+        let bytes = to_docx(&exam(Some("A"), 2), &[]).expect("renders");
         let names = part_names(&bytes);
         for required in [
             "[Content_Types].xml",
@@ -802,7 +863,7 @@ mod tests {
     /// Every part has a content type, by extension or by name. This is the
     /// check Word applies before it will open the file at all.
     fn every_part_has_a_content_type() {
-        let bytes = to_docx(&exam(None, 1)).expect("renders");
+        let bytes = to_docx(&exam(None, 1), &[]).expect("renders");
         let types = part(&bytes, "[Content_Types].xml");
         for name in part_names(&bytes) {
             if name == "[Content_Types].xml" {
@@ -823,33 +884,148 @@ mod tests {
     /// relationship points at a part that is actually in the package. A
     /// dangling `r:id` is the classic "unreadable content" cause.
     fn relationships_resolve_in_both_directions() {
-        let bytes = to_docx(&exam(Some("B"), 1)).expect("renders");
+        for (what, bytes) in [
+            (
+                "no images",
+                to_docx(&exam(Some("B"), 1), &[]).expect("renders"),
+            ),
+            ("an image", illustrated_package()),
+        ] {
+            let document = part(&bytes, "word/document.xml");
+            let rels = part(&bytes, "word/_rels/document.xml.rels");
+            let names = part_names(&bytes);
+            // Each relationship the document cites is declared.
+            for id in cited_ids(&document) {
+                let declared = rels.contains(&format!(r#"Id="{id}""#));
+                assert!(declared, "{what}: undeclared relationship {id}");
+            }
+            // Each declared target exists as a part.
+            let mut declared = 0_usize;
+            for entry in rels.split(r#"Target=""#).skip(1) {
+                declared += 1;
+                let target = entry.split('"').next().unwrap_or_default();
+                let path = format!("word/{target}");
+                assert!(names.contains(&path), "{what}: missing target {path}");
+            }
+            assert!(declared >= 4, "{what}: a document part went undeclared");
+        }
+    }
+
+    /// Every relationship id the document part cites.
+    ///
+    /// Both spellings: page furniture references a part with `r:id`, while a
+    /// picture references one with `r:embed`. Checking only the first leaves
+    /// the image case — the one that makes Word refuse the whole file —
+    /// unguarded.
+    fn cited_ids(document: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        for attribute in [r#"r:id=""#, r#"r:embed=""#] {
+            for reference in document.split(attribute).skip(1) {
+                ids.push(reference.split('"').next().unwrap_or_default().to_owned());
+            }
+        }
+        ids
+    }
+
+    /// A one-question exam whose prompt holds an image, and the bytes for it.
+    fn illustrated() -> (Exam, Vec<(String, Vec<u8>)>) {
+        let mut exam = exam(None, 1);
+        if let Some(item) = exam.items.first_mut() {
+            item.question.prompt = "Name this tree: ![a red maple](figure.png)".to_owned();
+        }
+        let images = vec![("figure.png".to_owned(), media::tests::png(96, 96, None))];
+        (exam, images)
+    }
+
+    /// The package for [`illustrated`].
+    fn illustrated_package() -> Vec<u8> {
+        let (exam, images) = illustrated();
+        to_docx(&exam, &images).expect("renders")
+    }
+
+    #[test]
+    /// An image in a prompt reaches the package as a part, byte for byte,
+    /// with the drawing that cites it. Three files have to agree — the
+    /// document, the relationships and the media part — and Word refuses to
+    /// open the document at all if they do not.
+    fn an_image_in_a_prompt_is_bundled_and_drawn() {
+        let (exam, images) = illustrated();
+        let bytes = to_docx(&exam, &images).expect("renders");
         let document = part(&bytes, "word/document.xml");
+        assert!(document.contains("<w:drawing>"), "{document}");
+        assert!(document.contains(r#"descr="a red maple""#), "{document}");
+        assert!(part_names(&bytes).contains(&"word/media/image1.png".to_owned()));
+        let stored = part_bytes(&bytes, "word/media/image1.png");
+        let supplied = images.first().map(|(_, bytes)| bytes.clone());
+        assert_eq!(Some(stored), supplied, "the part is not the image");
+    }
+
+    #[test]
+    /// A prompt's figure is not carried into the key: a key reprints no
+    /// prompts, so there is nothing to draw. (An image in an *answer* would
+    /// reach it, through the same `option_line` the sheet uses.)
+    fn an_answer_key_bundles_no_images_of_its_own() {
+        let (exam, images) = illustrated();
+        let bytes = to_answer_key(&exam, &images).expect("renders");
+        let media: Vec<String> = part_names(&bytes)
+            .into_iter()
+            .filter(|name| name.starts_with("word/media/"))
+            .collect();
+        assert!(media.is_empty(), "the key carried {media:?}");
+    }
+
+    #[test]
+    /// An image in an *answer* does reach the key: the key prints the
+    /// correct choice, and that text goes through the same writer the sheet
+    /// uses. Only prompts are left behind.
+    fn an_image_in_an_answer_reaches_the_key() {
+        let mut exam = exam(None, 1);
+        if let Some(item) = exam.items.first_mut() {
+            item.question.kind = QuestionKind::MultipleChoice(ChoiceSet {
+                choices: vec![Choice {
+                    text: "this one ![leaf](figure.png)".to_owned(),
+                    correct: true,
+                }],
+            });
+        }
+        let images = vec![("figure.png".to_owned(), media::tests::png(96, 96, None))];
+        let bytes = to_answer_key(&exam, &images).expect("renders");
+        assert!(
+            part_names(&bytes).contains(&"word/media/image1.png".to_owned()),
+            "the answer's image was dropped"
+        );
+    }
+
+    #[test]
+    /// A document that drew nothing carries no media part and no image
+    /// relationship — supplying images the questions never reference must not
+    /// pad every sheet with them.
+    fn images_that_were_never_drawn_are_not_bundled() {
+        let images = vec![("unused.png".to_owned(), media::tests::png(96, 96, None))];
+        let bytes = to_docx(&exam(None, 1), &images).expect("renders");
         let rels = part(&bytes, "word/_rels/document.xml.rels");
-        let names = part_names(&bytes);
-        // Each `r:id` used in the document is declared.
-        for reference in document.split(r#"r:id=""#).skip(1) {
-            let id = reference.split('"').next().unwrap_or_default();
-            assert!(
-                rels.contains(&format!(r#"Id="{id}""#)),
-                "undeclared r:id {id}"
-            );
+        assert!(!rels.contains("rIdImage"), "{rels}");
+        for name in part_names(&bytes) {
+            assert!(!name.starts_with("word/media/"), "{name} was bundled");
         }
-        // Each declared target exists as a part.
-        let mut declared = 0_usize;
-        for entry in rels.split(r#"Target=""#).skip(1) {
-            declared += 1;
-            let target = entry.split('"').next().unwrap_or_default();
-            let path = format!("word/{target}");
-            assert!(names.contains(&path), "missing target {path}");
-        }
-        assert!(declared >= 4, "every document part should be declared");
+    }
+
+    #[test]
+    /// The drawing namespace is declared on the document root. A `wp:inline`
+    /// under an undeclared prefix is not a missing picture, it is a document
+    /// Word will not parse.
+    fn the_drawing_namespace_is_declared() {
+        let document = part(&illustrated_package(), "word/document.xml");
+        assert!(
+            document.contains(&format!(r#"xmlns:wp="{WP_NS}""#)),
+            "{document}"
+        );
     }
 
     #[test]
     /// The section properties close the body and carry the page furniture.
     fn the_section_closes_the_body_with_page_setup() {
-        let bytes = to_docx(&exam(None, 1)).expect("renders");
+        let bytes = to_docx(&exam(None, 1), &[]).expect("renders");
         let document = part(&bytes, "word/document.xml");
         assert!(document.ends_with("</w:sectPr></w:body></w:document>"));
         assert!(document.contains(r#"<w:pgSz w:w="12240" w:h="15840"/>"#));
@@ -860,7 +1036,7 @@ mod tests {
     /// Page numbers are OOXML fields, not text: they have to count real pages,
     /// which the writer cannot know.
     fn page_numbers_are_fields_not_text() {
-        let bytes = to_docx(&exam(Some("C"), 1)).expect("renders");
+        let bytes = to_docx(&exam(Some("C"), 1), &[]).expect("renders");
         let footer = part(&bytes, "word/footer1.xml");
         assert!(footer.contains("<w:instrText xml:space=\"preserve\"> PAGE </w:instrText>"));
         assert!(footer.contains("<w:instrText xml:space=\"preserve\"> NUMPAGES </w:instrText>"));
@@ -881,7 +1057,7 @@ mod tests {
     fn an_absent_page_footer_still_yields_a_valid_part() {
         let mut quiz = exam(None, 1);
         quiz.layout.page_footer = None;
-        let bytes = to_docx(&quiz).expect("renders");
+        let bytes = to_docx(&quiz, &[]).expect("renders");
         let footer = part(&bytes, "word/footer1.xml");
         assert!(footer.contains("<w:ftr"));
         assert!(footer.ends_with("</w:ftr>"));
@@ -891,7 +1067,7 @@ mod tests {
     /// Authored text is XML-escaped, so a prompt containing markup cannot
     /// corrupt the document.
     fn authored_text_is_escaped() {
-        let bytes = to_docx(&exam(None, 1)).expect("renders");
+        let bytes = to_docx(&exam(None, 1), &[]).expect("renders");
         let document = part(&bytes, "word/document.xml");
         assert!(document.contains("Question 0 &amp; &lt;prompt&gt;"));
         assert!(!document.contains("<prompt>"));
@@ -934,7 +1110,7 @@ mod tests {
     fn an_unterminated_placeholder_does_not_duplicate_text() {
         let mut quiz = exam(None, 1);
         quiz.layout.page_footer = Some("Sheet ${name} tail ${oops".to_owned());
-        let footer = part(&to_docx(&quiz).expect("renders"), "word/footer1.xml");
+        let footer = part(&to_docx(&quiz, &[]).expect("renders"), "word/footer1.xml");
         assert_eq!(footer.matches(" tail ").count(), 1, "{footer}");
     }
 
@@ -944,7 +1120,7 @@ mod tests {
     fn crlf_blocks_split_into_paragraphs() {
         let mut quiz = exam(None, 1);
         quiz.header = Some("Para one.\r\n\r\nPara two.".to_owned());
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         assert!(document.contains("<w:t xml:space=\"preserve\">Para one.</w:t>"));
         assert!(document.contains("<w:t xml:space=\"preserve\">Para two.</w:t>"));
         assert!(
@@ -1021,14 +1197,14 @@ mod tests {
         // them they emit every `w:pPr` child the list writer can produce, and
         // an exam without a list leaves `w:numPr` and `w:ind` unvisited.
         listed.header = Some("- one\n\n  still one\n\n  - deeper".to_owned());
-        let listed = to_docx(&listed).expect("renders");
+        let listed = to_docx(&listed, &[]).expect("renders");
         let document = part(&listed, "word/document.xml");
         assert!(
             document.contains("<w:numPr>") && document.contains("<w:ind "),
             "the fixture no longer lays a list out, so two of the nine \
              positions go unchecked again: {document}"
         );
-        for bytes in [to_docx(&exam(Some("A"), 2)).expect("renders"), listed] {
+        for bytes in [to_docx(&exam(Some("A"), 2), &[]).expect("renders"), listed] {
             for name in ["word/document.xml", "word/styles.xml"] {
                 assert_schema_order(&part(&bytes, name), name);
             }
@@ -1061,7 +1237,7 @@ mod tests {
     /// required, and omitting any makes the document invalid.
     fn page_margins_carry_every_required_attribute() {
         let document = part(
-            &to_docx(&exam(None, 1)).expect("renders"),
+            &to_docx(&exam(None, 1), &[]).expect("renders"),
             "word/document.xml",
         );
         let margins = document
@@ -1110,7 +1286,7 @@ mod tests {
     /// to; losing it, or putting it on body prose instead, orphans the prompt.
     fn the_prompt_paragraph_keeps_its_answer_space_with_it() {
         let document = part(
-            &to_docx(&exam(None, 1)).expect("renders"),
+            &to_docx(&exam(None, 1), &[]).expect("renders"),
             "word/document.xml",
         );
         let prompt = properties_of(&document, "1. Question 0");
@@ -1142,7 +1318,7 @@ mod tests {
     /// sheet is — a student holding form B must be able to see that.
     fn the_body_opens_with_the_titled_variant() {
         let titled = part(
-            &to_docx(&exam(Some("B"), 1)).expect("renders"),
+            &to_docx(&exam(Some("B"), 1), &[]).expect("renders"),
             "word/document.xml",
         );
         assert!(
@@ -1153,7 +1329,7 @@ mod tests {
             "{titled}"
         );
         let single = part(
-            &to_docx(&exam(None, 1)).expect("renders"),
+            &to_docx(&exam(None, 1), &[]).expect("renders"),
             "word/document.xml",
         );
         assert!(
@@ -1168,7 +1344,7 @@ mod tests {
     /// substring assertion on the two instructions can see.
     fn footer_fields_follow_the_template_order() {
         let footer = part(
-            &to_docx(&exam(Some("C"), 1)).expect("renders"),
+            &to_docx(&exam(Some("C"), 1), &[]).expect("renders"),
             "word/footer1.xml",
         );
         let fields: Vec<&str> = footer
@@ -1185,7 +1361,7 @@ mod tests {
     /// into the field's result.
     fn every_field_is_balanced() {
         let footer = part(
-            &to_docx(&exam(Some("C"), 1)).expect("renders"),
+            &to_docx(&exam(Some("C"), 1), &[]).expect("renders"),
             "word/footer1.xml",
         );
         for marker in ["begin", "separate", "end"] {
@@ -1206,7 +1382,7 @@ mod tests {
     /// a missing `Override` on the main document is exactly what makes Word
     /// call the file unreadable.
     fn each_word_part_declares_its_own_content_type() {
-        let bytes = to_docx(&exam(None, 1)).expect("renders");
+        let bytes = to_docx(&exam(None, 1), &[]).expect("renders");
         let types = part(&bytes, "[Content_Types].xml");
         for (name, content_type) in [
             ("/word/document.xml", "wordprocessingml.document.main+xml"),
@@ -1232,7 +1408,7 @@ mod tests {
     /// package root rather than to `word/`, so the document-level check in
     /// `relationships_resolve_in_both_directions` never looks at it.
     fn the_package_relationship_points_at_a_real_part() {
-        let bytes = to_docx(&exam(None, 1)).expect("renders");
+        let bytes = to_docx(&exam(None, 1), &[]).expect("renders");
         let names = part_names(&bytes);
         let root = part(&bytes, "_rels/.rels");
         let mut targets = 0_usize;
@@ -1253,7 +1429,7 @@ mod tests {
     fn page_breaks_fall_between_questions_only() {
         let mut quiz = exam(None, 3);
         quiz.layout.page_break_between = true;
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         assert_eq!(document.matches(r#"<w:br w:type="page"/>"#).count(), 2);
     }
 
@@ -1265,7 +1441,7 @@ mod tests {
         let mut quiz = exam(None, 0);
         quiz.header = None;
         quiz.footer = None;
-        let bytes = to_docx(&quiz).expect("renders");
+        let bytes = to_docx(&quiz, &[]).expect("renders");
         let document = part(&bytes, "word/document.xml");
         assert!(
             document.contains(r#"<w:pStyle w:val="Title"/>"#),
@@ -1283,7 +1459,7 @@ mod tests {
         for item in &mut quiz.items {
             item.answer_space = 0;
         }
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         assert!(!document.contains(r#"w:lineRule="exact""#), "{document}");
     }
 
@@ -1295,7 +1471,7 @@ mod tests {
     /// leading space goes with it.
     fn a_prompt_opening_with_a_list_numbers_the_question_not_the_bullet() {
         let document = part(
-            &to_docx(&exam_asking("- bubble sort\n- merge sort")).expect("renders"),
+            &to_docx(&exam_asking("- bubble sort\n- merge sort"), &[]).expect("renders"),
             "word/document.xml",
         );
         let numbered = properties_of(&document, "1. ");
@@ -1320,7 +1496,8 @@ mod tests {
     /// naming a level no item uses is ignored outright — the authored `5.`
     /// then prints as `a.`, which reads as a perfectly ordinary list.
     fn a_nested_ordered_lists_start_is_overridden_at_its_own_level() {
-        let package = to_docx(&exam_asking("Steps:\n\n- outer\n\n  5. five")).expect("renders");
+        let package =
+            to_docx(&exam_asking("Steps:\n\n- outer\n\n  5. five"), &[]).expect("renders");
         let document = part(&package, "word/document.xml");
         let inner = document
             .split(r#"<w:ilvl w:val="1"/><w:numId w:val=""#)
@@ -1354,7 +1531,7 @@ mod tests {
     fn two_ordered_lists_do_not_continue_each_other() {
         let mut quiz = exam_asking("Then:\n\n1. weigh it\n2. record it");
         quiz.header = Some("1. read the rules\n2. sign the sheet".to_owned());
-        let package = to_docx(&quiz).expect("renders");
+        let package = to_docx(&quiz, &[]).expect("renders");
         let document = part(&package, "word/document.xml");
         let mut ids = numbering_ids(&document);
         ids.dedup();
@@ -1378,7 +1555,7 @@ mod tests {
     fn an_empty_list_item_is_not_filtered_out_of_the_body() {
         let mut quiz = exam(None, 1);
         quiz.header = Some("1.\n2. second\n3. third".to_owned());
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         assert_eq!(document.matches("<w:numPr>").count(), 3, "{document}");
     }
 
@@ -1390,7 +1567,7 @@ mod tests {
     fn a_nested_continuation_is_indented_to_its_own_level() {
         let mut quiz = exam(None, 1);
         quiz.header = Some("- outer\n\n  - inner\n\n    still inner".to_owned());
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         let tail = properties_of(&document, "still inner");
         assert!(!tail.contains("<w:numPr>"), "a second marker: {tail}");
         assert!(tail.contains(r#"<w:ind w:left="1440"/>"#), "{tail}");
@@ -1479,7 +1656,7 @@ mod tests {
     fn answer_text(prompt: &str, kind: QuestionKind, option_order: Vec<usize>) -> String {
         let quiz = exam_of(prompt, kind, option_order);
         text_of(&part(
-            &to_docx(&quiz).expect("renders"),
+            &to_docx(&quiz, &[]).expect("renders"),
             "word/document.xml",
         ))
     }
@@ -1665,7 +1842,7 @@ mod tests {
     fn key_text(prompt: &str, kind: QuestionKind, option_order: Vec<usize>) -> String {
         let quiz = exam_of(prompt, kind, option_order);
         text_of(&part(
-            &to_answer_key(&quiz).expect("renders"),
+            &to_answer_key(&quiz, &[]).expect("renders"),
             "word/document.xml",
         ))
     }
@@ -1828,7 +2005,10 @@ mod tests {
     fn the_key_is_a_key_and_not_a_second_sheet() {
         let mut quiz = exam(Some("A"), 2);
         quiz.header = Some("No calculators.".to_owned());
-        let key = part(&to_answer_key(&quiz).expect("renders"), "word/document.xml");
+        let key = part(
+            &to_answer_key(&quiz, &[]).expect("renders"),
+            "word/document.xml",
+        );
         assert!(text_of(&key).contains("Exam 1 (A) — Answer Key"), "{key}");
         assert!(
             !text_of(&key).contains("No calculators."),
@@ -1859,7 +2039,7 @@ mod tests {
     /// is actually wired to a prompt at all.
     fn math_in_a_prompt_reaches_the_document() {
         let quiz = exam_asking(r"Sort in $O(n \log n)$ time.");
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         assert!(document.contains("<m:oMath>"), "{document}");
         assert!(
             !text_of(&document).contains(r"\log"),
@@ -1873,7 +2053,7 @@ mod tests {
     fn unconvertible_math_fails_the_export() {
         let quiz = exam_asking(r"Evaluate $\begin{unknown}x\end{unknown}$.");
         assert!(matches!(
-            to_docx(&quiz),
+            to_docx(&quiz, &[]),
             Err(crate::Error::UnsupportedMath { .. })
         ));
     }
@@ -1884,7 +2064,7 @@ mod tests {
     /// tail, and the answer space after it, sliding onto the next page.
     fn a_multi_paragraph_prompt_stays_together() {
         let document = part(
-            &to_docx(&exam_asking("First half.\n\nSecond half.")).expect("renders"),
+            &to_docx(&exam_asking("First half.\n\nSecond half."), &[]).expect("renders"),
             "word/document.xml",
         );
         assert!(text_of(&document).contains("1. First half."), "{document}");
@@ -1896,7 +2076,7 @@ mod tests {
     /// Every style a run or paragraph names must be defined, or Word drops
     /// the formatting silently — the document still opens, just wrong.
     fn every_style_referenced_is_defined() {
-        let package = to_docx(&exam_asking("`code` and\n\n# A heading")).expect("renders");
+        let package = to_docx(&exam_asking("`code` and\n\n# A heading"), &[]).expect("renders");
         let styles = part(&package, "word/styles.xml");
         let used = referenced_styles(&part(&package, "word/document.xml"));
         // Named, not just counted: a scanner that silently found nothing
@@ -1930,7 +2110,7 @@ mod tests {
     /// the page.
     fn a_numbered_equation_is_not_centred() {
         let document = part(
-            &to_docx(&exam_asking(r"$$\frac{a}{b}$$")).expect("renders"),
+            &to_docx(&exam_asking(r"$$\frac{a}{b}$$"), &[]).expect("renders"),
             "word/document.xml",
         );
         assert!(document.contains("<m:oMath>"), "the equation is missing");
@@ -1945,7 +2125,7 @@ mod tests {
     /// nothing else shares its line, so centring costs nothing.
     fn a_standalone_equation_is_centred() {
         let document = part(
-            &to_docx(&exam_asking("Prove:\n\n$$e^{i\\pi} + 1 = 0$$")).expect("renders"),
+            &to_docx(&exam_asking("Prove:\n\n$$e^{i\\pi} + 1 = 0$$"), &[]).expect("renders"),
             "word/document.xml",
         );
         assert!(document.contains("<m:oMathPara>"), "{document}");
@@ -1957,7 +2137,7 @@ mod tests {
     /// made the same markup mean two things.
     fn a_heading_opening_a_prompt_keeps_its_level() {
         let document = part(
-            &to_docx(&exam_asking("## Part A\n\nWhat is x?")).expect("renders"),
+            &to_docx(&exam_asking("## Part A\n\nWhat is x?"), &[]).expect("renders"),
             "word/document.xml",
         );
         assert_eq!(
@@ -1974,7 +2154,7 @@ mod tests {
     /// reaches the navigation pane or a contents table.
     fn heading_styles_are_the_built_in_ones() {
         let styles = part(
-            &to_docx(&exam(None, 1)).expect("renders"),
+            &to_docx(&exam(None, 1), &[]).expect("renders"),
             "word/styles.xml",
         );
         for (level, id) in HEADING_STYLES.iter().enumerate() {
@@ -1992,7 +2172,7 @@ mod tests {
     /// pointing at a defined `w:num` — rather than as bullet characters
     /// typed into the text.
     fn a_list_becomes_word_numbering() {
-        let package = to_docx(&exam_asking("- first\n- second")).expect("renders");
+        let package = to_docx(&exam_asking("- first\n- second"), &[]).expect("renders");
         let document = part(&package, "word/document.xml");
         assert_eq!(document.matches("<w:numPr>").count(), 2, "{document}");
         // Every id used must be defined, or Word opens the file with the
@@ -2017,7 +2197,7 @@ mod tests {
     /// out to the left of the item it belongs to.
     fn an_item_continuation_is_indented_but_unmarked() {
         let document = part(
-            &to_docx(&exam_asking("- one\n\n  still one")).expect("renders"),
+            &to_docx(&exam_asking("- one\n\n  still one"), &[]).expect("renders"),
             "word/document.xml",
         );
         let tail = properties_of(&document, "still one");
@@ -2032,7 +2212,7 @@ mod tests {
     fn a_list_in_a_prompt_is_sticky_and_one_in_the_header_is_not() {
         let mut quiz = exam_asking("Pick one:\n\n- alpha");
         quiz.header = Some("- loose".to_owned());
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         assert!(
             properties_of(&document, "alpha").contains("<w:keepNext/>"),
             "{document}"
@@ -2052,7 +2232,7 @@ mod tests {
         if let Some(item) = quiz.items.first_mut() {
             item.question.prompt = "What does ${page} mean?".to_owned();
         }
-        let document = part(&to_docx(&quiz).expect("renders"), "word/document.xml");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
         assert!(
             text_of(&document).contains("What does ${page} mean?"),
             "{document}"
@@ -2067,7 +2247,7 @@ mod tests {
     fn an_unknown_placeholder_renders_as_nothing() {
         let mut quiz = exam(None, 1);
         quiz.layout.page_footer = Some("A${bogus}B".to_owned());
-        let footer = part(&to_docx(&quiz).expect("renders"), "word/footer1.xml");
+        let footer = part(&to_docx(&quiz, &[]).expect("renders"), "word/footer1.xml");
         assert!(footer.contains(">A<"), "{footer}");
         assert!(footer.contains(">B<"), "{footer}");
         assert!(!footer.contains("bogus"), "the key leaked onto the page");
@@ -2077,7 +2257,7 @@ mod tests {
     /// The header and footer blocks reach the document, split into paragraphs.
     fn header_and_footer_blocks_are_rendered() {
         let document = part(
-            &to_docx(&exam(None, 1)).expect("renders"),
+            &to_docx(&exam(None, 1), &[]).expect("renders"),
             "word/document.xml",
         );
         assert!(document.contains("Answer every question."));

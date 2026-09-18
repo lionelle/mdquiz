@@ -128,17 +128,20 @@ pub struct DiagramOutcome {
 /// content); failures are collected as warnings and leave the block untouched.
 /// Returns the images to bundle and any warnings.
 ///
-/// Operates on a question slice, so any collection of questions renders: a
-/// caller holding an [`ItemBank`](crate::model::ItemBank) passes
-/// `&mut bank.items`.
+/// Operates on any run of questions, so a caller holding an
+/// [`ItemBank`](crate::model::ItemBank) passes `bank.items.iter_mut()` and one
+/// holding several assembled variants passes a chain across all of them. That
+/// matters beyond convenience: the dedupe is per *call*, so rendering variant
+/// by variant would shell out to the diagram tool once per variant for a
+/// figure they all share.
 #[must_use]
-pub fn render_diagrams(
-    items: &mut [Question],
+pub fn render_diagrams<'a>(
+    items: impl IntoIterator<Item = &'a mut Question>,
     render: &DiagramRenderer<'_>,
     format: DiagramFormat,
 ) -> DiagramOutcome {
     let mut outcome = DiagramOutcome::default();
-    let mut seen = HashSet::new();
+    let mut seen = Seen::default();
     for question in items {
         let id = question.id.clone();
         for field in question.rich_text_fields_mut() {
@@ -154,21 +157,41 @@ fn render_field(
     render: &DiagramRenderer<'_>,
     format: DiagramFormat,
     id: &str,
-    seen: &mut HashSet<String>,
+    seen: &mut Seen,
     outcome: &mut DiagramOutcome,
 ) {
     // Collect spans first (immutable borrow ends), then splice back-to-front so
     // earlier byte offsets stay valid as text is replaced.
     for (span, language, source) in diagram_blocks(field).into_iter().rev() {
         let path = generated_path(language, &source, format);
-        if seen.contains(&path) {
+        if seen.rendered.contains(&path) {
             field.replace_range(span, &image_reference(&path));
+        } else if seen.failed.contains(&path) {
+            // Left as source, like the first attempt: retrying would shell out
+            // to a tool that has already said no, once per copy of the
+            // question, and warn the author about it every time.
         } else if let Some(bytes) = render_one(render, language, &source, id, outcome) {
-            seen.insert(path.clone());
+            seen.rendered.insert(path.clone());
             outcome.images.push((path.clone(), bytes));
             field.replace_range(span, &image_reference(&path));
+        } else {
+            seen.failed.insert(path);
         }
     }
+}
+
+/// What a pass has already decided about each distinct diagram.
+///
+/// Failures are remembered as well as successes. The same diagram reaches this
+/// once per question that holds it — and, on a multi-variant exam, once per
+/// variant that drew that question — so a tool that is not installed would
+/// otherwise be run, and reported, once for every copy.
+#[derive(Debug, Default)]
+struct Seen {
+    /// Paths already rendered, whose bytes are in the outcome.
+    rendered: HashSet<String>,
+    /// Paths already attempted and refused, left as source.
+    failed: HashSet<String>,
 }
 
 /// Render a single diagram, recording a warning (and returning `None`) on failure.
@@ -588,14 +611,38 @@ mod tests {
     }
 
     #[test]
-    /// Failures are not cached the way renders are: every occurrence of an
-    /// unrenderable diagram warns, so each block needing attention is named.
-    fn repeated_failures_warn_once_per_occurrence() {
+    /// A failure is cached like a render: the same diagram is attempted once
+    /// and warned about once, however many copies of it a pass meets.
+    ///
+    /// This used to warn per occurrence, on the reasoning that every block
+    /// needing attention should be named. Variants broke that premise — a
+    /// pass now sees one authored block once per variant that drew its
+    /// question, and the message names the *question*, so the repeats are
+    /// byte-identical and report one problem as four. Worse, each repeat
+    /// shelled out to a tool that had already said no.
+    fn a_failing_diagram_is_attempted_once() {
         let mut b = bank("```dot\nsame\n```\n\n```dot\nsame\n```");
-        let render = |_language: DiagramLanguage, _source: &str| Err("dot not found".to_owned());
+        let attempts = std::cell::Cell::new(0_usize);
+        let render = |_language: DiagramLanguage, _source: &str| {
+            attempts.set(attempts.get() + 1);
+            Err("dot not found".to_owned())
+        };
         let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
         assert!(outcome.images.is_empty());
-        assert_eq!(outcome.warnings.len(), 2);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert_eq!(attempts.get(), 1, "the tool was run again after refusing");
+        // Both blocks are still left as source, cached failure or not.
+        assert_eq!(prompt(&b).matches("```dot").count(), 2);
+    }
+
+    #[test]
+    /// Two *different* failing diagrams each warn. The cache is keyed by the
+    /// diagram, so deduping repeats must not swallow a second real problem.
+    fn different_failing_diagrams_each_warn() {
+        let mut b = bank("```dot\none\n```\n\n```dot\ntwo\n```");
+        let render = |_language: DiagramLanguage, _source: &str| Err("dot not found".to_owned());
+        let outcome = render_diagrams(&mut b.items, &render, DiagramFormat::Png);
+        assert_eq!(outcome.warnings.len(), 2, "{:?}", outcome.warnings);
     }
 
     #[test]

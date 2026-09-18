@@ -21,7 +21,7 @@ use mdquiz::export::{self, canvas, markdown};
 use mdquiz::model::{ItemBank, Question};
 use mdquiz::parse;
 use mdquiz::path::escapes_dir;
-use mdquiz::quiz::assemble::assemble;
+use mdquiz::quiz::assemble::{Assembly, assemble};
 use mdquiz::quiz::output::{self, OutputFile};
 use mdquiz::quiz::sample::{self, SampleRng, Source};
 use mdquiz::quiz::spec::Spec;
@@ -212,7 +212,7 @@ fn run_quiz(args: QuizArgs) -> anyhow::Result<()> {
     // working directory: a spec is checked in beside the questions it draws.
     let root = spec_path.parent().unwrap_or(Path::new("."));
     let seed = seed.unwrap_or_else(entropy_seed);
-    let assembly = assemble(
+    let mut assembly = assemble(
         &spec,
         &|dir: &str| list_group_sources(root, dir),
         &partial_reader(root),
@@ -221,8 +221,12 @@ fn run_quiz(args: QuizArgs) -> anyhow::Result<()> {
     for warning in &assembly.warnings {
         eprintln!("warning: {warning}");
     }
+    // After assembly, so the diagram pass sees the questions the variants
+    // actually drew — and before rendering, because a `w:drawing` needs the
+    // image bytes the pass produces.
+    let images = quiz_images(root, &mut assembly);
     let stem = name.unwrap_or_else(|| spec_stem(spec_path));
-    let files = output::render(&assembly, &stem, seed)?;
+    let files = output::render(&assembly, &stem, seed, &images)?;
     write_output_files(out_dir, &files)?;
     // Printed even when it was given, so the line in the terminal is the whole
     // record of how this paper was built.
@@ -230,7 +234,14 @@ fn run_quiz(args: QuizArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// List one spec group's question sources, relative to the spec's folder.
+/// List one spec group's question sources, named relative to the spec's folder.
+///
+/// Spec-relative, not group-relative, because that is what [`assemble`]
+/// promises its questions: it recovers each one's own folder from the
+/// directory part of its path, and rebases that question's images and `file:`
+/// partials against it. A bare `q1.md` would send a group's
+/// `figures/maple.png` looking beside the *spec* instead of beside the
+/// question — and would make two groups' identically named figures collide.
 ///
 /// # Errors
 ///
@@ -239,7 +250,11 @@ fn list_group_sources(root: &Path, dir: &str) -> std::result::Result<Vec<Source>
     if escapes_dir(dir) {
         return Err(format!("group folder {dir:?} escapes the spec's directory"));
     }
-    read_question_sources(&root.join(dir), false).map_err(|error| error.to_string())
+    let sources = read_question_sources(&root.join(dir), false).map_err(|e| e.to_string())?;
+    Ok(sources
+        .into_iter()
+        .map(|(path, contents)| (mdquiz::path::join_dir(dir, &path), contents))
+        .collect())
 }
 
 /// The base name for a spec's output files: the spec file's own stem.
@@ -311,12 +326,42 @@ fn canvas_images(
     let renderer = move |language: DiagramLanguage, source: &str| {
         render_diagram(language, source, diagram_format)
     };
-    let outcome = diagram::render_diagrams(items, &renderer, diagram_format);
+    let outcome = diagram::render_diagrams(&mut *items, &renderer, diagram_format);
+    bundled(dir, &*items, outcome)
+}
+
+/// Render the diagrams across every variant of `assembly`, then gather every
+/// image its sheets need.
+///
+/// Always [`DiagramFormat::Png`]: Word places SVG only through the
+/// `asvg:svgBlip` extension, which needs a rasterised copy alongside it
+/// anyway, so the Word path has no SVG mode to choose. One pass across all the
+/// variants at once, so a figure four of them share is rendered once.
+fn quiz_images(root: &Path, assembly: &mut Assembly) -> Vec<(String, Vec<u8>)> {
+    let renderer = |language: DiagramLanguage, source: &str| {
+        render_diagram(language, source, DiagramFormat::Png)
+    };
+    let outcome = diagram::render_diagrams(assembly.questions_mut(), &renderer, DiagramFormat::Png);
+    bundled(root, assembly.questions(), outcome)
+}
+
+/// The images to bundle: the diagrams just rendered, plus the local images
+/// `items` reference, read from `dir`. Diagram warnings are reported here
+/// because a diagram left as code is the author's to fix, not an export
+/// failure.
+fn bundled<'a>(
+    dir: &Path,
+    items: impl IntoIterator<Item = &'a Question>,
+    outcome: diagram::DiagramOutcome,
+) -> Vec<(String, Vec<u8>)> {
     for warning in &outcome.warnings {
         eprintln!("warning: {warning}");
     }
     let mut images = load_images(dir, items);
     images.extend(outcome.images);
+    // Sorted so a package's media parts land in a stable order whatever order
+    // the questions happened to reference them in.
+    images.sort_by(|(one, _), (other, _)| one.cmp(other));
     images
 }
 
@@ -325,7 +370,10 @@ fn canvas_images(
 ///
 /// Generated-diagram paths (under [`diagram::GENERATED_DIR`]) are skipped here:
 /// their bytes come from the diagram pass, not the question directory.
-fn load_images(dir: &Path, items: &[Question]) -> Vec<(String, Vec<u8>)> {
+fn load_images<'a>(
+    dir: &Path,
+    items: impl IntoIterator<Item = &'a Question>,
+) -> Vec<(String, Vec<u8>)> {
     let mut images = Vec::new();
     for path in canvas::local_image_paths(items) {
         if diagram::is_generated_path(&path) {
@@ -980,6 +1028,155 @@ mod tests {
     }
 
     /// The arguments a `mdquiz quiz` run would parse to.
+    #[test]
+    /// A group's sources are named relative to the *spec*, not the group. That
+    /// prefix is what lets `assemble` recover a question's own folder and
+    /// rebase its images against it — without it an image beside a question
+    /// is looked for beside the spec, which is where it is not.
+    fn group_sources_are_named_relative_to_the_spec() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        quiz_fixture(dir.path(), 1);
+        let sources = list_group_sources(dir.path(), "topics").expect("lists");
+        let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["topics/q.md"]);
+    }
+
+    #[test]
+    /// An image beside a question in a group folder is found, placed, and
+    /// bundled into the sheet. This is the whole chain: the source path names
+    /// the group, the parser rebases the image onto it, the CLI reads it from
+    /// there, and the writer embeds it.
+    fn an_image_beside_a_question_reaches_the_sheet() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = illustrated_fixture(dir.path());
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 4)).expect("quiz runs");
+        let bytes = fs::read(out.join("midterm.docx")).expect("the sheet is written");
+        let names = part_names(&bytes);
+        assert!(
+            names.contains(&"word/media/image1.png".to_owned()),
+            "no image was bundled: {names:?}"
+        );
+    }
+
+    #[test]
+    /// Two groups may each hold a `figures/fig.png`, and they are two
+    /// different pictures. Group-relative source paths would have collapsed
+    /// them into one, printing whichever was read last under both questions.
+    fn identically_named_figures_in_two_groups_stay_distinct() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (group, width) in [("trees", 96_u32), ("graphs", 48_u32)] {
+            let figures = dir.path().join(group).join("figures");
+            fs::create_dir_all(&figures).expect("create figures");
+            fs::write(figures.join("fig.png"), sized_png(width)).expect("write image");
+            fs::write(
+                dir.path().join(group).join("q.md"),
+                format!(
+                    "---\nid: {group}\nkind: true_false\nanswer: true\n---\n\n\
+                     See ![a figure](figures/fig.png)\n"
+                ),
+            )
+            .expect("write question");
+        }
+        let spec = dir.path().join("midterm.yaml");
+        fs::write(
+            &spec,
+            "name: M\nvariants: 1\ngroups:\n  - dir: trees\n    take: all\n\
+             \x20 - dir: graphs\n    take: all\n",
+        )
+        .expect("write spec");
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 9)).expect("quiz runs");
+        let bytes = fs::read(out.join("midterm.docx")).expect("the sheet is written");
+        let media: Vec<String> = part_names(&bytes)
+            .into_iter()
+            .filter(|name| name.starts_with("word/media/"))
+            .collect();
+        assert_eq!(media.len(), 2, "the two figures collided: {media:?}");
+    }
+
+    #[test]
+    /// Every variant that draws an illustrated question carries the figure,
+    /// and carries it once. A shared figure is bundled per *sheet* — each is
+    /// a standalone file — but never twice within one.
+    fn every_variant_carries_a_shared_figure_exactly_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = illustrated_fixture(dir.path());
+        fs::write(
+            &spec,
+            "name: M\nvariants: 3\nlayout:\n  shuffle_choices: true\n\
+             groups:\n  - dir: topics\n    take: all\n",
+        )
+        .expect("write spec");
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 3)).expect("quiz runs");
+        for variant in ["A", "B", "C"] {
+            let bytes =
+                fs::read(out.join(format!("midterm-{variant}.docx"))).expect("sheet written");
+            let media: Vec<String> = part_names(&bytes)
+                .into_iter()
+                .filter(|name| name.starts_with("word/media/"))
+                .collect();
+            assert_eq!(media, ["word/media/image1.png"], "variant {variant}");
+        }
+    }
+
+    /// A one-question spec whose question embeds an image in its own folder.
+    fn illustrated_fixture(dir: &Path) -> PathBuf {
+        let figures = dir.join("topics").join("figures");
+        fs::create_dir_all(&figures).expect("create figures");
+        fs::write(figures.join("tree.png"), tiny_png()).expect("write image");
+        fs::write(
+            dir.join("topics").join("q.md"),
+            "---
+id: q
+kind: true_false
+answer: true
+---
+
+             Is this a maple? ![a maple](figures/tree.png)
+",
+        )
+        .expect("write question");
+        let spec = dir.join("midterm.yaml");
+        fs::write(
+            &spec,
+            "name: M
+variants: 1
+groups:
+  - dir: topics
+    take: all
+",
+        )
+        .expect("write spec");
+        spec
+    }
+
+    /// A 1x1 PNG header, which is all the writer measures.
+    ///
+    /// Built here rather than shared with `export::docx::media`'s fixture:
+    /// this is the binary crate, which cannot see that module's internals.
+    fn tiny_png() -> Vec<u8> {
+        sized_png(1)
+    }
+
+    /// A square PNG header `side` pixels across, so two fixtures can differ.
+    fn sized_png(side: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend(13_u32.to_be_bytes());
+        bytes.extend(b"IHDR");
+        bytes.extend(side.to_be_bytes());
+        bytes.extend(side.to_be_bytes());
+        bytes.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        bytes
+    }
+
+    /// The part names inside a `.docx`.
+    fn part_names(bytes: &[u8]) -> Vec<String> {
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("a zip");
+        archive.file_names().map(ToOwned::to_owned).collect()
+    }
+
     fn quiz_args(spec: &Path, out_dir: &Path, name: Option<&str>, seed: u64) -> QuizArgs {
         QuizArgs {
             spec: spec.to_path_buf(),
