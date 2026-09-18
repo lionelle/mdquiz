@@ -38,9 +38,9 @@ use crate::Result;
 use crate::export::docx::inline::Kind;
 use crate::export::docx::media::Media;
 use crate::export::docx::numbering::{Item, Numbering};
-use crate::export::zip_package;
+use crate::export::{points_label, zip_package};
 use crate::quiz::exam::{Exam, ExamItem};
-use crate::quiz::spec::{TEMPLATE_CLOSE, TEMPLATE_OPEN, TemplateKey};
+use crate::quiz::spec::{Layout, TEMPLATE_CLOSE, TEMPLATE_OPEN, TemplateKey};
 
 /// The OOXML main-document namespace.
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
@@ -389,16 +389,12 @@ fn body_xml(exam: &Exam, solutions: Solutions, refs: &mut Refs<'_>) -> Result<St
         return key_body(exam, refs);
     }
     let mut xml = paragraph(&inline::text_run(&exam.title()), ParagraphStyle::Title);
+    xml.push_str(&total_paragraph(exam));
     if let Some(header) = &exam.header {
         xml.push_str(&prose(header, refs)?);
     }
     for (index, item) in exam.items.iter().enumerate() {
-        xml.push_str(&question_xml(
-            index + 1,
-            item,
-            exam.layout.page_break_between,
-            refs,
-        )?);
+        xml.push_str(&question_xml(index + 1, item, &exam.layout, refs)?);
     }
     if let Some(footer) = &exam.footer {
         xml.push_str(&prose(footer, refs)?);
@@ -420,12 +416,38 @@ fn body_xml(exam: &Exam, solutions: Solutions, refs: &mut Refs<'_>) -> Result<St
 fn key_body(exam: &Exam, refs: &mut Refs<'_>) -> Result<String> {
     let title = format!("{} — Answer Key", exam.title());
     let mut xml = paragraph(&inline::text_run(&title), ParagraphStyle::Title);
+    xml.push_str(&total_paragraph(exam));
     for (index, item) in exam.items.iter().enumerate() {
-        let lead = inline::text_run(&format!("{}. ", index + 1));
+        let lead = inline::text_run(&question_lead(index + 1, item, &exam.layout));
         let answer = answers::key_line(item, refs)?;
         xml.push_str(&paragraph(&(lead + &answer), ParagraphStyle::Body));
     }
     Ok(xml)
+}
+
+/// The line under the title saying what the sheet is worth.
+///
+/// Printed whether or not the questions carry their own marks: a student
+/// budgeting an hour needs the total, and on a sheet where every question
+/// counts the same it is the only place the weighting appears at all.
+fn total_paragraph(exam: &Exam) -> String {
+    let total = points_label(exam.total_points());
+    paragraph(
+        &inline::text_run(&format!("Total: {total}")),
+        ParagraphStyle::Body,
+    )
+}
+
+/// The numbered lead a question opens with, carrying its value when the
+/// layout asks for one: `3. (5 points) `.
+///
+/// The same lead on the sheet and on the key, so a grader reads the marks
+/// beside the answer they are awarding them for.
+fn question_lead(number: usize, item: &ExamItem, layout: &Layout) -> String {
+    if !layout.show_points {
+        return format!("{number}. ");
+    }
+    format!("{number}. ({}) ", points_label(item.question.points))
 }
 
 /// The question number and the prompt's first paragraph, if it has one.
@@ -469,15 +491,15 @@ fn opening_paragraphs(lead: &str, first: Option<inline::Paragraph>) -> String {
 fn question_xml(
     number: usize,
     item: &ExamItem,
-    page_break: bool,
+    layout: &Layout,
     refs: &mut Refs<'_>,
 ) -> Result<String> {
     let mut xml = String::new();
-    if page_break && number > 1 {
+    if layout.page_break_between && number > 1 {
         xml.push_str(r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
     }
     let mut prompt = inline::paragraphs(&answers::prompt(&item.question), refs)?.into_iter();
-    let lead = inline::text_run(&format!("{number}. "));
+    let lead = inline::text_run(&question_lead(number, item, layout));
     xml.push_str(&opening_paragraphs(&lead, prompt.next()));
     for block in prompt {
         let style = ParagraphStyle::Continuation.or_block(block.kind);
@@ -1289,7 +1311,7 @@ mod tests {
             &to_docx(&exam(None, 1), &[]).expect("renders"),
             "word/document.xml",
         );
-        let prompt = properties_of(&document, "1. Question 0");
+        let prompt = properties_of(&document, "1. (1 point) Question 0");
         assert!(
             prompt.contains("<w:keepNext/>"),
             "prompt lost keepNext: {prompt}"
@@ -1957,7 +1979,7 @@ mod tests {
             QuestionKind::TrueFalse(TrueFalse { answer: true }),
             Vec::new(),
         );
-        assert!(tf.contains("1. True"), "{tf}");
+        assert!(tf.contains("1. (1 point) True"), "{tf}");
         assert!(!tf.contains("False"), "{tf}");
         assert!(!tf.contains("[ ]"), "the key printed a checkbox: {tf}");
     }
@@ -2025,6 +2047,106 @@ mod tests {
     }
 
     /// The exam of [`exam`] with its single prompt replaced by `prompt`.
+    /// An exam whose questions are worth `points`, in order.
+    fn exam_worth(points: &[f64]) -> Exam {
+        let mut quiz = exam(None, points.len());
+        for (item, value) in quiz.items.iter_mut().zip(points) {
+            item.question.points = *value;
+        }
+        quiz
+    }
+
+    #[test]
+    /// Each question says what it is worth. A student budgeting an hour
+    /// cannot tell a twenty-mark question from a two-mark one otherwise, and
+    /// nothing else on the sheet carries that.
+    fn every_question_prints_what_it_is_worth() {
+        let quiz = exam_worth(&[5.0, 1.0, 2.5]);
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
+        let text = text_of(&document);
+        assert!(text.contains("1. (5 points) "), "{text}");
+        assert!(text.contains("2. (1 point) "), "{text}");
+        assert!(text.contains("3. (2.5 points) "), "{text}");
+    }
+
+    #[test]
+    /// The sheet states its total, and the total is the sum of the questions
+    /// on *this* variant — not of the bank they were drawn from.
+    fn the_sheet_states_its_total() {
+        let document = part(
+            &to_docx(&exam_worth(&[5.0, 1.0, 2.5]), &[]).expect("renders"),
+            "word/document.xml",
+        );
+        assert!(
+            text_of(&document).contains("Total: 8.5 points"),
+            "{document}"
+        );
+    }
+
+    #[test]
+    /// The key carries the same marks as the sheet, beside the answers they
+    /// are awarded for, and the same total.
+    fn the_key_carries_the_marks_and_the_total() {
+        let text = text_of(&part(
+            &to_answer_key(&exam_worth(&[5.0, 2.0]), &[]).expect("renders"),
+            "word/document.xml",
+        ));
+        assert!(text.contains("Total: 7 points"), "{text}");
+        assert!(text.contains("1. (5 points) "), "{text}");
+        assert!(text.contains("2. (2 points) "), "{text}");
+    }
+
+    #[test]
+    /// A sheet and its key lead every question identically, so a grader
+    /// reading the two side by side is never comparing different marks
+    /// against the same number.
+    fn the_sheet_and_the_key_lead_each_question_alike() {
+        let quiz = exam_worth(&[5.0, 1.0, 2.5]);
+        let sheet = text_of(&part(
+            &to_docx(&quiz, &[]).expect("renders"),
+            "word/document.xml",
+        ));
+        let key = text_of(&part(
+            &to_answer_key(&quiz, &[]).expect("renders"),
+            "word/document.xml",
+        ));
+        for lead in ["1. (5 points) ", "2. (1 point) ", "3. (2.5 points) "] {
+            assert!(sheet.contains(lead), "sheet is missing {lead}: {sheet}");
+            assert!(key.contains(lead), "key is missing {lead}: {key}");
+        }
+    }
+
+    #[test]
+    /// `show_points: false` drops the per-question marks — a quiz where
+    /// every question counts the same does not need them repeated — but
+    /// keeps the total, which is the one place the weighting then appears.
+    fn turning_points_off_keeps_the_total() {
+        let mut quiz = exam_worth(&[2.0, 2.0]);
+        quiz.layout.show_points = false;
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
+        let text = text_of(&document);
+        assert!(text.contains("Total: 4 points"), "{text}");
+        assert!(!text.contains("(2 points)"), "{text}");
+        assert!(text.contains("1. Question 0"), "{text}");
+    }
+
+    #[test]
+    /// An exam with no questions is worth nothing, and says so plainly.
+    ///
+    /// `f64` sums from `-0.0`, so the obvious implementation prints
+    /// "Total: -0 points" — which reads as a bug to anyone holding the page.
+    fn an_empty_exam_is_worth_nothing() {
+        let text = text_of(&part(
+            &to_docx(&exam_worth(&[]), &[]).expect("renders"),
+            "word/document.xml",
+        ));
+        assert!(text.contains("Total: 0 points"), "{text}");
+        assert!(
+            !text.contains("-0"),
+            "a negative zero reached the page: {text}"
+        );
+    }
+
     fn exam_asking(prompt: &str) -> Exam {
         let mut quiz = exam(None, 1);
         if let Some(item) = quiz.items.first_mut() {
@@ -2067,7 +2189,10 @@ mod tests {
             &to_docx(&exam_asking("First half.\n\nSecond half."), &[]).expect("renders"),
             "word/document.xml",
         );
-        assert!(text_of(&document).contains("1. First half."), "{document}");
+        assert!(
+            text_of(&document).contains("1. (1 point) First half."),
+            "{document}"
+        );
         let tail = properties_of(&document, "Second half.");
         assert!(tail.contains("<w:keepNext/>"), "tail lost keepNext: {tail}");
     }
@@ -2141,7 +2266,7 @@ mod tests {
             "word/document.xml",
         );
         assert_eq!(
-            properties_of(&document, "1. Part A"),
+            properties_of(&document, "1. (1 point) Part A"),
             r#"<w:pStyle w:val="Heading2"/>"#,
             "{document}"
         );

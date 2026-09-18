@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 
 use crate::Result;
+use crate::export::points_label;
 use crate::label::sequence as choice_label;
 use crate::model::{Blank, Choice, Matching, Ordering, Question, QuestionKind};
 
@@ -19,12 +20,28 @@ use crate::model::{Blank, Choice, Matching, Ordering, Question, QuestionKind};
 /// Currently infallible; the `Result` is retained because `render_question`
 /// keeps a fallible signature for future `#[non_exhaustive]` question kinds.
 pub fn to_print_markdown(bank: &crate::model::ItemBank) -> Result<String> {
-    let mut out = format!("# {}\n", bank.name);
+    let mut out = format!("# {}\n\n{}\n", bank.name, total_line(bank));
     for (index, question) in bank.items.iter().enumerate() {
         out.push('\n');
         out.push_str(&render_question(index + 1, question)?);
     }
     Ok(out)
+}
+
+/// The line under the title saying what the whole sheet is worth.
+fn total_line(bank: &crate::model::ItemBank) -> String {
+    let total: f64 = bank.items.iter().map(|question| question.points).sum();
+    format!("Total: {}", points_label(total))
+}
+
+/// The lead a numbered question opens with, carrying what it is worth.
+///
+/// Built once here rather than in each renderer, so the six of them cannot
+/// disagree about how a question is introduced. Unlike the Word sheet this
+/// has no layout to consult — a bank is not an exam — so the marks always
+/// print; a bank sheet is still a paper someone sits.
+fn question_lead(number: usize, question: &Question) -> String {
+    format!("{number}. ({}) ", points_label(question.points))
 }
 
 /// Render a single numbered question, dispatching on its kind.
@@ -39,29 +56,22 @@ pub fn to_print_markdown(bank: &crate::model::ItemBank) -> Result<String> {
     reason = "fallible signature reserved for future non_exhaustive QuestionKind variants"
 )]
 fn render_question(number: usize, question: &Question) -> Result<String> {
+    let lead = question_lead(number, question);
+    let prompt = &question.prompt;
     match &question.kind {
-        QuestionKind::TrueFalse(_) => Ok(render_true_false(number, &question.prompt)),
-        QuestionKind::MultipleChoice(set) => Ok(render_choices(
-            number,
-            &question.prompt,
-            &set.choices,
-            false,
-        )),
-        QuestionKind::MultipleSelect(set) => {
-            Ok(render_choices(number, &question.prompt, &set.choices, true))
-        }
-        QuestionKind::FillInBlank(fitb) => {
-            Ok(render_fill_in_blank(number, &question.prompt, &fitb.blanks))
-        }
-        QuestionKind::Matching(matching) => Ok(render_matching(number, &question.prompt, matching)),
-        QuestionKind::Ordering(ordering) => Ok(render_ordering(number, &question.prompt, ordering)),
+        QuestionKind::TrueFalse(_) => Ok(render_true_false(&lead, prompt)),
+        QuestionKind::MultipleChoice(set) => Ok(render_choices(&lead, prompt, &set.choices, false)),
+        QuestionKind::MultipleSelect(set) => Ok(render_choices(&lead, prompt, &set.choices, true)),
+        QuestionKind::FillInBlank(fitb) => Ok(render_fill_in_blank(&lead, prompt, &fitb.blanks)),
+        QuestionKind::Matching(matching) => Ok(render_matching(&lead, prompt, matching)),
+        QuestionKind::Ordering(ordering) => Ok(render_ordering(&lead, prompt, ordering)),
     }
 }
 
 /// Render an ordering item: the items shown sorted (never in the correct order),
 /// each with a blank to write its position, no key.
-fn render_ordering(number: usize, prompt: &str, ordering: &Ordering) -> String {
-    let mut out = format!("{number}. {prompt}\n");
+fn render_ordering(lead: &str, prompt: &str, ordering: &Ordering) -> String {
+    let mut out = format!("{lead}{prompt}\n");
     for index in ordering.display_order() {
         if let Some(item) = ordering.items.get(index) {
             // Writing to a `String` is infallible, so the result is discarded.
@@ -80,8 +90,8 @@ fn render_ordering(number: usize, prompt: &str, ordering: &Ordering) -> String {
 /// pair answers before the distractors, so a plain sort over the text lands
 /// back on the order that makes option *n* the answer to prompt *n* whenever
 /// the answers happen to sort that way. `display_order` rotates off it.
-fn render_matching(number: usize, prompt: &str, matching: &Matching) -> String {
-    let mut out = format!("{number}. {prompt}\n");
+fn render_matching(lead: &str, prompt: &str, matching: &Matching) -> String {
+    let mut out = format!("{lead}{prompt}\n");
     for (index, pair) in matching.pairs.iter().enumerate() {
         // Writing to a `String` is infallible, so the result is discarded.
         let _ = write!(out, "\n   {}. {}", index + 1, pair.left);
@@ -98,21 +108,21 @@ fn render_matching(number: usize, prompt: &str, matching: &Matching) -> String {
 }
 
 /// Render a fill-in-the-blank item: each `{{name}}` marker becomes a blank line.
-fn render_fill_in_blank(number: usize, prompt: &str, blanks: &[Blank]) -> String {
-    format!("{number}. {}\n", crate::model::fill_blanks(prompt, blanks))
+fn render_fill_in_blank(lead: &str, prompt: &str, blanks: &[Blank]) -> String {
+    format!("{lead}{}\n", crate::model::fill_blanks(prompt, blanks))
 }
 
 /// Render a true/false item: the prompt plus blank True/False checkboxes.
-fn render_true_false(number: usize, prompt: &str) -> String {
-    format!("{number}. {prompt}\n\n   - [ ] True\n   - [ ] False\n")
+fn render_true_false(lead: &str, prompt: &str) -> String {
+    format!("{lead}{prompt}\n\n   - [ ] True\n   - [ ] False\n")
 }
 
 /// Render a choice-based item: the prompt then lettered options, no key.
 ///
 /// With `multiple`, options carry a blank checkbox to signal that more than one
 /// may be selected; otherwise they are a plain lettered list.
-fn render_choices(number: usize, prompt: &str, choices: &[Choice], multiple: bool) -> String {
-    let mut out = format!("{number}. {prompt}\n");
+fn render_choices(lead: &str, prompt: &str, choices: &[Choice], multiple: bool) -> String {
+    let mut out = format!("{lead}{prompt}\n");
     for (index, choice) in choices.iter().enumerate() {
         let label = choice_label(index);
         // Writing to a `String` is infallible, so the result is discarded.
@@ -133,7 +143,7 @@ fn render_choices(number: usize, prompt: &str, choices: &[Choice], multiple: boo
 /// alongside the answer-free question sheet.
 #[must_use]
 pub fn to_answer_key(bank: &crate::model::ItemBank) -> String {
-    let mut out = format!("# {} — Answer Key\n", bank.name);
+    let mut out = format!("# {} — Answer Key\n\n{}\n", bank.name, total_line(bank));
     for (index, question) in bank.items.iter().enumerate() {
         out.push('\n');
         out.push_str(&render_answer(index + 1, question));
@@ -153,7 +163,7 @@ fn render_answer(number: usize, question: &Question) -> String {
         QuestionKind::Matching(matching) => matching_answer(matching),
         QuestionKind::Ordering(ordering) => ordering_answer(ordering),
     };
-    format!("{number}. {answer}\n")
+    format!("{}{answer}\n", question_lead(number, question))
 }
 
 /// The correct choices as `label. text`, joined; covers single and multi-select.
@@ -228,19 +238,80 @@ mod tests {
             name: "Quiz 1".to_owned(),
             items: Vec::new(),
         };
-        assert_eq!(to_print_markdown(&bank).expect("empty bank"), "# Quiz 1\n");
+        assert_eq!(
+            to_print_markdown(&bank).expect("empty bank"),
+            "# Quiz 1\n\nTotal: 0 points\n"
+        );
     }
 
     #[test]
     /// A true/false question renders numbered, with blank checkboxes and no key.
     fn renders_true_false_without_answer() {
         let rendered = to_print_markdown(&true_false_bank()).expect("bank renders");
-        assert!(rendered.contains("1. Binary search needs a sorted array."));
+        assert!(rendered.contains("1. (1 point) Binary search needs a sorted array."));
         assert!(rendered.contains("- [ ] True"));
         assert!(rendered.contains("- [ ] False"));
         // The print sheet must never leak the correct answer.
         assert!(!rendered.contains("[x]"));
         assert!(!rendered.to_lowercase().contains("answer"));
+    }
+
+    /// A bank of true/false questions worth `points`, in order.
+    fn bank_worth(points: &[f64]) -> ItemBank {
+        ItemBank {
+            name: "M".to_owned(),
+            items: points
+                .iter()
+                .enumerate()
+                .map(|(index, points)| Question {
+                    id: format!("q{index}"),
+                    title: None,
+                    prompt: format!("Question {index}?"),
+                    points: *points,
+                    tags: Vec::new(),
+                    feedback: Feedback::default(),
+                    kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    /// Each question says what it is worth, and the sheet states its total.
+    /// A printed bank is still a paper someone sits.
+    fn the_sheet_prints_each_value_and_the_total() {
+        let out = to_print_markdown(&bank_worth(&[5.0, 1.0, 2.5])).expect("renders");
+        assert!(out.contains("Total: 8.5 points"), "{out}");
+        assert!(out.contains("1. (5 points) "), "{out}");
+        assert!(out.contains("2. (1 point) "), "{out}");
+        assert!(out.contains("3. (2.5 points) "), "{out}");
+    }
+
+    #[test]
+    /// The key leads every question exactly as the sheet does, so a grader
+    /// reading the two together never compares different marks against the
+    /// same number.
+    fn the_key_leads_each_question_as_the_sheet_does() {
+        let bank = bank_worth(&[5.0, 1.0, 2.5]);
+        let sheet = to_print_markdown(&bank).expect("renders");
+        let key = to_answer_key(&bank);
+        for lead in ["1. (5 points) ", "2. (1 point) ", "3. (2.5 points) "] {
+            assert!(sheet.contains(lead), "sheet is missing {lead}: {sheet}");
+            assert!(key.contains(lead), "key is missing {lead}: {key}");
+        }
+        assert!(key.contains("Total: 8.5 points"), "{key}");
+    }
+
+    #[test]
+    /// A bank with no questions is worth nothing, and says so — `f64` sums
+    /// from `-0.0`, so the total needs normalising before it is printed.
+    fn an_empty_bank_is_worth_nothing() {
+        let out = to_print_markdown(&bank_worth(&[])).expect("renders");
+        assert!(out.contains("Total: 0 points"), "{out}");
+        assert!(
+            !out.contains("-0"),
+            "a negative zero reached the page: {out}"
+        );
     }
 
     #[test]
@@ -260,9 +331,11 @@ mod tests {
             items: vec![tf("a", "First?"), tf("b", "Second?")],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        assert!(out.contains("1. First?"));
-        assert!(out.contains("2. Second?"));
-        assert!(out.find("1. First?") < out.find("2. Second?"));
+        let (first, second) = (
+            out.find("1. (1 point) First?").expect("question one"),
+            out.find("2. (1 point) Second?").expect("question two"),
+        );
+        assert!(first < second, "the questions came out reversed: {out}");
     }
 
     #[test]
@@ -311,7 +384,7 @@ mod tests {
             }],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        assert!(out.contains("1. Which is O(1)?"));
+        assert!(out.contains("1. (1 point) Which is O(1)?"));
         assert!(out.contains("A. Hash lookup"));
         assert!(out.contains("B. Linear scan"));
         // No answer key: correctness must not leak into the sheet.
@@ -373,7 +446,7 @@ mod tests {
             }],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        assert!(out.contains("1. HTTP ________ returns ________."));
+        assert!(out.contains("1. (1 point) HTTP ________ returns ________."));
         assert!(!out.contains("{{"));
         assert!(!out.contains("GET"));
     }
@@ -406,7 +479,7 @@ mod tests {
     /// A matching item renders numbered prompts and lettered options, no key.
     fn renders_matching_without_answer_key() {
         let out = to_print_markdown(&matching_bank()).expect("renders");
-        assert!(out.contains("1. Match each type to its size."));
+        assert!(out.contains("1. (1 point) Match each type to its size."));
         assert!(out.contains("   1. char"));
         assert!(out.contains("   2. int"));
         // Every option is lettered and the distractor is among them: leaving
@@ -446,7 +519,7 @@ mod tests {
             }],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        assert!(out.contains("1. Order the phases."));
+        assert!(out.contains("1. (1 point) Order the phases."));
         // Sorted display order, not the authored order, with write-in blanks.
         let items = out.find("____ Compile").expect("compile listed");
         let link = out.find("____ Link").expect("link listed");
@@ -547,8 +620,8 @@ mod tests {
         };
         let key = to_answer_key(&bank);
         assert!(key.contains("# Q — Answer Key"));
-        assert!(key.contains("1. **False**"));
-        assert!(key.contains("2. A. Right"));
+        assert!(key.contains("1. (1 point) **False**"));
+        assert!(key.contains("2. (1 point) A. Right"));
         // The distractor is absent — the key lists correct answers only.
         assert!(!key.contains("Wrong"));
     }

@@ -726,6 +726,43 @@ existing pattern.
       spec the manifest's option lists equal what each sheet printed, item for
       item, and each key names its own sheet's letters.
 
+12. **Per-question points on the sheet.** *Done* — both print paths.
+
+    `Question::points` had existed since the first question kind and only the
+    Canvas exporter ever read it (`points_possible`). On paper that meant a
+    student could not tell a twenty-mark question from a two-mark one, which
+    is exactly the judgement a student makes when budgeting an hour.
+
+    Every question now leads `3. (5 points) `, and each sheet states its
+    total under the title. The *same* lead on the sheet and on the key, so a
+    grader reading the two side by side is never comparing different marks
+    against the same number — `the_sheet_and_the_key_lead_each_question_alike`
+    asserts them together, in the spirit of the Part 9 key/option pairing.
+
+    `export::points_label` is shared by the two writers so a Word sheet and a
+    Markdown one word it the same way. `f64::to_string` already gives the
+    shortest form that round-trips — `1` not `1.0`, `2.5` not `2.5000001` —
+    so only the plural needed deciding, and only an exact 1 is singular.
+
+    **`f64` sums from `-0.0`.** That is the only identity preserving the sign
+    of everything it adds, so an exam of no questions totals negative zero
+    and a sheet reads `Total: -0 points`. Found by the empty-exam test, fixed
+    in `points_label` rather than at each call site, and pinned on both
+    paths.
+
+    `Layout::show_points` (default true) turns the per-question marks off for
+    a quiz where every question counts the same and they would only be
+    repetition; the total still prints, and is then the one place the
+    weighting appears at all. The Markdown bank sheet has no such knob — a
+    bank is not an exam and has no layout — so its marks always print.
+
+    The six Markdown renderers took `number: usize` and each spelled
+    `{number}. ` themselves; they now take the lead the dispatcher built, so
+    the six cannot disagree about how a question is introduced.
+
+    Verified on converted pages, not just in the suite: `Total: 7.5 points`
+    with `1. (5 points)` and `2. (2.5 points)` on both the sheet and the key.
+
 
 ### Tables in v1
 
@@ -823,6 +860,7 @@ passed.
   *plus* a rasterised `r:embed` fallback, so it is strictly more work than PNG
   and never less — see Part 10. The Canvas path still offers
   `--diagram-format svg`, where it is a plain `<img>`.
-- **Per-question points on the sheet.** `Question::points` exists but no
-  exporter prints it. A paper exam wants per-question points and a per-variant
-  total.
+- **Forcing the point marks on for a uniform sheet.** `show_points` is a
+  plain bool, so an instructor who wants `(1 point)` on all forty questions
+  gets it and one who does not turns it off. What is missing is a *per-group*
+  override, for a spec whose sections differ in weight.

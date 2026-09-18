@@ -97,9 +97,23 @@ pub struct Layout {
     /// have no choice list, or derive their order when rendered.
     #[serde(default)]
     pub shuffle_choices: bool,
+    /// Whether each question prints what it is worth.
+    ///
+    /// On by default: a student allocating time across a paper needs to know
+    /// a question is worth twenty marks and not two, and that is not
+    /// recoverable from the sheet any other way. Turn it off for a quiz where
+    /// every question counts the same and the marks would only be repetition
+    /// — the total still prints either way.
+    #[serde(default = "default_show_points")]
+    pub show_points: bool,
     /// The repeating page footer, with `${...}` placeholders.
     #[serde(default)]
     pub page_footer: Option<String>,
+}
+
+/// Whether a spec that says nothing about points prints them.
+const fn default_show_points() -> bool {
+    true
 }
 
 /// The default blank lines left after a question.
@@ -114,6 +128,7 @@ impl Default for Layout {
             answer_space: default_answer_space(),
             page_break_between: false,
             shuffle_choices: false,
+            show_points: default_show_points(),
             page_footer: None,
         }
     }

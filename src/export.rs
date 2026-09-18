@@ -93,6 +93,26 @@ pub(crate) fn zip_package(what: &str, files: &[(&str, &[u8])]) -> Result<Vec<u8>
     Ok(cursor.into_inner())
 }
 
+/// A point value as it reads on a printed sheet: `1 point`, `2.5 points`.
+///
+/// Shared by the print writers so a Word sheet and a Markdown one word it the
+/// same way. `f64::to_string` already gives the shortest form that round-trips
+/// — `1` rather than `1.0`, `2.5` rather than `2.500000001` — so only the
+/// plural needs deciding, and only an exact 1 is singular.
+pub(crate) fn points_label(points: f64) -> String {
+    // `+ 0.0` turns a negative zero positive. `f64`'s `Sum` folds from
+    // `-0.0` — the only identity that preserves the sign of everything it
+    // adds — so an exam of no questions totals `-0.0`, and a sheet reading
+    // "Total: -0 points" looks like a bug because it is one.
+    let points = points + 0.0;
+    let unit = if (points - 1.0).abs() < f64::EPSILON {
+        "point"
+    } else {
+        "points"
+    };
+    format!("{points} {unit}")
+}
+
 /// Map a zip-writer failure onto the crate export error, naming which package
 /// was being built so a Canvas failure and a Word failure do not read alike.
 fn zip_err(what: &str, error: &zip::result::ZipError) -> crate::Error {
@@ -114,6 +134,24 @@ pub enum Format {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    /// Only an exact one is singular, and a whole number loses its `.0`:
+    /// `f64`'s own formatting already gives the shortest form that round
+    /// trips, so `1.0` reads `1` and `2.5` reads `2.5`.
+    fn a_point_value_reads_as_a_human_would_write_it() {
+        for (points, expected) in [
+            (1.0, "1 point"),
+            (0.0, "0 points"),
+            (-0.0, "0 points"),
+            (2.0, "2 points"),
+            (2.5, "2.5 points"),
+            (0.5, "0.5 points"),
+            (40.0, "40 points"),
+        ] {
+            assert_eq!(super::points_label(points), expected);
+        }
+    }
     use super::*;
 
     #[test]

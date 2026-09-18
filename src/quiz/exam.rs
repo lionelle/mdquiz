@@ -126,6 +126,15 @@ impl Exam {
         (variants > 1).then(|| sequence(index))
     }
 
+    /// What the whole sheet is worth.
+    ///
+    /// Summed rather than stored: the items are the source of truth, and a
+    /// total kept beside them is a total that can disagree with them.
+    #[must_use]
+    pub fn total_points(&self) -> f64 {
+        self.items.iter().map(|item| item.question.points).sum()
+    }
+
     /// The exam's title with its variant, as printed at the top of the sheet.
     #[must_use]
     pub fn title(&self) -> String {
@@ -181,6 +190,21 @@ mod tests {
         assert_eq!(Exam::variant_label(0, 5).as_deref(), Some("A"));
         assert_eq!(Exam::variant_label(4, 5).as_deref(), Some("E"));
         assert_eq!(Exam::variant_label(26, 30).as_deref(), Some("27"));
+    }
+
+    #[test]
+    /// The total is the sum of the questions on *this* sheet. Variants draw
+    /// different questions, so a total taken from the bank would be wrong on
+    /// every variant that did not draw all of it.
+    fn the_total_sums_the_questions_on_this_sheet() {
+        let quiz = exam(Some("B"), &[5.0, 1.0, 2.5]);
+        assert!((quiz.total_points() - 8.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    /// An exam with no questions is worth zero rather than failing to add up.
+    fn an_exam_with_no_questions_totals_zero() {
+        assert!(exam(None, &[]).total_points().abs() < f64::EPSILON);
     }
 
     #[test]
