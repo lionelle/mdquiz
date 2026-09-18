@@ -560,12 +560,38 @@ existing pattern.
    is derive a *different* order, which is what the bug above was.
 10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
     (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.
-11. **`mdquiz quiz` subcommand.** Library returns
-    `Vec<OutputFile>` + warnings; `cli.rs` only writes bytes — it is already
-    1122 lines. Variant naming (A/B/C, reusing `choice_label`'s A..Z-then-number
-    rule; `key_path` only appends `-key` today and nothing produces the `-A`).
-    Manifest records per-variant question ids, the shuffled choice order, and
-    the derived seed.
+11. **`mdquiz quiz` subcommand.** *Sheets and keys done; manifest still to do.*
+
+    `quiz::output::render` pairs every variant with its answer key and names
+    both, returning `Vec<OutputFile>` of bare names and bytes; `cli.rs` creates
+    the directory and writes them. Variant naming reuses `Exam::variant_label`
+    (and so `label::sequence`'s A..Z-then-number rule) rather than re-deriving
+    it, and the variant goes *before* the key suffix — `exam-A`, `exam-A-key` —
+    so a listing groups a sheet with the key that grades it. A lone sheet takes
+    the stem alone, because an `-A` implies a `-B` that does not exist.
+
+    **Every variant gets its own key**, which is the point of the whole freeze
+    chain: a letter circled on variant B means something else on A, so one key
+    cannot grade two papers. Verified end to end on a three-variant spec —
+    variant A showed `C. 1 byte` and its key said `char → C`; variant B showed
+    `B. 1 byte` and its key said `char → B`.
+
+    Group folders resolve against the *spec's* directory, not the shell's
+    working directory (a spec is checked in beside the questions it draws), and
+    `escapes_dir` refuses one that climbs out. The seed is printed on every
+    run, given or generated: without it a sheet handed out can never be
+    rebuilt.
+
+    `Command` now holds `clap::Args` structs rather than inline fields, so
+    `run` is a two-arm dispatch and each subcommand destructures its own
+    arguments.
+
+    **Still to do:** the manifest (per-variant question ids, the shuffled
+    choice order, the derived seed). Note it cannot record a choice
+    *permutation* — assembly shuffles `choices` in place and discards the
+    authored order — so it records the presented texts, or `assemble` has to
+    start tracking original positions. `serde_norway` is already a dependency,
+    so YAML matches the spec format and needs nothing new.
 
 ### Tables in v1
 

@@ -4,8 +4,10 @@
 //! an exam is a chosen subset, laid out. The pipeline runs in one direction:
 //!
 //! * [`spec`] — the authored YAML blueprint and its validation,
-//! * [`assemble`] — the one place randomness happens, and
-//! * [`exam`] — the finished [`Exam`](exam::Exam) the print writers consume,
+//! * [`assemble`] — the one place randomness happens,
+//! * [`exam`] — the finished [`Exam`](exam::Exam) the print writers consume, and
+//! * [`output`] — every variant paired with its answer key, named and ready to
+//!   write,
 //!
 //! with [`sample`] providing the seeded draws that [`assemble`] uses.
 //!
@@ -15,5 +17,6 @@
 
 pub mod assemble;
 pub mod exam;
+pub mod output;
 pub mod sample;
 pub mod spec;
