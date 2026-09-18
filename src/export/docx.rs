@@ -8,8 +8,8 @@
 //! before any question appears, plus the page furniture that is the same on
 //! every sheet. Authored content is delegated — [`inline`] renders Markdown to
 //! runs, [`omml`] renders LaTeX to math, and [`numbering`] owns the list
-//! definitions a `w:numPr` resolves against. The per-question answer
-//! structures arrive in a later change and slot into the body builder.
+//! definitions a `w:numPr` resolves against, and [`answers`] decides what
+//! prints under a prompt for the student to answer in.
 //!
 //! # What Word actually requires
 //!
@@ -103,8 +103,46 @@ const MAX_ANSWER_TWIPS: u32 = PAGE_HEIGHT - 2 * MARGIN;
 /// writer cannot convert, [`crate::Error::Export`] if the zip container cannot
 /// be written, or [`crate::Error::Io`] from the underlying writer.
 pub fn to_docx(exam: &Exam) -> Result<Vec<u8>> {
+    package(exam, Solutions::Hide)
+}
+
+/// Render `exam` as the instructor's answer key.
+///
+/// Pairs with [`to_docx`] — the numbering matches, so the key reads alongside
+/// the sheet, and the option letters it names are the ones that sheet printed.
+/// The prompts are not reprinted: a key is read next to the paper, and a grader
+/// wants one line per question.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] if an answer holds math or Markdown the writer
+/// cannot render, or if the package cannot be zipped.
+pub fn to_answer_key(exam: &Exam) -> Result<Vec<u8>> {
+    package(exam, Solutions::Show)
+}
+
+/// Whether a document prints the answers or the room to write them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Solutions {
+    /// The student's sheet: options to pick from, blanks to write in.
+    Hide,
+    /// The instructor's key: the correct answer, one line per question.
+    Show,
+}
+
+/// Build the whole package, with the body `solutions` calls for.
+///
+/// Everything but `word/document.xml` is identical in the two: a key that
+/// paginated or footed differently would be harder to read beside the sheet it
+/// grades.
+///
+/// # Errors
+///
+/// Returns [`crate::Error`] if the body cannot be rendered or the package
+/// cannot be zipped.
+fn package(exam: &Exam, solutions: Solutions) -> Result<Vec<u8>> {
     let mut lists = Numbering::new();
-    let document = document_xml(exam, &mut lists)?;
+    let document = document_xml(exam, solutions, &mut lists)?;
     let numbering = lists.to_xml();
     let footer = footer_xml(exam);
     let rels = document_rels();
@@ -279,11 +317,11 @@ const SETTINGS: &str = concat!(
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt, header or footer
 /// contains math that cannot be converted.
-fn document_xml(exam: &Exam, lists: &mut Numbering) -> Result<String> {
+fn document_xml(exam: &Exam, solutions: Solutions, lists: &mut Numbering) -> Result<String> {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="{W_NS}" xmlns:m="{M_NS}" xmlns:r="{R_NS}"><w:body>"#
     );
-    xml.push_str(&body_xml(exam, lists)?);
+    xml.push_str(&body_xml(exam, solutions, lists)?);
     xml.push_str(&section_xml());
     xml.push_str("</w:body></w:document>");
     Ok(xml)
@@ -292,10 +330,13 @@ fn document_xml(exam: &Exam, lists: &mut Numbering) -> Result<String> {
 /// Everything above the closing section properties: title, header, questions,
 /// footer.
 ///
-/// Question rendering is deliberately shallow for now — a numbered prompt and
-/// its answer space. The per-kind answer structures land with the question
-/// writers.
-fn body_xml(exam: &Exam, lists: &mut Numbering) -> Result<String> {
+/// Each question is a numbered prompt, the answer structure its kind calls
+/// for, then the blank space the item asked for. What that structure *is* is
+/// [`answers`]'s to decide; this builder only sets the lines it hands back.
+fn body_xml(exam: &Exam, solutions: Solutions, lists: &mut Numbering) -> Result<String> {
+    if solutions == Solutions::Show {
+        return key_body(exam, lists);
+    }
     let mut xml = paragraph(&inline::text_run(&exam.title()), ParagraphStyle::Title);
     if let Some(header) = &exam.header {
         xml.push_str(&prose(header, lists)?);
@@ -310,6 +351,28 @@ fn body_xml(exam: &Exam, lists: &mut Numbering) -> Result<String> {
     }
     if let Some(footer) = &exam.footer {
         xml.push_str(&prose(footer, lists)?);
+    }
+    Ok(xml)
+}
+
+/// The answer key's body: a title, then one numbered answer per question.
+///
+/// No header, footer or page breaks. Those are the sheet's instructions to the
+/// student and its room to write; a key carries neither, and repeating "no
+/// calculators" to the person marking would only make the key longer than it
+/// needs to be.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if an answer holds math that
+/// cannot be rendered.
+fn key_body(exam: &Exam, lists: &mut Numbering) -> Result<String> {
+    let title = format!("{} — Answer Key", exam.title());
+    let mut xml = paragraph(&inline::text_run(&title), ParagraphStyle::Title);
+    for (index, item) in exam.items.iter().enumerate() {
+        let lead = inline::text_run(&format!("{}. ", index + 1));
+        let answer = answers::key_line(item, lists)?;
+        xml.push_str(&paragraph(&(lead + &answer), ParagraphStyle::Body));
     }
     Ok(xml)
 }
@@ -341,11 +404,17 @@ fn opening_paragraphs(lead: &str, first: Option<inline::Paragraph>) -> String {
     )
 }
 
-/// One numbered question: its prompt, then the blank space to answer in.
+/// One numbered question: its prompt, its answer structure, then the blank
+/// space to answer in.
 ///
 /// The number shares the first paragraph with the prompt rather than standing
 /// alone, so a wrapped prompt still hangs off its own number — except where
 /// [`opening_paragraphs`] cannot put it there.
+///
+/// The answer space is emitted for every kind, including those that print
+/// options above it: it is an authored layout value, and deciding here that a
+/// choice question needs no room would re-derive what [`ExamItem`] froze. A
+/// group that wants none sets `answer_space: 0`.
 fn question_xml(
     number: usize,
     item: &ExamItem,
@@ -375,9 +444,12 @@ fn question_xml(
 /// One empty paragraph with an exact line height, rather than `lines` empty
 /// paragraphs: an exact height makes the paragraph a single line box, and a
 /// line box is indivisible, so the writing room is never broken across a page.
-/// What keeps it *with* its question is not this paragraph but the
-/// `w:keepNext` on [`ParagraphStyle::Question`]; remove that and the space
-/// migrates to the next page on its own, orphaning the prompt.
+/// What keeps it *with* its question is not this paragraph but the `w:keepNext`
+/// on whatever precedes it — [`ParagraphStyle::Question`] where the prompt is
+/// the last thing printed, [`ParagraphStyle::Answer`] where an option list
+/// comes between. Both answer yes to [`ParagraphStyle::is_sticky`]; drop
+/// either and the space migrates to the next page alone, orphaning the
+/// question.
 ///
 /// The height is capped at [`MAX_ANSWER_TWIPS`] — see there for why.
 fn answer_space(lines: usize) -> String {
@@ -431,7 +503,9 @@ enum ParagraphStyle {
     /// blank to write in.
     ///
     /// Indented under its prompt and held to it, so an option list never
-    /// starts on the page after the question it belongs to.
+    /// starts on the page after the question it belongs to. Every line is
+    /// sticky, not just the first: a list broken across a page reads as two
+    /// lists, and the chain carries on down to the answer space below.
     Answer,
     /// A list item, in the list [`Item`] names.
     ///
@@ -496,8 +570,13 @@ impl ParagraphStyle {
 
 /// How far an answer line is indented from the margin, in twips.
 ///
-/// Half an inch, which is where a list item's first level sits too: an option
-/// list and a bulleted list in the same prompt should not step differently.
+/// The same place a list item's first level sits, so an option list and a
+/// bulleted list in one prompt do not step differently. Kept separate from
+/// `numbering`'s indent rather than derived from it: that one is the *step* a
+/// list multiplies by its depth, and folding the two together would make
+/// "how deep does a nested bullet go" and "how far in does option B sit" one
+/// knob. `an_answer_line_lines_up_with_a_first_level_list_item` is what holds
+/// the two numbers together.
 const ANSWER_INDENT: u32 = 720;
 
 /// The `w:pPr` tags that hold a paragraph to the one after it.
@@ -1556,6 +1635,175 @@ mod tests {
             sorted.find("____ Run") < sorted.find("____ Compile"),
             reversed.find("____ Run") < reversed.find("____ Compile"),
             "the order on the page did not follow option_order"
+        );
+    }
+
+    #[test]
+    /// An item that never went through assembly falls back to the model's own
+    /// display order rather than the authored one. `ExamItem`'s fields are
+    /// public, so an order can be absent; printing the items in the order they
+    /// were authored would put an ordering question's answer on the sheet.
+    fn an_item_with_no_stored_order_falls_back_to_the_display_order() {
+        let items = vec!["Compile".to_owned(), "Link".to_owned(), "Run".to_owned()];
+        let kind = QuestionKind::Ordering(Ordering {
+            items: items.clone(),
+        });
+        let text = answer_text("Order them.", kind, Vec::new());
+        let compile = text.find("____ Compile").expect("compile listed");
+        let link = text.find("____ Link").expect("link listed");
+        let run = text.find("____ Run").expect("run listed");
+        assert!(
+            !(compile < link && link < run),
+            "the sheet printed the authored order: {text}"
+        );
+        // And it is the order assembly would have frozen for a non-shuffling
+        // group, so a sheet and a key built this way still agree.
+        assert!(link < run && run < compile, "not the display order: {text}");
+    }
+
+    /// The printed text of the answer key for an exam of `kind`.
+    fn key_text(prompt: &str, kind: QuestionKind, option_order: Vec<usize>) -> String {
+        let quiz = exam_of(prompt, kind, option_order);
+        text_of(&part(
+            &to_answer_key(&quiz).expect("renders"),
+            "word/document.xml",
+        ))
+    }
+
+    /// The matching question the sheet and key tests share.
+    fn matching_kind() -> QuestionKind {
+        QuestionKind::Matching(Matching {
+            pairs: vec![
+                MatchPair {
+                    left: "char".to_owned(),
+                    right: "1 byte".to_owned(),
+                },
+                MatchPair {
+                    left: "int".to_owned(),
+                    right: "4 bytes".to_owned(),
+                },
+            ],
+            distractors: vec!["8 bytes".to_owned()],
+        })
+    }
+
+    #[test]
+    /// The key names the letters the *sheet* printed. This is what freezing
+    /// the presented order buys: with the options shown as A. 8 bytes, B. 1
+    /// byte, C. 4 bytes, prompt 1's answer is B and prompt 2's is C. A key
+    /// that re-derived the order would letter them differently and mark every
+    /// correct paper wrong.
+    fn the_key_letters_matching_answers_as_the_sheet_did() {
+        let order = vec![2, 0, 1];
+        let sheet = answer_text("Match them.", matching_kind(), order.clone());
+        assert!(sheet.contains("B. 1 byte"), "{sheet}");
+        assert!(sheet.contains("C. 4 bytes"), "{sheet}");
+
+        let key = key_text("Match them.", matching_kind(), order);
+        assert!(key.contains("1. char → B"), "{key}");
+        assert!(key.contains("2. int → C"), "{key}");
+    }
+
+    #[test]
+    /// Reordering the options relabels the key with them, in step. Pinning
+    /// only one order would pass on a key that ignored `option_order`
+    /// entirely and always answered `A`.
+    fn the_key_follows_the_order_the_sheet_was_given() {
+        let authored = key_text("Match them.", matching_kind(), vec![0, 1, 2]);
+        assert!(authored.contains("1. char → A"), "{authored}");
+        let rotated = key_text("Match them.", matching_kind(), vec![2, 0, 1]);
+        assert!(rotated.contains("1. char → B"), "{rotated}");
+    }
+
+    #[test]
+    /// The key names only the correct choice, and letters it by the position
+    /// it prints in — assembly shuffles this payload itself, so the position
+    /// *is* the label.
+    fn the_key_names_only_the_correct_choice() {
+        let choice = key_text(
+            "Pick one.",
+            QuestionKind::MultipleChoice(ChoiceSet {
+                choices: two_choices(),
+            }),
+            Vec::new(),
+        );
+        assert!(choice.contains("A. alpha"), "{choice}");
+        assert!(
+            !choice.contains("beta"),
+            "an incorrect choice printed: {choice}"
+        );
+    }
+
+    #[test]
+    /// The key states which of True and False is right, and carries none of
+    /// the sheet's checkboxes.
+    fn the_key_states_the_true_false_answer() {
+        let tf = key_text(
+            "The sky is blue.",
+            QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            Vec::new(),
+        );
+        assert!(tf.contains("1. True"), "{tf}");
+        assert!(!tf.contains("False"), "{tf}");
+        assert!(!tf.contains("[ ]"), "the key printed a checkbox: {tf}");
+    }
+
+    #[test]
+    /// The key lists every accepted answer for a blank, not just the first: a
+    /// grader has to recognise a right response, and a blank matched by regex
+    /// has no single spelling.
+    fn the_key_lists_every_accepted_blank_answer() {
+        let fitb = key_text(
+            "The capital is {{city}}.",
+            QuestionKind::FillInBlank(FillInBlank {
+                blanks: vec![Blank {
+                    id: "city".to_owned(),
+                    answers: vec!["Paris".to_owned(), "paris".to_owned()],
+                    match_mode: MatchMode::default(),
+                }],
+            }),
+            Vec::new(),
+        );
+        assert!(fitb.contains("city: Paris, paris"), "{fitb}");
+    }
+
+    #[test]
+    /// The key gives an ordering question's *authored* sequence, whatever
+    /// order the sheet presented the items in — the authored order is the
+    /// answer.
+    fn the_key_gives_the_authored_ordering() {
+        let ordering = key_text(
+            "Order them.",
+            QuestionKind::Ordering(Ordering {
+                items: vec!["Compile".to_owned(), "Link".to_owned()],
+            }),
+            vec![1, 0],
+        );
+        let compile = ordering.find("1. Compile").expect("compile first");
+        let link = ordering.find("2. Link").expect("link second");
+        assert!(compile < link, "{ordering}");
+    }
+
+    #[test]
+    /// The key is titled as one and numbered like the sheet, but carries none
+    /// of the sheet's furniture — no instructions, no writing room, no page
+    /// breaks between questions.
+    fn the_key_is_a_key_and_not_a_second_sheet() {
+        let mut quiz = exam(Some("A"), 2);
+        quiz.header = Some("No calculators.".to_owned());
+        let key = part(&to_answer_key(&quiz).expect("renders"), "word/document.xml");
+        assert!(text_of(&key).contains("Exam 1 (A) — Answer Key"), "{key}");
+        assert!(
+            !text_of(&key).contains("No calculators."),
+            "the key repeated the sheet's instructions: {key}"
+        );
+        assert!(
+            !key.contains(r#"w:lineRule="exact""#),
+            "the key left writing room: {key}"
+        );
+        assert!(
+            !key.contains(r#"w:type="page""#),
+            "the key broke pages between answers: {key}"
         );
     }
 

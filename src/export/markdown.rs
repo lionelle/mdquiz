@@ -73,7 +73,13 @@ fn render_ordering(number: usize, prompt: &str, ordering: &Ordering) -> String {
 }
 
 /// Render a matching item: numbered left prompts, then lettered right options
-/// (all options, sorted so they do not line up with the prompts), no key.
+/// (all of them, in [`Matching::display_order`] so they do not line up with
+/// the prompts), no key.
+///
+/// The order comes from the model rather than a sort here: `options` lists the
+/// pair answers before the distractors, so a plain sort over the text lands
+/// back on the order that makes option *n* the answer to prompt *n* whenever
+/// the answers happen to sort that way. `display_order` rotates off it.
 fn render_matching(number: usize, prompt: &str, matching: &Matching) -> String {
     let mut out = format!("{number}. {prompt}\n");
     for (index, pair) in matching.pairs.iter().enumerate() {
@@ -81,10 +87,11 @@ fn render_matching(number: usize, prompt: &str, matching: &Matching) -> String {
         let _ = write!(out, "\n   {}. {}", index + 1, pair.left);
     }
     out.push('\n');
-    let mut options = matching.options();
-    options.sort_unstable();
-    for (index, right) in options.iter().enumerate() {
-        let _ = write!(out, "\n   {}. {right}", choice_label(index));
+    let options = matching.options();
+    for (position, index) in matching.display_order().into_iter().enumerate() {
+        if let Some(right) = options.get(index) {
+            let _ = write!(out, "\n   {}. {right}", choice_label(position));
+        }
     }
     out.push('\n');
     out
@@ -92,11 +99,7 @@ fn render_matching(number: usize, prompt: &str, matching: &Matching) -> String {
 
 /// Render a fill-in-the-blank item: each `{{name}}` marker becomes a blank line.
 fn render_fill_in_blank(number: usize, prompt: &str, blanks: &[Blank]) -> String {
-    let mut filled = prompt.to_owned();
-    for blank in blanks {
-        filled = filled.replace(&crate::model::blank_marker(&blank.id), "________");
-    }
-    format!("{number}. {filled}\n")
+    format!("{number}. {}\n", crate::model::fill_blanks(prompt, blanks))
 }
 
 /// Render a true/false item: the prompt plus blank True/False checkboxes.
@@ -375,14 +378,14 @@ mod tests {
         assert!(!out.contains("GET"));
     }
 
-    #[test]
-    /// A matching item renders numbered prompts and lettered options, no key.
-    fn renders_matching_without_answer_key() {
+    /// A bank of one matching question whose rights sort into the order that
+    /// pairs each with its own prompt — the case a plain sort gets wrong.
+    fn matching_bank() -> ItemBank {
         let pair = |left: &str, right: &str| MatchPair {
             left: left.to_owned(),
             right: right.to_owned(),
         };
-        let bank = ItemBank {
+        ItemBank {
             name: "M".to_owned(),
             items: vec![Question {
                 id: "mt".to_owned(),
@@ -396,14 +399,29 @@ mod tests {
                     distractors: vec!["8 bytes".to_owned()],
                 }),
             }],
-        };
-        let out = to_print_markdown(&bank).expect("renders");
+        }
+    }
+
+    #[test]
+    /// A matching item renders numbered prompts and lettered options, no key.
+    fn renders_matching_without_answer_key() {
+        let out = to_print_markdown(&matching_bank()).expect("renders");
         assert!(out.contains("1. Match each type to its size."));
         assert!(out.contains("   1. char"));
         assert!(out.contains("   2. int"));
-        // Right options are lettered, sorted, and include the distractor.
-        assert!(out.contains("A. 1 byte"));
-        assert!(out.contains("C. 8 bytes"));
+        // Every option is lettered and the distractor is among them: leaving
+        // it out would let a student count options against prompts and get
+        // the last pair free.
+        for right in ["1 byte", "4 bytes", "8 bytes"] {
+            assert!(out.contains(right), "{right} is missing: {out}");
+        }
+        // And option A is *not* prompt 1's answer. These rights sort into the
+        // order that pairs each with its own prompt, so a plain sort here
+        // would print the whole answer; `display_order` rotates off it.
+        assert!(
+            !out.contains("A. 1 byte"),
+            "the options line up with the prompts: {out}"
+        );
         // No answer key: no pairing (e.g. "left = right") is written out.
         assert!(!out.contains('='));
     }

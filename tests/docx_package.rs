@@ -21,8 +21,11 @@ use std::io::Read as _;
 use std::path::Path;
 use std::process::Command;
 
-use mdquiz::export::docx::to_docx;
-use mdquiz::model::{Feedback, Question, QuestionKind, TrueFalse};
+use mdquiz::export::docx::{to_answer_key, to_docx};
+use mdquiz::model::{
+    Choice, Feedback, MatchPair, Matching, MultipleSelect, Question, QuestionKind, ScoringMode,
+    TrueFalse,
+};
 use mdquiz::quiz::exam::{Exam, ExamItem};
 use mdquiz::quiz::spec::Layout;
 
@@ -88,7 +91,7 @@ const PROMPTS: [&str; 8] = [
      | n | total |\n|---|-------|\n| 3 |       |",
 ];
 
-/// One true/false item asking the `n`th prompt.
+/// One item asking the `n`th prompt, of the `n`th kind.
 fn sample_item(n: usize) -> ExamItem {
     ExamItem {
         question: Question {
@@ -98,16 +101,65 @@ fn sample_item(n: usize) -> ExamItem {
             points: 1.0,
             tags: Vec::new(),
             feedback: Feedback::default(),
-            kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            kind: sample_kind(n),
         },
         answer_space: 4,
         option_order: Vec::new(),
     }
 }
 
+/// The question kind for item `n`.
+///
+/// Varied rather than all true/false so more than one answer structure reaches
+/// the checks in this file: substring assertions in `export::docx` cannot tell
+/// you the document *opens*, and a matching question is the one that emits an
+/// empty paragraph as a separator — the likeliest thing to come out wrong on a
+/// real page. Every other index stays true/false so the prompts above keep
+/// exercising what they were written for.
+fn sample_kind(n: usize) -> QuestionKind {
+    match n {
+        1 => QuestionKind::MultipleSelect(MultipleSelect {
+            choices: vec![
+                Choice {
+                    text: "*merge* sort".to_owned(),
+                    correct: true,
+                },
+                Choice {
+                    text: "bubble sort".to_owned(),
+                    correct: false,
+                },
+            ],
+            scoring: ScoringMode::default(),
+        }),
+        2 => QuestionKind::Matching(Matching {
+            pairs: vec![
+                MatchPair {
+                    left: "char".to_owned(),
+                    right: "1 byte".to_owned(),
+                },
+                MatchPair {
+                    left: "int".to_owned(),
+                    right: "4 bytes".to_owned(),
+                },
+            ],
+            distractors: vec!["8 bytes".to_owned()],
+        }),
+        _ => QuestionKind::TrueFalse(TrueFalse { answer: true }),
+    }
+}
+
 /// Every `(name, contents)` part of the generated package.
 fn package_parts() -> Vec<(String, Vec<u8>)> {
-    let bytes = to_docx(&sample_exam()).expect("the exam renders");
+    parts_of(to_docx(&sample_exam()).expect("the exam renders"))
+}
+
+/// Every `(name, contents)` part of the generated answer key.
+fn key_parts() -> Vec<(String, Vec<u8>)> {
+    parts_of(to_answer_key(&sample_exam()).expect("the key renders"))
+}
+
+/// Every `(name, contents)` part of the package in `bytes`.
+fn parts_of(bytes: Vec<u8>) -> Vec<(String, Vec<u8>)> {
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("the package is a zip");
     // By index rather than by name: `file_names` would borrow the archive
@@ -155,10 +207,13 @@ fn every_part_is_well_formed_xml() {
         return;
     }
     let dir = tempfile::tempdir().expect("temp dir");
-    let parts = package_parts();
-    assert!(!parts.is_empty(), "the package holds no parts");
-    for (name, contents) in parts {
-        assert_well_formed(dir.path(), &name, &contents);
+    // Both documents: the key is a second body through the same container, and
+    // Word refuses a malformed one just as readily as a malformed sheet.
+    for (label, parts) in [("sheet", package_parts()), ("key", key_parts())] {
+        assert!(!parts.is_empty(), "the {label} holds no parts");
+        for (name, contents) in parts {
+            assert_well_formed(dir.path(), &format!("{label}-{name}"), &contents);
+        }
     }
 }
 
@@ -289,10 +344,13 @@ fn assert_page_numbering(rendered: &str) {
         footers.iter().all(|(_, each)| *each == total),
         "the footers disagree on the total: {footers:?}"
     );
+    // The numbers themselves, not just the largest: `${page}` resolving to 1
+    // on every page of a three-page sheet satisfies any check on the maximum,
+    // and a stale `${page}` is precisely what this is here to catch.
     assert_eq!(
-        footers.iter().map(|(page, _)| *page).max().unwrap_or(0),
-        total,
-        "the last page is numbered below the total, so a field went stale: {footers:?}"
+        footers.iter().map(|(page, _)| *page).collect::<Vec<_>>(),
+        (1..=total).collect::<Vec<_>>(),
+        "the page numbers are not 1..={total}, so a field went stale: {footers:?}"
     );
 }
 
@@ -348,6 +406,42 @@ fn assert_prompts(rendered: &str) {
     assert!(
         rendered.contains("| n | total |"),
         "the table lost its row: {rendered}"
+    );
+    assert_answer_structures(rendered);
+}
+
+/// Assert the answer structures reached the page, on a document a word
+/// processor actually read.
+///
+/// The per-kind shapes are asserted on the XML in `export::docx`; what this
+/// adds is that they survive to a laid-out page — in particular the empty
+/// paragraph a matching question puts between its prompts and its options,
+/// which is the one line here that carries no text of its own.
+fn assert_answer_structures(rendered: &str) {
+    // Multiple select: a box per option, and the option's italics do not eat
+    // its text.
+    assert!(
+        rendered.contains("[ ] A. merge sort"),
+        "the multiple-select options are missing: {rendered}"
+    );
+    // Matching: numbered prompts with a blank each, then every option
+    // lettered, distractor included.
+    for line in ["____ 1. char", "____ 2. int"] {
+        assert!(
+            rendered.contains(line),
+            "the matching prompt {line:?} is missing: {rendered}"
+        );
+    }
+    for right in ["1 byte", "4 bytes", "8 bytes"] {
+        assert!(
+            rendered.contains(right),
+            "the matching option {right:?} is missing: {rendered}"
+        );
+    }
+    // True/false still prints both options and neither answer.
+    assert!(
+        rendered.contains("[ ] True") && rendered.contains("[ ] False"),
+        "the true/false options are missing: {rendered}"
     );
 }
 

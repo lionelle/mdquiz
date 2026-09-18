@@ -411,6 +411,16 @@ pub(super) mod tests {
         );
     }
 
+    #[test]
+    /// An answer line and a list item's first level start at the same indent,
+    /// so an option list and a bulleted list in one prompt do not step
+    /// differently. Two constants on purpose — this one is the per-level step,
+    /// the other a fixed offset — so the coincidence is pinned here rather
+    /// than asserted in a doc comment nothing checks.
+    fn an_answer_line_lines_up_with_a_first_level_list_item() {
+        assert_eq!(super::super::ANSWER_INDENT, indent(0));
+    }
+
     /// The values of every `w:{attribute}` in `xml`, in document order.
     ///
     /// Shared with `docx::tests`, which reads `w:numId` out of `document.xml`

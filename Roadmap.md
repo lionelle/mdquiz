@@ -524,9 +524,40 @@ existing pattern.
    "a choice question needs no room" would be exactly the re-derivation
    `ExamItem` exists to prevent — set `answer_space: 0` on the group instead.
 
-   **Still to do here:** the answer-key document. `export/markdown.rs` keeps
-   deriving its own order, correctly: it is the *bank* path and never sees an
-   `ExamItem`.
+   **Found by review: the bank sheet was handing away a matching answer.**
+   `markdown::render_matching` sorted the options itself
+   (`options.sort_unstable()`) instead of going through
+   `Matching::display_order`, so it skipped `hides_the_answer` — and the two
+   print paths' tests then asserted *opposite* things about identical data,
+   one of them that option A is prompt 1's answer. It uses the model's order
+   now. `render_ordering` was already correct; only matching had its own sort.
+
+   Blank-marker substitution was also duplicated verbatim in both paths,
+   `"________"` literal included. It lives in `model::fill_blanks` with
+   `model::BLANK_FILL` now — the marker syntax's own module — so a blank is
+   the same width whichever sheet a student is handed.
+
+   **The answer-key document ships.** `docx::to_answer_key` pairs with
+   `to_docx`: same container, same numbering, a different body. The key is one
+   line per question — a title, then the answer — with no header, no writing
+   room and no page breaks, because those are the sheet's instructions to the
+   student and its room to write.
+
+   The key lives in `answers.rs` beside the sheet's options, and that is the
+   point: **the sheet letters its options from the presented order and the key
+   names those letters back.** A key built from a different order than the
+   sheet it grades would mark every correct paper wrong, and neither document
+   can reveal that on its own — so one module owns both, and
+   `the_key_letters_matching_answers_as_the_sheet_did` asserts them together.
+   This is what closing the freeze gap was for; the bank key prints answers as
+   *text* precisely because it could not trust a label.
+
+   An ordering key gives the authored sequence, not the presented one: there
+   the authored order is the answer.
+
+   Part 9 is complete. `export/markdown.rs` keeps deriving its own order for
+   the bank path, correctly — it never sees an `ExamItem`. What it must not do
+   is derive a *different* order, which is what the bug above was.
 10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
     (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.
 11. **`mdquiz quiz` subcommand.** Library returns

@@ -285,6 +285,24 @@ pub(crate) fn blank_marker(name: &str) -> String {
     ["{{", name, "}}"].concat()
 }
 
+/// The writing room a `{{name}}` marker prints as.
+///
+/// Wider than the `____` a whole answer is written on: this blank sits mid
+/// sentence and has to read as a gap in the text rather than a rule under it.
+pub(crate) const BLANK_FILL: &str = "________";
+
+/// `prompt` with every one of `blanks`'s markers replaced by writing room.
+///
+/// A marker is an instruction to the exporter rather than text, so a sheet
+/// printing the prompt verbatim would put `{{city}}` on the paper. Shared by
+/// both print paths, so a blank is the same width whichever sheet a student is
+/// handed.
+pub(crate) fn fill_blanks(prompt: &str, blanks: &[Blank]) -> String {
+    blanks.iter().fold(prompt.to_owned(), |filled, blank| {
+        filled.replace(&blank_marker(&blank.id), BLANK_FILL)
+    })
+}
+
 /// Scan `text` for inline `{{name}}` blank markers, in first-appearance order.
 ///
 /// Names are trimmed; markers are de-duplicated, so a name reused in the prompt

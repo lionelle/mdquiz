@@ -1,4 +1,9 @@
-//! What is printed under a question's prompt for the student to answer in.
+//! A question's answers: what the student writes in, and what the key says.
+//!
+//! Both live here because they must agree. The sheet letters its options from
+//! the presented order and the key names those letters back — so a key built
+//! from a different order than the sheet it grades is the one failure neither
+//! document can reveal on its own. One module, one order.
 //!
 //! One line per option, as runs. The container decides the `w:pPr` each line
 //! is set with — the same division [`super::inline`] uses, and for the same
@@ -7,16 +12,18 @@
 //!
 //! The idioms follow the bank print sheet in `export::markdown`, so the two
 //! artifacts read the same way: a lettered list for a single answer, a
-//! checkbox where more than one may be picked, and a `____` blank wherever the
-//! student writes something in.
+//! checkbox where more than one may be picked, and a [`BLANK`] wherever the
+//! student writes a whole answer in. A blank *within* a sentence is a
+//! different width and belongs to the prompt — see [`crate::model::BLANK_FILL`].
 //!
-//! # Nothing is derived here
+//! # The presented order is stored, not derived
 //!
 //! A matching or ordering question's presented order is read from
-//! [`ExamItem::option_order`], never recomputed. That order is the one thing a
-//! sheet and its answer key must agree on, and it is decided once during
-//! assembly; a writer that sorted the options itself would be the bug
-//! [`crate::quiz::exam`] exists to prevent.
+//! [`ExamItem::option_order`]. That order is the one thing a sheet and its
+//! answer key must agree on, and it is decided once during assembly; a writer
+//! that sorted the options itself would be the bug [`crate::quiz::exam`]
+//! exists to prevent. [`presented`] falls back to the model's own default only
+//! for an item that never went through assembly — see there.
 
 use std::fmt::Write as _;
 
@@ -47,11 +54,7 @@ pub(super) fn prompt(question: &Question) -> String {
     let QuestionKind::FillInBlank(fitb) = &question.kind else {
         return question.prompt.clone();
     };
-    let mut filled = question.prompt.clone();
-    for blank in &fitb.blanks {
-        filled = filled.replace(&crate::model::blank_marker(&blank.id), "________");
-    }
-    filled
+    crate::model::fill_blanks(&question.prompt, &fitb.blanks)
 }
 
 /// The lines of `item`'s answer structure, in print order.
@@ -59,6 +62,11 @@ pub(super) fn prompt(question: &Question) -> String {
 /// Empty where a kind prints nothing under its prompt: a fill-in-the-blank
 /// question carries its blanks *in* the prompt, so an option list below it
 /// would have nothing to hold.
+///
+/// An individual line may also be empty, and is a gap the caller must set like
+/// any other — a matching question separates its prompts from its options that
+/// way, because a gap is `w:pPr` and this module writes only runs. Do not
+/// filter run-less lines out the way `docx::prose` does; that closes it.
 ///
 /// # Errors
 ///
@@ -110,9 +118,9 @@ fn choices(choices: &[Choice], multiple: bool, lists: &mut Numbering) -> Result<
 
 /// The left prompts of a matching question, then the options they draw from.
 ///
-/// The two blocks are separated by a blank line, and every option is listed
-/// including the distractors — a student who can count the options against the
-/// prompts would otherwise get the last pair free.
+/// Two differently labelled blocks — numbered prompts with a blank each, then
+/// lettered options — separated by a gap, which is the empty line in the
+/// middle.
 ///
 /// # Errors
 ///
@@ -123,22 +131,56 @@ fn matching_lines(
     order: &[usize],
     lists: &mut Numbering,
 ) -> Result<Vec<String>> {
-    let mut lines = Vec::new();
-    for (index, pair) in matching.pairs.iter().enumerate() {
-        let label = format!("{BLANK}{}. ", index + 1);
-        lines.push(option_line(&label, &pair.left, lists)?);
-    }
+    let mut lines = matching_prompts(matching, lists)?;
     lines.push(String::new());
+    lines.extend(matching_options(matching, order, lists)?);
+    Ok(lines)
+}
+
+/// The numbered left prompts, each with a blank for the letter it matches.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if a prompt holds math that
+/// cannot be rendered.
+fn matching_prompts(matching: &Matching, lists: &mut Numbering) -> Result<Vec<String>> {
+    matching
+        .pairs
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| option_line(&format!("{BLANK}{}. ", index + 1), &pair.left, lists))
+        .collect()
+}
+
+/// The lettered options, in the presented order.
+///
+/// Every option is listed, distractors included: a student who could count the
+/// options against the prompts would otherwise get the last pair free.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if an option holds math that
+/// cannot be rendered.
+fn matching_options(
+    matching: &Matching,
+    order: &[usize],
+    lists: &mut Numbering,
+) -> Result<Vec<String>> {
     let options = matching.options();
-    for (position, index) in presented(order, || matching.display_order())
+    presented(order, || matching.display_order())
         .into_iter()
         .enumerate()
-    {
-        let label = format!("{}. ", choice_label(position));
-        let option = options.get(index).copied().unwrap_or_default();
-        lines.push(option_line(&label, option, lists)?);
-    }
-    Ok(lines)
+        .map(|(position, index)| {
+            // An index past the options is only reachable from an order that
+            // did not come from this payload, which assembly cannot produce —
+            // it indexes the same list. The degradation is deliberately
+            // visible: a labelled line with nothing on it is something an
+            // instructor notices on the proof, where dropping the line
+            // silently renumbers everything below it.
+            let option = options.get(index).copied().unwrap_or_default();
+            option_line(&format!("{}. ", choice_label(position)), option, lists)
+        })
+        .collect()
 }
 
 /// The items of an ordering question, each with a blank for its position.
@@ -155,18 +197,24 @@ fn ordering_lines(
     presented(order, || ordering.display_order())
         .into_iter()
         .map(|index| {
+            // Out of range only from an order that did not come from this
+            // payload; see `matching_options` for why the empty line stays.
             let item = ordering.items.get(index).map_or("", String::as_str);
             option_line(BLANK, item, lists)
         })
         .collect()
 }
 
-/// `order` as frozen at assembly, or `default` if it is empty.
+/// `order` as frozen at assembly, or the model's default if it is empty.
 ///
-/// An [`ExamItem`] from `assemble` always carries an order. The fallback is
-/// for one built by hand — a test, or a caller that bypasses assembly — and is
-/// the same default assembly would have stored, so a sheet and a key built the
-/// same way still agree on which option is `B`.
+/// An [`ExamItem`] from `assemble` always carries an order for these kinds, so
+/// the fallback is for one built by hand — a test, or a caller that bypassed
+/// assembly. It is the order a *non-shuffling* group would have stored:
+/// assembly computes `hides_the_answer(display_order())`, `display_order`
+/// already ends in `hides_the_answer`, and the second application is a no-op
+/// because a rotated identity is never the identity again. A shuffling group's
+/// order cannot be recovered and is not guessed at — being unrecoverable is
+/// why it is stored in the first place.
 fn presented(order: &[usize], default: impl FnOnce() -> Vec<usize>) -> Vec<usize> {
     if order.is_empty() {
         return default();
@@ -180,6 +228,11 @@ fn presented(order: &[usize], default: impl FnOnce() -> Vec<usize>) -> Vec<usize
 /// blank — and must not be read as Markdown. The option text *is* authored, so
 /// it goes through [`inline`] and gets its marks and math.
 ///
+/// An option is one line, so anything `inline` splits into several paragraphs
+/// is run together onto this one and each paragraph's kind is dropped: a list
+/// in an option keeps its text and loses its markers, which live in the
+/// `w:pPr` a single line has no room for.
+///
 /// # Errors
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if `text` holds math that cannot
@@ -190,4 +243,131 @@ fn option_line(label: &str, text: &str, lists: &mut Numbering) -> Result<String>
         let _ = write!(runs, "{}", block.runs);
     }
     Ok(runs)
+}
+
+/// The key's line for `item`: its correct answer, as runs.
+///
+/// Named by *label* wherever the student answers with one, because that is
+/// what the grader is comparing against — a letter circled on the sheet. The
+/// labels come from the same presented order the sheet lettered, so the two
+/// cannot disagree.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if an answer holds math that
+/// cannot be rendered.
+pub(super) fn key_line(item: &ExamItem, lists: &mut Numbering) -> Result<String> {
+    match &item.question.kind {
+        QuestionKind::TrueFalse(tf) => {
+            Ok(inline::text_run(if tf.answer { "True" } else { "False" }))
+        }
+        QuestionKind::MultipleChoice(set) => correct_choices(&set.choices, lists),
+        QuestionKind::MultipleSelect(set) => correct_choices(&set.choices, lists),
+        QuestionKind::FillInBlank(fitb) => blank_answers(&fitb.blanks, lists),
+        QuestionKind::Matching(matching) => matching_key(matching, &item.option_order, lists),
+        QuestionKind::Ordering(ordering) => ordering_key(ordering, lists),
+    }
+}
+
+/// The correct choices as `label. text`, joined; covers single and multi-select.
+///
+/// The label is the choice's own position, which is the position it prints in:
+/// assembly shuffles the payload itself for these kinds, so there is no
+/// separate order to consult.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if a choice holds math that
+/// cannot be rendered.
+fn correct_choices(choices: &[Choice], lists: &mut Numbering) -> Result<String> {
+    let correct: Vec<(usize, &Choice)> = choices
+        .iter()
+        .enumerate()
+        .filter(|(_, choice)| choice.correct)
+        .collect();
+    let mut lines = Vec::new();
+    for (index, choice) in correct {
+        let label = format!("{}. ", choice_label(index));
+        lines.push(option_line(&label, &choice.text, lists)?);
+    }
+    Ok(joined(&lines))
+}
+
+/// Each blank's accepted answers, as `name: a, b`, joined.
+///
+/// Every accepted answer, not just the first: the grader needs to know a
+/// response is right, and a blank matched by regex has no single spelling.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if an answer holds math that
+/// cannot be rendered.
+fn blank_answers(blanks: &[crate::model::Blank], lists: &mut Numbering) -> Result<String> {
+    let mut lines = Vec::new();
+    for blank in blanks {
+        let label = format!("{}: ", blank.id);
+        lines.push(option_line(&label, &blank.answers.join(", "), lists)?);
+    }
+    Ok(joined(&lines))
+}
+
+/// Each pair as `n. left → LABEL`, joined.
+///
+/// The label is the one the sheet printed against that pair's right-hand
+/// answer, found by looking the answer up in the presented order. A key naming
+/// the answer's *text* would grade a shuffled variant just as well, but a
+/// grader reading the letter a student wrote wants the letter.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if a prompt holds math that
+/// cannot be rendered.
+fn matching_key(matching: &Matching, order: &[usize], lists: &mut Numbering) -> Result<String> {
+    let options = matching.options();
+    let presented = presented(order, || matching.display_order());
+    let mut lines = Vec::new();
+    for (index, pair) in matching.pairs.iter().enumerate() {
+        let label = label_of(&pair.right, &options, &presented);
+        let prefix = format!("{}. ", index + 1);
+        let mut runs = option_line(&prefix, &pair.left, lists)?;
+        let _ = write!(runs, "{}", inline::text_run(&format!(" → {label}")));
+        lines.push(runs);
+    }
+    Ok(joined(&lines))
+}
+
+/// The printed label of the option whose text is `right`.
+///
+/// Empty when the answer is not among the options, which parsing rejects: a
+/// pair's right-hand side is always one of them, because that is where
+/// [`Matching::options`] collects them from.
+fn label_of(right: &str, options: &[&str], presented: &[usize]) -> String {
+    options
+        .iter()
+        .position(|option| *option == right)
+        .and_then(|index| presented.iter().position(|shown| *shown == index))
+        .map_or_else(String::new, choice_label)
+}
+
+/// The items in their correct order, numbered.
+///
+/// The authored order is the answer, so this is the payload read straight
+/// through — the presented order is the sheet's business, not the key's.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::UnsupportedMath`] if an item holds math that cannot
+/// be rendered.
+fn ordering_key(ordering: &Ordering, lists: &mut Numbering) -> Result<String> {
+    let mut lines = Vec::new();
+    for (index, item) in ordering.items.iter().enumerate() {
+        let label = format!("{}. ", index + 1);
+        lines.push(option_line(&label, item, lists)?);
+    }
+    Ok(joined(&lines))
+}
+
+/// Several answers on one line, separated so they read as a list.
+fn joined(lines: &[String]) -> String {
+    lines.join(&inline::text_run(";  "))
 }
