@@ -501,10 +501,31 @@ existing pattern.
    shuffle. Rotation consumes no randomness, so an unshuffled sheet does not
    depend on the seed at all.
 
-   **Still to do here:** the per-question answer structures in the DOCX writer
-   (it prints prompt + blank space today) and the answer-key document, both
-   reading `option_order` rather than deriving anything. `export/markdown.rs`
-   keeps deriving, correctly: it is the *bank* path and never sees an
+   **The answer structures ship.** `src/export/docx/answers.rs` owns what is
+   printed under a prompt, returning runs for the container to set — the same
+   division `inline` uses. All six kinds, following the bank sheet's idioms so
+   the two artifacts read alike: a lettered list for a single answer, a `[ ]`
+   box where more than one may be picked, a `____` blank wherever the student
+   writes something in. Matching and ordering read `ExamItem::option_order`
+   and sort nothing.
+
+   Brackets rather than `☐` deliberately: the ballot-box code point is missing
+   from some faces a reader may substitute, and a missing glyph prints as a
+   box that looks deliberate — the sheet would be wrong in a way nobody can
+   see.
+
+   **Found doing it: the DOCX writer printed `{{city}}`.** Fill-in-the-blank
+   markers are an instruction to the exporter, and only the bank sheet
+   substituted them; the exam sheet put the marker on the paper. `answers::
+   prompt` now fills them with writing room on this path too.
+
+   `answer_space` is still emitted for every kind, including those that now
+   print options. It is an authored layout value, and having the writer decide
+   "a choice question needs no room" would be exactly the re-derivation
+   `ExamItem` exists to prevent — set `answer_space: 0` on the group instead.
+
+   **Still to do here:** the answer-key document. `export/markdown.rs` keeps
+   deriving its own order, correctly: it is the *bank* path and never sees an
    `ExamItem`.
 10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
     (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.

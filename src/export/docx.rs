@@ -26,6 +26,7 @@
 //! * Children of `w:pPr` are a *sequence*, not a set: out-of-order elements are
 //!   a schema violation even though they look harmless.
 
+mod answers;
 mod inline;
 mod numbering;
 pub mod omml;
@@ -355,12 +356,15 @@ fn question_xml(
     if page_break && number > 1 {
         xml.push_str(r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#);
     }
-    let mut prompt = inline::paragraphs(&item.question.prompt, lists)?.into_iter();
+    let mut prompt = inline::paragraphs(&answers::prompt(&item.question), lists)?.into_iter();
     let lead = inline::text_run(&format!("{number}. "));
     xml.push_str(&opening_paragraphs(&lead, prompt.next()));
     for block in prompt {
         let style = ParagraphStyle::Continuation.or_block(block.kind);
         xml.push_str(&paragraph(&block.centred(), style));
+    }
+    for line in answers::lines(item, lists)? {
+        xml.push_str(&paragraph(&line, ParagraphStyle::Answer));
     }
     xml.push_str(&answer_space(item.answer_space));
     Ok(xml)
@@ -423,6 +427,12 @@ enum ParagraphStyle {
     Continuation,
     /// A Markdown heading, at the given level.
     Heading(u8),
+    /// One line of a question's answer structure: an option, a checkbox, a
+    /// blank to write in.
+    ///
+    /// Indented under its prompt and held to it, so an option list never
+    /// starts on the page after the question it belongs to.
+    Answer,
     /// A list item, in the list [`Item`] names.
     ///
     /// `sticky` is inherited from the style the caller asked for, so a list
@@ -463,7 +473,7 @@ impl ParagraphStyle {
     /// `or_block` replaces a heading outright rather than asking — so a
     /// heading is never the `self` here.
     const fn is_sticky(self) -> bool {
-        matches!(self, Self::Question | Self::Continuation)
+        matches!(self, Self::Question | Self::Continuation | Self::Answer)
     }
 
     /// The `w:pPr` contents for this style, in schema order.
@@ -475,11 +485,20 @@ impl ParagraphStyle {
             Self::Continuation => {
                 format!(r#"{STICKY}<w:spacing w:before="120" w:after="120"/>"#)
             }
+            Self::Answer => {
+                format!(r#"{STICKY}<w:spacing w:after="60"/><w:ind w:left="{ANSWER_INDENT}"/>"#)
+            }
             Self::Heading(level) => format!(r#"<w:pStyle w:val="{}"/>"#, heading_style(level)),
             Self::Item { item, sticky } => item_properties(item, sticky),
         }
     }
 }
+
+/// How far an answer line is indented from the margin, in twips.
+///
+/// Half an inch, which is where a list item's first level sits too: an option
+/// list and a bulleted list in the same prompt should not step differently.
+const ANSWER_INDENT: u32 = 720;
 
 /// The `w:pPr` tags that hold a paragraph to the one after it.
 ///
@@ -621,7 +640,10 @@ fn field_run(instruction: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Feedback, Question, QuestionKind, TrueFalse};
+    use crate::model::{
+        Blank, Choice, ChoiceSet, Feedback, FillInBlank, MatchMode, MatchPair, Matching,
+        MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse,
+    };
     use crate::quiz::spec::Layout;
     use std::io::Cursor;
 
@@ -1026,7 +1048,14 @@ mod tests {
             r#"<w:spacing w:after="120"/>"#,
             "body prose should not be sticky: {document}"
         );
-        assert_eq!(document.matches("<w:keepNext/>").count(), 1, "{document}");
+        // The prompt and the two true/false options, and nothing else: an
+        // option list orphaned from its question is as bad as an orphaned
+        // answer space, and body prose must stay free to break.
+        assert_eq!(
+            document.matches("<w:keepNext/>").count(),
+            3,
+            "sticky paragraphs are the prompt and its options: {document}"
+        );
     }
 
     #[test]
@@ -1354,6 +1383,180 @@ mod tests {
                 "level {level}, marked {marked}, sticky {sticky}"
             );
         }
+    }
+
+    /// The exam of [`exam`] asking one question of `kind`.
+    fn exam_of(prompt: &str, kind: QuestionKind, option_order: Vec<usize>) -> Exam {
+        let mut quiz = exam(None, 1);
+        if let Some(item) = quiz.items.first_mut() {
+            item.question.prompt = prompt.to_owned();
+            item.question.kind = kind;
+            item.option_order = option_order;
+        }
+        quiz
+    }
+
+    /// The printed text of the one question in an exam of `kind`.
+    fn answer_text(prompt: &str, kind: QuestionKind, option_order: Vec<usize>) -> String {
+        let quiz = exam_of(prompt, kind, option_order);
+        text_of(&part(
+            &to_docx(&quiz).expect("renders"),
+            "word/document.xml",
+        ))
+    }
+
+    /// Two choices, the first correct.
+    fn two_choices() -> Vec<Choice> {
+        vec![
+            Choice {
+                text: "alpha".to_owned(),
+                correct: true,
+            },
+            Choice {
+                text: "beta".to_owned(),
+                correct: false,
+            },
+        ]
+    }
+
+    #[test]
+    /// A single-answer question letters its options with no box; a
+    /// choose-all-that-apply one adds a box to each. Nothing else on the page
+    /// says how many letters the student may pick.
+    fn a_choice_question_letters_its_options() {
+        let single = answer_text(
+            "Pick one.",
+            QuestionKind::MultipleChoice(ChoiceSet {
+                choices: two_choices(),
+            }),
+            Vec::new(),
+        );
+        assert!(single.contains("A. alpha"), "{single}");
+        assert!(single.contains("B. beta"), "{single}");
+        assert!(
+            !single.contains("[ ]"),
+            "a single answer got a box: {single}"
+        );
+
+        let multiple = answer_text(
+            "Pick any.",
+            QuestionKind::MultipleSelect(MultipleSelect {
+                choices: two_choices(),
+                scoring: ScoringMode::default(),
+            }),
+            Vec::new(),
+        );
+        assert!(multiple.contains("[ ] A. alpha"), "{multiple}");
+        assert!(multiple.contains("[ ] B. beta"), "{multiple}");
+    }
+
+    #[test]
+    /// A true/false question prints both options with a box each, and never
+    /// which of them is right.
+    fn a_true_false_question_prints_both_options_and_no_answer() {
+        let text = answer_text(
+            "The sky is blue.",
+            QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            Vec::new(),
+        );
+        assert!(text.contains("[ ] True"), "{text}");
+        assert!(text.contains("[ ] False"), "{text}");
+    }
+
+    #[test]
+    /// A fill-in-the-blank marker becomes writing room in the prompt, and the
+    /// marker itself never reaches the page — `{{city}}` is an instruction to
+    /// the exporter, not text the student should see.
+    fn a_blank_marker_becomes_writing_room() {
+        let text = answer_text(
+            "The capital is {{city}}.",
+            QuestionKind::FillInBlank(FillInBlank {
+                blanks: vec![Blank {
+                    id: "city".to_owned(),
+                    answers: vec!["Paris".to_owned()],
+                    match_mode: MatchMode::default(),
+                }],
+            }),
+            Vec::new(),
+        );
+        assert!(text.contains("The capital is ________."), "{text}");
+        assert!(!text.contains("{{city}}"), "the marker printed: {text}");
+        assert!(!text.contains("Paris"), "the answer printed: {text}");
+    }
+
+    #[test]
+    /// A matching question prints its prompts with blanks, then every option
+    /// including the distractor — leaving the distractor out would let a
+    /// student count the options against the prompts and get the last pair
+    /// free. The options are labelled in the *stored* order, not re-sorted.
+    fn a_matching_question_prints_prompts_then_every_option() {
+        let text = answer_text(
+            "Match them.",
+            QuestionKind::Matching(Matching {
+                pairs: vec![
+                    MatchPair {
+                        left: "char".to_owned(),
+                        right: "1 byte".to_owned(),
+                    },
+                    MatchPair {
+                        left: "int".to_owned(),
+                        right: "4 bytes".to_owned(),
+                    },
+                ],
+                distractors: vec!["8 bytes".to_owned()],
+            }),
+            vec![2, 0, 1],
+        );
+        assert!(text.contains("____ 1. char"), "{text}");
+        assert!(text.contains("____ 2. int"), "{text}");
+        // The stored order is [8 bytes, 1 byte, 4 bytes], so the labels follow
+        // it rather than the authored order that pairs A with prompt 1.
+        assert!(text.contains("A. 8 bytes"), "{text}");
+        assert!(text.contains("B. 1 byte"), "{text}");
+        assert!(text.contains("C. 4 bytes"), "{text}");
+    }
+
+    #[test]
+    /// An ordering question prints its items in the stored order, each with a
+    /// blank for its position — and never in the authored order, which is the
+    /// answer.
+    fn an_ordering_question_prints_the_stored_order() {
+        let text = answer_text(
+            "Order them.",
+            QuestionKind::Ordering(Ordering {
+                items: vec!["Compile".to_owned(), "Link".to_owned(), "Run".to_owned()],
+            }),
+            vec![1, 2, 0],
+        );
+        let link = text.find("____ Link").expect("link listed");
+        let run = text.find("____ Run").expect("run listed");
+        let compile = text.find("____ Compile").expect("compile listed");
+        assert!(link < run && run < compile, "wrong order: {text}");
+    }
+
+    #[test]
+    /// The presented order is read, not derived. A writer that sorted the
+    /// options itself would disagree with the answer key for any shuffled
+    /// variant, which is the whole reason the order is frozen at assembly.
+    fn the_stored_order_is_read_rather_than_derived() {
+        let items = vec!["Compile".to_owned(), "Link".to_owned(), "Run".to_owned()];
+        let sorted = answer_text(
+            "Order them.",
+            QuestionKind::Ordering(Ordering {
+                items: items.clone(),
+            }),
+            vec![0, 1, 2],
+        );
+        let reversed = answer_text(
+            "Order them.",
+            QuestionKind::Ordering(Ordering { items }),
+            vec![2, 1, 0],
+        );
+        assert_ne!(
+            sorted.find("____ Run") < sorted.find("____ Compile"),
+            reversed.find("____ Run") < reversed.find("____ Compile"),
+            "the order on the page did not follow option_order"
+        );
     }
 
     /// The exam of [`exam`] with its single prompt replaced by `prompt`.

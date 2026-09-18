@@ -271,14 +271,42 @@ fn assert_furniture(rendered: &str) {
     }
     assert!(rendered.contains("End of exam."), "footer missing");
     assert!(rendered.contains("Page 1 of"), "page footer missing");
-    // `${pages}` is resolved by the word processor, so this proves the field
-    // updated rather than printing a stale count. Two pages is simply what this
-    // exam fills today; adding a prompt means updating the number here.
+    assert_page_numbering(rendered);
+}
+
+/// Assert the page footer's `${page}` and `${pages}` fields both resolved.
+///
+/// Checked as a relationship rather than against a literal count: `${pages}`
+/// is resolved by the word processor, and the proof it updated is that the
+/// last page's own number equals the total. Pinning "Page 2 of 2" instead made
+/// this fail whenever the sample exam grew — which it does every time a part
+/// of the plan lands — for a reason that had nothing to do with the footer.
+fn assert_page_numbering(rendered: &str) {
+    let footers = page_footers(rendered);
+    assert!(!footers.is_empty(), "no page footer resolved: {rendered}");
+    let total = footers.iter().map(|(_, total)| *total).max().unwrap_or(0);
     assert!(
-        rendered.contains("Page 2 of 2"),
-        "the total-pages field did not resolve, or the sample exam no longer \
-         fills exactly two pages: {rendered}"
+        footers.iter().all(|(_, each)| *each == total),
+        "the footers disagree on the total: {footers:?}"
     );
+    assert_eq!(
+        footers.iter().map(|(page, _)| *page).max().unwrap_or(0),
+        total,
+        "the last page is numbered below the total, so a field went stale: {footers:?}"
+    );
+}
+
+/// Every `Page N of M` the footer resolved to, in the order they appear.
+fn page_footers(rendered: &str) -> Vec<(usize, usize)> {
+    rendered
+        .split("Page ")
+        .skip(1)
+        .filter_map(|rest| rest.split_once(" of "))
+        .filter_map(|(page, rest)| {
+            let total = rest.split(|ch: char| !ch.is_ascii_digit()).next()?;
+            Some((page.parse().ok()?, total.parse().ok()?))
+        })
+        .collect()
 }
 
 /// Assert every prompt printed as the writer claims to render it.
