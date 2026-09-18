@@ -764,31 +764,79 @@ existing pattern.
     with `1. (5 points)` and `2. (2.5 points)` on both the sheet and the key.
 
 
-### Tables in v1
+13. **Real Word tables.** *Done* — `w:tbl`, not text that looks like one.
 
-A Markdown pipe table is emitted as **literal text**, not as `w:tbl`. Real table
-rendering is deferred (see "Deferred").
+    `export::docx::table` owns it. A table is the one authored construct that
+    is neither a run nor a paragraph — `w:tbl` is a block-level *sibling* of
+    `w:p` — so it could not travel as an `inline::Paragraph`'s runs without
+    somebody eventually wrapping it in a `w:p`. That mistake produces
+    well-formed XML, so neither `xmllint` nor a substring assertion catches
+    it; only Word refusing the file does. Hence `Kind::Table` and a single
+    `docx::set`, which every rendered block now goes through: the wrapping
+    decision is made in one place and cannot be forgotten in another.
 
-This matches what the print sheet already does — `export/markdown.rs` never
-parses Markdown, it interpolates the authored string verbatim, and its own test
-asserts a pipe table stays literal. It does *not* match Canvas, which renders
-real bordered HTML tables; that divergence is accepted for v1 and must be
-documented in `docs/`.
+    Three things Word refuses a document over, each pinned by a test:
 
-Two requirements make the difference between a usable stopgap and an unreadable
-one, and both are the same requirements code blocks have — which is why the two
-share one part:
+    - **A `w:tc` must hold at least one `w:p`.** The empty cell is the one a
+      student writes the answer in, so this is not a corner case.
+    - **A row shorter than the grid renders ragged**, and Markdown permits
+      one, so short rows are padded.
+    - **Two adjacent tables merge** with nothing between them, and a document
+      ending on a table gets an empty paragraph appended anyway — so each
+      table emits its own.
+
+    **Fixed equal column widths, not autofit.** Autofit reads better for
+    prose and is wrong here: the column a student writes into is the empty
+    one, and autofit collapses an empty column to nothing. An equal share of
+    the text width is predictable, leaves room to write, and does not depend
+    on what the reader decides to measure. The grid and every cell state the
+    same width, because under a fixed layout a cell that disagrees with its
+    column leaves the reader to arbitrate.
+
+    Borders are spelled on each table rather than defined as a table *style*,
+    for the reason `styles.xml` already documents for `w:rStyle`: a style
+    reference the package does not define loses its formatting silently, and
+    a borderless table of blank cells is an invisible table. The header row
+    carries `w:tblHeader` so it repeats when the table breaks across a page —
+    columns with no names on page two are columns nobody can answer — and its
+    cells open bold, so a cell's own `**…**` stacks rather than replacing it.
+    Per-column alignment reaches the cells as `w:jc`.
+
+    **Math in a cell now renders** rather than being refused. The refusal
+    existed because the table printed as source and the LaTeX would have
+    printed with it; once the table is laid out there is nothing to refuse.
+    Math in a table that *falls back* is still refused.
+
+    One cell the writer cannot lay out sends the whole table to source, in
+    the monospace face — the same rule a list follows, for the same reason.
+    An answer option holding a table falls back too: an option is folded into
+    one line, and a `w:tbl` is not something that folds.
+
+    Verified on a converted page: a four-column table with left, centred and
+    right alignment, math and inline marks in its cells, and an empty column
+    laid out for writing.
+
+
+### Tables
+
+A Markdown pipe table is a real `w:tbl` (see item 13). The section that stood
+here described the v1 stopgap — literal text in a monospace face — which is
+now only the *fallback*, taken when a cell holds something the writer cannot
+lay out.
+
+The stopgap's two requirements still apply to that fallback, and to code
+blocks, which is why the two share one path:
 
 - **Monospace.** A pipe table in a proportional font loses column alignment
   entirely. In a monospace style the columns still line up on paper.
 - **Preserved line breaks.** A DOCX paragraph collapses newlines, so a
   multi-row table would otherwise render as one run-on line. Each row needs an
-  explicit `<w:br/>` (or its own paragraph with zero spacing).
+  explicit `<w:br/>`.
 
-No warning is emitted. This is deliberate and is *not* inconsistent with the
-hard-error policy for math: a table rendered as text is visibly text, and the
-instructor sees exactly what the student sees. Wrong math, by contrast, looks
-right. The failure modes are not comparable.
+No warning is emitted for the fallback. This is deliberate and is *not*
+inconsistent with the hard-error policy for math: a table rendered as text is
+visibly text, and the instructor sees exactly what the student sees. Wrong
+math, by contrast, looks right. The failure modes are not comparable.
 
 ### Converter contract
 
@@ -853,9 +901,10 @@ passed.
   `tags: [trees]` group filter is the natural next knob.
 - **Markdown header/footer.** Only the DOCX writer consumes header/footer;
   extending the Markdown sheet is a small follow-on.
-- **Real DOCX tables.** `w:tbl`/`w:tblGrid`/`w:tblPr`/`w:tblBorders`, to reach
-  parity with the Canvas exporter's bordered tables. v1 emits table text
-  instead; see "Tables in v1".
+- **Table sizing beyond equal columns.** Every column takes an equal share of
+  the text width (see item 13). A table of one narrow column and one wide one
+  wastes the page; an authored width hint, or autofit for tables with no empty
+  cells, would fix it.
 - **SVG in DOCX.** Needs `asvg:svgBlip` inside `a:blip`'s extension list
   *plus* a rasterised `r:embed` fallback, so it is strictly more work than PNG
   and never less — see Part 10. The Canvas path still offers

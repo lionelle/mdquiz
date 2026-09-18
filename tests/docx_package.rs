@@ -118,11 +118,13 @@ const PROMPTS: [&str; 9] = [
     "Prove the identity:\n\n$$e^{i\\pi} + 1 = 0$$",
     "Answer both parts:\n\n1. State the rule.\n\n   Then name it.\n2. Apply it to $n = 2^{10}$.",
     "Rank these, slowest first:\n\n- bubble sort\n- merge sort\n- counting sort",
-    // A code block and a pipe table: the two constructs set preformatted
-    // rather than laid out. Both are here so the converter reads a document
-    // holding them, and so the rows and the indent are checked on a real page.
+    // A code block, set preformatted, beside a pipe table, laid out as a
+    // real `w:tbl`. Both are here so the converter reads a document holding
+    // them — and the table's last cell is empty on purpose: that is the one
+    // a student writes in, and a `w:tc` with no paragraph is the mistake
+    // Word refuses to open a document over.
     "Trace the loop and complete the table:\n\n```\nfor i in 0..n:\n    total += i\n```\n\n\
-     | n | total |\n|---|-------|\n| 3 |       |",
+     | iteration | accumulator |\n|---|---|\n| 3 |  |",
     // An embedded figure: the drawing, its relationship and the media part
     // have to agree, and a converter is the only reader here that proves the
     // picture actually lands on the page.
@@ -320,12 +322,41 @@ fn a_preformatted_block_keeps_its_whitespace_in_the_xml() {
         "the code block lost its indent: {document}"
     );
     assert!(
-        document.contains("| 3 |       |"),
-        "the table lost its column padding: {document}"
-    );
-    assert!(
         document.contains(r#"<w:rStyle w:val="Code"/>"#),
         "the preformatted block is not monospace: {document}"
+    );
+}
+
+#[test]
+/// A pipe table becomes a real `w:tbl`, not text that looks like one.
+///
+/// The structural rules are checked here rather than by substring alone
+/// because each is one Word refuses to open the document over: a cell with
+/// no paragraph in it, or a table with nothing after it.
+fn a_pipe_table_becomes_a_real_table() {
+    let document = sample_document();
+    assert!(document.contains("<w:tbl>"), "no table: {document}");
+    assert!(
+        !document.contains("| 3 |"),
+        "the table also printed as text: {document}"
+    );
+    assert!(
+        document.contains("<w:tblHeader/>"),
+        "the header row will not repeat across a page: {document}"
+    );
+    // Every cell holds a paragraph, and the empty one holds an empty
+    // paragraph rather than nothing at all.
+    let cells = document.matches("<w:tc>").count();
+    let closed = document.matches("</w:tc>").count();
+    assert_eq!(cells, closed, "unbalanced cells: {document}");
+    assert!(cells >= 4, "expected a two-by-two table: {document}");
+    for cell in document.split("<w:tc>").skip(1) {
+        let body = cell.split("</w:tc>").next().unwrap_or_default();
+        assert!(body.contains("<w:p"), "a cell holds no paragraph: {body}");
+    }
+    assert!(
+        document.contains("</w:tbl><w:p/>"),
+        "a table must be followed by a paragraph: {document}"
     );
 }
 
@@ -517,11 +548,26 @@ fn assert_prompts(rendered: &str) {
         rendered.contains("total += i"),
         "the code block is missing from the page: {rendered}"
     );
-    assert!(
-        rendered.contains("| n | total |"),
-        "the table lost its row: {rendered}"
-    );
+    assert_table_was_laid_out(rendered);
     assert_answer_structures(rendered);
+}
+
+/// Assert the pipe table reached the page as a table rather than as pipes.
+///
+/// The structure is pinned on the XML by `a_pipe_table_becomes_a_real_table`;
+/// what a converted page adds is that a real word processor laid it out
+/// instead of rejecting the document.
+fn assert_table_was_laid_out(rendered: &str) {
+    for cell in ["iteration", "accumulator"] {
+        assert!(
+            rendered.contains(cell),
+            "the table lost its {cell} column: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("| iteration |"),
+        "the table printed as pipes: {rendered}"
+    );
 }
 
 /// Assert the answer structures reached the page, on a document a word

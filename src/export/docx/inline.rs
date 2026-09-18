@@ -15,16 +15,20 @@
 //! description. One that was not — a remote URL, a missing file, a format
 //! that is not PNG — falls back with the rest.
 //!
-//! Every other block — tables, code blocks, links — is **refused** rather
-//! than dropped: a block this module cannot render is emitted as its own
-//! Markdown source, so a table prints as `| a | b |` instead of silently
-//! losing its columns. Tables and code blocks, whose alignment carries
-//! meaning, are set in [`CODE_STYLE`] so the columns and the indent survive;
-//! every other refused block keeps the body face. That fallback is the same stopgap the print sheet
-//! already ships for tables — text that looks like text, which an instructor
-//! can see and work around. One item a list cannot lay out sends the *whole*
-//! list back to source, because half a list formatted and half printed as
-//! Markdown reads worse than either.
+//! Tables are laid out: [`super::table`] turns a pipe table into a `w:tbl`,
+//! which is the one authored construct that is neither a run nor a paragraph
+//! — so it is reported as [`Kind::Table`] and the caller emits it whole.
+//!
+//! Everything else block-level — code blocks, quotes, links — is **refused**
+//! rather than dropped: a block this module cannot render is emitted as its
+//! own Markdown source, so it prints as the Markdown an instructor typed
+//! instead of silently losing its shape. A code block, whose indentation
+//! carries meaning, is set in [`CODE_STYLE`] so the alignment survives; so
+//! is a table that fell back, for the same reason. Every other refused block
+//! keeps the body face. One item a list cannot lay out sends the *whole*
+//! list back to source, and one cell a table cannot lay out sends the whole
+//! table, because half of either formatted and half printed as Markdown
+//! reads worse than either.
 //!
 //! Math is the exception, and deliberately: it is never printed as source. A
 //! student who meets `$\frac{a}{b}$` on a page sees something that is not a
@@ -41,11 +45,11 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Parser, Tag, TagEnd};
 
-use super::Refs;
 use super::numbering::{Item, MAX_LEVEL, Marker};
 use super::omml::{self, Display};
+use super::{Refs, table};
 use crate::export::escape_xml;
 use crate::{Error, Result};
 
@@ -72,6 +76,12 @@ pub(super) enum Kind {
     Equation,
     /// A paragraph inside a list item, in the list [`Item`] names.
     Item(Item),
+    /// A whole `w:tbl`, already complete.
+    ///
+    /// The odd one out: a table is a block-level sibling of `w:p`, not
+    /// something that fits inside one, so the caller emits it as-is rather
+    /// than wrapping it. [`super::set`] is the one place that decides.
+    Table,
 }
 
 /// One rendered paragraph.
@@ -92,7 +102,7 @@ impl Paragraph {
     pub(super) fn centred(&self) -> String {
         match self.kind {
             Kind::Equation => format!("<m:oMathPara>{}</m:oMathPara>", self.runs),
-            Kind::Prose | Kind::Heading(_) | Kind::Item(_) => self.runs.clone(),
+            Kind::Prose | Kind::Heading(_) | Kind::Item(_) | Kind::Table => self.runs.clone(),
         }
     }
 }
@@ -144,10 +154,12 @@ enum Block<'a> {
     /// A list, carried as the events inside it. Unlike the others it yields
     /// several paragraphs — one per item, and more where an item holds more.
     List(Marker, Vec<Event<'a>>),
-    /// A code block or a pipe table, carried as the events inside it. Printed
-    /// as its own source in a monospace face — not a fallback from a richer
-    /// rendering, but how v1 renders these two.
+    /// A code block, carried as the events inside it. Printed as its own
+    /// source in a monospace face — not a fallback from a richer rendering,
+    /// but how a fence is rendered.
     Preformatted(Vec<Event<'a>>),
+    /// A pipe table, with its column alignments and the events inside it.
+    Table(Vec<Alignment>, Vec<Event<'a>>),
     /// Any other block: printed as its own source, never rendered. Its events
     /// are kept all the same, because math among them is refused rather than
     /// printed.
@@ -211,6 +223,18 @@ impl<'e> Block<'e> {
                 out.extend(paragraphs);
             }
             Self::Preformatted(events) => return Ok(Some((events, Face::Code))),
+            Self::Table(alignments, events) => {
+                let Some(xml) = table::table(&alignments, &events, refs)? else {
+                    // A cell this writer cannot lay out sends the whole
+                    // table to source, in the monospace face that keeps its
+                    // columns lined up on the page.
+                    return Ok(Some((events, Face::Code)));
+                };
+                out.push(Paragraph {
+                    kind: Kind::Table,
+                    runs: xml,
+                });
+            }
             Self::Literal(events) => return Ok(Some((events, Face::Body))),
         }
         Ok(None)
@@ -239,8 +263,11 @@ fn blocks(source: &str) -> Vec<(Range<usize>, Block<'_>)> {
                 let marker = first.map_or(Marker::Bullet, Marker::Ordered);
                 blocks.push((range, Block::List(marker, inside(&mut events))));
             }
-            Event::Start(Tag::CodeBlock(_) | Tag::Table(_)) => {
+            Event::Start(Tag::CodeBlock(_)) => {
                 blocks.push((range, Block::Preformatted(inside(&mut events))));
+            }
+            Event::Start(Tag::Table(alignments)) => {
+                blocks.push((range, Block::Table(alignments, inside(&mut events))));
             }
             Event::Start(_) => blocks.push((range, Block::Literal(inside(&mut events)))),
             // Nothing else needs an arm. Every inline event is wrapped in a
@@ -510,10 +537,40 @@ fn nested<'a, 'e>(events: &'a [Event<'e>], start: usize) -> (&'a [Event<'e>], us
 fn runs(events: &[Event<'_>], kind: Kind, refs: &mut Refs<'_>) -> Result<Option<String>> {
     let display = match kind {
         Kind::Equation => Display::Block,
-        Kind::Prose | Kind::Heading(_) | Kind::Item(_) => Display::Inline,
+        Kind::Prose | Kind::Heading(_) | Kind::Item(_) | Kind::Table => Display::Inline,
     };
+    marked_runs(events, Marks::default(), display, refs)
+}
+
+/// Render one table cell's inline events as runs, opening with `marks`.
+///
+/// Cells are the one caller that starts with a mark already applied: a header
+/// cell is bold before its own `**…**` adds anything.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedMath`] if a math span cannot be converted.
+pub(super) fn runs_for(
+    events: &[Event<'_>],
+    marks: Marks,
+    refs: &mut Refs<'_>,
+) -> Result<Option<String>> {
+    marked_runs(events, marks, Display::Inline, refs)
+}
+
+/// Render `events` as runs, starting from `marks`.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedMath`] if a math span cannot be converted, or
+/// if the paragraph is falling back and holds math.
+fn marked_runs(
+    events: &[Event<'_>],
+    mut marks: Marks,
+    display: Display,
+    refs: &mut Refs<'_>,
+) -> Result<Option<String>> {
     let mut xml = String::new();
-    let mut marks = Marks::default();
     let mut at = 0_usize;
     while let Some(event) = events.get(at) {
         let opened = at;
@@ -618,7 +675,7 @@ fn refuse_math(events: &[Event<'_>]) -> Result<()> {
 /// event would leave `inner` plain — the least emphasised word in the
 /// sentence, which is the opposite of what it says.
 #[derive(Debug, Default, Clone, Copy)]
-struct Marks {
+pub(super) struct Marks {
     /// Depth of open `` `code` `` spans.
     code: u32,
     /// Depth of open `**strong**` spans.
@@ -630,6 +687,16 @@ struct Marks {
 }
 
 impl Marks {
+    /// Marks with strong already open, for a cell that is a column heading.
+    pub(super) const fn bold() -> Self {
+        Self {
+            code: 0,
+            bold: 1,
+            italic: 0,
+            strike: 0,
+        }
+    }
+
     /// Apply `event` if it opens or closes a mark, reporting whether it did.
     fn apply(&mut self, event: &Event<'_>) -> bool {
         match event {
@@ -905,7 +972,6 @@ mod tests {
     /// what the no-degrading rule exists to prevent.
     fn math_inside_a_literal_block_is_refused() {
         for source in [
-            "| $x^2$ | 2 |\n|---|---|\n| a | b |",
             "> recall $e^{i\\pi}$",
             r"Given $x^2$, see [the handout](http://a.example).",
             r"Given ![fig](f.png), find $x^2$.",
@@ -943,7 +1009,7 @@ mod tests {
     #[test]
     /// A block with no math is not refused — only math is undegradable.
     fn a_literal_block_without_math_is_fine() {
-        assert!(only("| a | b |\n|---|---|").contains(">| a | b |<"));
+        assert!(only("> quoted prose").contains(">&gt; quoted prose<"));
     }
 
     #[test]
@@ -1188,7 +1254,6 @@ mod tests {
     /// does the indentation of a code block.
     fn a_preformatted_block_is_set_in_the_code_style() {
         for source in [
-            "| a | b |\n|---|---|\n| 1 | 2 |",
             "```\nlet x = 1;\n```",
             // An info string is part of the fence line, which prints too.
             "```rust\nlet x = 1;\n```",
@@ -1209,10 +1274,10 @@ mod tests {
     /// line, so styling only the opening run leaves a table with its first
     /// row aligned and the rest not.
     fn every_line_of_a_preformatted_block_carries_the_style() {
-        let runs = only("| a | b |\n|---|---|\n| 1 | 2 |");
+        let runs = only("```\nlet x = 1;\nlet y = 2;\n```");
         assert_eq!(
             runs.matches(r#"<w:rStyle w:val="Code"/>"#).count(),
-            3,
+            4,
             "{runs}"
         );
     }
@@ -1267,10 +1332,10 @@ mod tests {
     #[test]
     /// A pipe table keeps its rows on separate lines, which is the whole of
     /// what makes it readable as a table.
-    fn a_table_falls_back_line_by_line() {
-        let runs = only("| a | b |\n|---|---|\n| 1 | 2 |");
-        assert_eq!(runs.matches("<w:r><w:br/></w:r>").count(), 2, "{runs}");
-        assert!(runs.contains(">| a | b |<"), "{runs}");
+    fn a_code_block_falls_back_line_by_line() {
+        let runs = only("```\nlet x = 1;\nlet y = 2;\n```");
+        assert_eq!(runs.matches("<w:r><w:br/></w:r>").count(), 3, "{runs}");
+        assert!(runs.contains(">let x = 1;<"), "{runs}");
     }
 
     #[test]
@@ -1303,20 +1368,20 @@ mod tests {
     /// line is an ordinary authoring slip — and an off-by-one here drags the
     /// last letter of the paragraph onto the list.
     fn widening_a_block_starts_at_a_line_boundary() {
-        let rendered = rendered("text\n| a |\n|---|\n| b |").expect("renders");
+        let rendered = rendered("text\n\n    indented code").expect("renders");
         assert_eq!(rendered.len(), 2, "{rendered:?}");
-        let table = rendered.last().expect("two paragraphs");
-        // The text of the first run, whatever `w:rPr` it carries: a table is
-        // set preformatted, so asserting the bare `<w:r><w:t>` shape here
+        let block = rendered.last().expect("two paragraphs");
+        // The text of the first run, whatever `w:rPr` it carries: the block
+        // is set preformatted, so asserting the bare `<w:r><w:t>` shape here
         // would pin the face rather than the boundary this test is about.
-        let first = table
+        let first = block
             .runs
             .split_once("</w:t>")
             .and_then(|(head, _)| head.rsplit_once('>'))
             .map_or_else(String::new, |(_, text)| text.to_owned());
         assert_eq!(
-            first, "| a |",
-            "the paragraph bled into the table: {table:?}"
+            first, "    indented code",
+            "the paragraph bled into the block: {block:?}"
         );
     }
 

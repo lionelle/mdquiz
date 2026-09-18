@@ -31,6 +31,7 @@ mod inline;
 mod media;
 mod numbering;
 pub mod omml;
+mod table;
 
 use std::fmt::Write as _;
 
@@ -461,12 +462,12 @@ fn opening_paragraphs(lead: &str, first: Option<inline::Paragraph>) -> String {
     let Some(first) = first else {
         return paragraph(lead, ParagraphStyle::Question);
     };
-    if matches!(first.kind, Kind::Item(_)) {
+    // A list item brings its own marker and indent; a table is not a
+    // paragraph at all. Either way the number cannot share the line, so it
+    // takes one of its own and the block starts underneath.
+    if matches!(first.kind, Kind::Item(_) | Kind::Table) {
         return paragraph(lead, ParagraphStyle::Question)
-            + &paragraph(
-                &first.runs,
-                ParagraphStyle::Continuation.or_block(first.kind),
-            );
+            + &set(&first, ParagraphStyle::Continuation);
     }
     // `runs`, not `centred`: the number shares this line, and setting a
     // display equation apart would take the number to the middle of the page
@@ -502,8 +503,7 @@ fn question_xml(
     let lead = inline::text_run(&question_lead(number, item, layout));
     xml.push_str(&opening_paragraphs(&lead, prompt.next()));
     for block in prompt {
-        let style = ParagraphStyle::Continuation.or_block(block.kind);
-        xml.push_str(&paragraph(&block.centred(), style));
+        xml.push_str(&set(&block, ParagraphStyle::Continuation));
     }
     for line in answers::lines(item, refs)? {
         xml.push_str(&paragraph(&line, ParagraphStyle::Answer));
@@ -554,8 +554,24 @@ fn prose(markdown: &str, refs: &mut Refs<'_>) -> Result<String> {
         // it, and dropping it renumbers everything below. Anything else with
         // no runs is a blank paragraph nobody authored.
         .filter(|block| !block.runs.is_empty() || matches!(block.kind, Kind::Item(_)))
-        .map(|block| paragraph(&block.centred(), ParagraphStyle::Body.or_block(block.kind)))
+        .map(|block| set(block, ParagraphStyle::Body))
         .collect())
+}
+
+/// Set one rendered block, in the `w:p` it needs — or as itself, for the one
+/// kind that is already a block-level element.
+///
+/// Every [`inline::Paragraph`] reaches the document through here, so a
+/// `w:tbl` cannot be wrapped in a `w:p` by a caller that forgot. That mistake
+/// produces well-formed XML, so neither `xmllint` nor a substring assertion
+/// would catch it — only Word refusing to open the file.
+fn set(block: &inline::Paragraph, style: ParagraphStyle) -> String {
+    match block.kind {
+        Kind::Table => block.runs.clone(),
+        Kind::Prose | Kind::Heading(_) | Kind::Equation | Kind::Item(_) => {
+            paragraph(&block.centred(), style.or_block(block.kind))
+        }
+    }
 }
 
 /// How a paragraph is presented.
@@ -608,7 +624,9 @@ impl ParagraphStyle {
                 item,
                 sticky: self.is_sticky(),
             },
-            Kind::Prose | Kind::Equation => self,
+            // A table brings its whole `w:tbl` and is never wrapped, so no
+            // paragraph style applies to it; `set` never reaches here for one.
+            Kind::Prose | Kind::Equation | Kind::Table => self,
         }
     }
 

@@ -29,6 +29,7 @@ use std::fmt::Write as _;
 
 use super::Refs;
 use super::inline;
+use super::inline::Kind;
 use crate::Result;
 use crate::label::sequence as choice_label;
 use crate::model::{Choice, Matching, Ordering, Question, QuestionKind};
@@ -202,8 +203,17 @@ fn ordering_lines(items: &[String], refs: &mut Refs<'_>) -> Result<Vec<String>> 
 /// Returns [`crate::Error::UnsupportedMath`] if `text` holds math that cannot
 /// be rendered.
 fn option_line(label: &str, text: &str, refs: &mut Refs<'_>) -> Result<String> {
+    let blocks = inline::paragraphs(text, refs)?;
+    // An option is one line, so every block is folded into it — and a table
+    // is not something that folds. Its `w:tbl` inside a `w:p` is well-formed
+    // XML that Word refuses to open, so an option that somehow holds one
+    // prints its source instead. Nonsense to author, but a visibly odd
+    // option beats an unopenable paper.
+    if blocks.iter().any(|block| matches!(block.kind, Kind::Table)) {
+        return Ok(inline::text_run(label) + &inline::text_run(text));
+    }
     let mut runs = inline::text_run(label);
-    for block in inline::paragraphs(text, refs)? {
+    for block in blocks {
         let _ = write!(runs, "{}", block.runs);
     }
     Ok(runs)
