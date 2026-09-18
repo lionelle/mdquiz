@@ -19,11 +19,11 @@
 //! # The presented order is stored, not derived
 //!
 //! A matching or ordering question's presented order is read from
-//! [`ExamItem::option_order`]. That order is the one thing a sheet and its
-//! answer key must agree on, and it is decided once during assembly; a writer
-//! that sorted the options itself would be the bug [`crate::quiz::exam`]
-//! exists to prevent. [`presented`] falls back to the model's own default only
-//! for an item that never went through assembly — see there.
+//! [`ExamItem::presented_options`], which reads the order assembly froze. That
+//! order is the one thing a sheet and its answer key must agree on, and it is
+//! decided once during assembly; a writer that sorted the options itself would
+//! be the bug [`crate::quiz::exam`] exists to prevent. The run manifest reads
+//! the same accessor, so what it records is what was printed.
 
 use std::fmt::Write as _;
 
@@ -78,8 +78,10 @@ pub(super) fn lines(item: &ExamItem, lists: &mut Numbering) -> Result<Vec<String
         QuestionKind::MultipleChoice(set) => choices(&set.choices, false, lists),
         QuestionKind::MultipleSelect(set) => choices(&set.choices, true, lists),
         QuestionKind::FillInBlank(_) => Ok(Vec::new()),
-        QuestionKind::Matching(matching) => matching_lines(matching, &item.option_order, lists),
-        QuestionKind::Ordering(ordering) => ordering_lines(ordering, &item.option_order, lists),
+        QuestionKind::Matching(matching) => {
+            matching_lines(matching, &item.presented_options(), lists)
+        }
+        QuestionKind::Ordering(_) => ordering_lines(&item.presented_options(), lists),
     }
 }
 
@@ -128,12 +130,12 @@ fn choices(choices: &[Choice], multiple: bool, lists: &mut Numbering) -> Result<
 /// that cannot be rendered.
 fn matching_lines(
     matching: &Matching,
-    order: &[usize],
+    options: &[String],
     lists: &mut Numbering,
 ) -> Result<Vec<String>> {
     let mut lines = matching_prompts(matching, lists)?;
     lines.push(String::new());
-    lines.extend(matching_options(matching, order, lists)?);
+    lines.extend(matching_options(options, lists)?);
     Ok(lines)
 }
 
@@ -161,23 +163,11 @@ fn matching_prompts(matching: &Matching, lists: &mut Numbering) -> Result<Vec<St
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an option holds math that
 /// cannot be rendered.
-fn matching_options(
-    matching: &Matching,
-    order: &[usize],
-    lists: &mut Numbering,
-) -> Result<Vec<String>> {
-    let options = matching.options();
-    presented(order, || matching.display_order())
-        .into_iter()
+fn matching_options(options: &[String], lists: &mut Numbering) -> Result<Vec<String>> {
+    options
+        .iter()
         .enumerate()
-        .map(|(position, index)| {
-            // An index past the options is only reachable from an order that
-            // did not come from this payload, which assembly cannot produce —
-            // it indexes the same list. The degradation is deliberately
-            // visible: a labelled line with nothing on it is something an
-            // instructor notices on the proof, where dropping the line
-            // silently renumbers everything below it.
-            let option = options.get(index).copied().unwrap_or_default();
+        .map(|(position, option)| {
             option_line(&format!("{}. ", choice_label(position)), option, lists)
         })
         .collect()
@@ -189,37 +179,11 @@ fn matching_options(
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an item holds math that cannot
 /// be rendered.
-fn ordering_lines(
-    ordering: &Ordering,
-    order: &[usize],
-    lists: &mut Numbering,
-) -> Result<Vec<String>> {
-    presented(order, || ordering.display_order())
-        .into_iter()
-        .map(|index| {
-            // Out of range only from an order that did not come from this
-            // payload; see `matching_options` for why the empty line stays.
-            let item = ordering.items.get(index).map_or("", String::as_str);
-            option_line(BLANK, item, lists)
-        })
+fn ordering_lines(items: &[String], lists: &mut Numbering) -> Result<Vec<String>> {
+    items
+        .iter()
+        .map(|item| option_line(BLANK, item, lists))
         .collect()
-}
-
-/// `order` as frozen at assembly, or the model's default if it is empty.
-///
-/// An [`ExamItem`] from `assemble` always carries an order for these kinds, so
-/// the fallback is for one built by hand — a test, or a caller that bypassed
-/// assembly. It is the order a *non-shuffling* group would have stored:
-/// assembly computes `hides_the_answer(display_order())`, `display_order`
-/// already ends in `hides_the_answer`, and the second application is a no-op
-/// because a rotated identity is never the identity again. A shuffling group's
-/// order cannot be recovered and is not guessed at — being unrecoverable is
-/// why it is stored in the first place.
-fn presented(order: &[usize], default: impl FnOnce() -> Vec<usize>) -> Vec<usize> {
-    if order.is_empty() {
-        return default();
-    }
-    order.to_vec()
 }
 
 /// One answer line: its label as literal text, then `text` rendered.
@@ -264,7 +228,9 @@ pub(super) fn key_line(item: &ExamItem, lists: &mut Numbering) -> Result<String>
         QuestionKind::MultipleChoice(set) => correct_choices(&set.choices, lists),
         QuestionKind::MultipleSelect(set) => correct_choices(&set.choices, lists),
         QuestionKind::FillInBlank(fitb) => blank_answers(&fitb.blanks, lists),
-        QuestionKind::Matching(matching) => matching_key(matching, &item.option_order, lists),
+        QuestionKind::Matching(matching) => {
+            matching_key(matching, &item.presented_options(), lists)
+        }
         QuestionKind::Ordering(ordering) => ordering_key(ordering, lists),
     }
 }
@@ -322,12 +288,10 @@ fn blank_answers(blanks: &[crate::model::Blank], lists: &mut Numbering) -> Resul
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt holds math that
 /// cannot be rendered.
-fn matching_key(matching: &Matching, order: &[usize], lists: &mut Numbering) -> Result<String> {
-    let options = matching.options();
-    let presented = presented(order, || matching.display_order());
+fn matching_key(matching: &Matching, options: &[String], lists: &mut Numbering) -> Result<String> {
     let mut lines = Vec::new();
     for (index, pair) in matching.pairs.iter().enumerate() {
-        let label = label_of(&pair.right, &options, &presented);
+        let label = label_of(&pair.right, options);
         let prefix = format!("{}. ", index + 1);
         let mut runs = option_line(&prefix, &pair.left, lists)?;
         let _ = write!(runs, "{}", inline::text_run(&format!(" → {label}")));
@@ -338,14 +302,14 @@ fn matching_key(matching: &Matching, order: &[usize], lists: &mut Numbering) -> 
 
 /// The printed label of the option whose text is `right`.
 ///
-/// Empty when the answer is not among the options, which parsing rejects: a
-/// pair's right-hand side is always one of them, because that is where
-/// [`Matching::options`] collects them from.
-fn label_of(right: &str, options: &[&str], presented: &[usize]) -> String {
+/// Looked up in the options *as printed*, so the letter this returns is the
+/// letter on the paper. Empty when the answer is not among them, which parsing
+/// rejects: a pair's right-hand side is always one of the options, because
+/// that is where [`Matching::options`] collects them from.
+fn label_of(right: &str, options: &[String]) -> String {
     options
         .iter()
-        .position(|option| *option == right)
-        .and_then(|index| presented.iter().position(|shown| *shown == index))
+        .position(|option| option == right)
         .map_or_else(String::new, choice_label)
 }
 

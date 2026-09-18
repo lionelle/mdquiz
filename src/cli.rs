@@ -222,7 +222,7 @@ fn run_quiz(args: QuizArgs) -> anyhow::Result<()> {
         eprintln!("warning: {warning}");
     }
     let stem = name.unwrap_or_else(|| spec_stem(spec_path));
-    let files = output::render(&assembly, &stem)?;
+    let files = output::render(&assembly, &stem, seed)?;
     write_output_files(out_dir, &files)?;
     // Printed even when it was given, so the line in the terminal is the whole
     // record of how this paper was built.
@@ -1035,6 +1035,26 @@ mod tests {
                 "{name} is empty"
             );
         }
+    }
+
+    #[test]
+    /// The run is recorded beside the sheets: the seed that drew it, every
+    /// variant, and the options as printed. Without it a paper handed out
+    /// months ago cannot be accounted for.
+    fn quiz_writes_a_manifest_recording_the_seed_and_variants() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = quiz_fixture(dir.path(), 2);
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 77)).expect("quiz runs");
+        let manifest =
+            fs::read_to_string(out.join("midterm-manifest.yaml")).expect("manifest written");
+        assert!(manifest.contains("seed: 77"), "{manifest}");
+        assert!(manifest.contains("variant: A"), "{manifest}");
+        assert!(manifest.contains("variant: B"), "{manifest}");
+        assert!(manifest.contains("id: q"), "{manifest}");
+        // The options as printed, so the record says what the paper said.
+        assert!(manifest.contains("alpha"), "{manifest}");
+        assert!(manifest.contains("beta"), "{manifest}");
     }
 
     #[test]

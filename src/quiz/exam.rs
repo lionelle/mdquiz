@@ -18,7 +18,7 @@
 //! random choice.
 
 use crate::label::sequence;
-use crate::model::Question;
+use crate::model::{Question, QuestionKind};
 use crate::quiz::spec::Layout;
 
 /// One question as it will appear on a sheet.
@@ -42,6 +42,61 @@ pub struct ExamItem {
     /// Stored rather than derived so a sheet and its key cannot disagree about
     /// which option is `B`, and so a shuffling group can vary it per variant.
     pub option_order: Vec<usize>,
+}
+
+impl ExamItem {
+    /// The options this item prints, in the order they print.
+    ///
+    /// The single source of that order: the print writers letter these and the
+    /// run manifest records them, and a manifest reporting an order the sheet
+    /// did not use is a record of a paper nobody sat. Empty for the kinds with
+    /// no option list — true/false, whose two options are the writer's own
+    /// words, and fill-in-the-blank, whose blanks sit in the prompt.
+    ///
+    /// For a matching question these are the right-hand options; the left
+    /// prompts are not options to choose from.
+    #[must_use]
+    pub fn presented_options(&self) -> Vec<String> {
+        match &self.question.kind {
+            QuestionKind::MultipleChoice(set) => texts(&set.choices),
+            QuestionKind::MultipleSelect(set) => texts(&set.choices),
+            QuestionKind::Matching(matching) => {
+                let options = matching.options();
+                self.ordered(matching.display_order())
+                    .into_iter()
+                    .map(|index| options.get(index).copied().unwrap_or_default().to_owned())
+                    .collect()
+            }
+            QuestionKind::Ordering(ordering) => self
+                .ordered(ordering.display_order())
+                .into_iter()
+                .map(|index| ordering.items.get(index).cloned().unwrap_or_default())
+                .collect(),
+            QuestionKind::TrueFalse(_) | QuestionKind::FillInBlank(_) => Vec::new(),
+        }
+    }
+
+    /// [`Self::option_order`] if assembly froze one, or `default` if it did not.
+    ///
+    /// An item from `assemble` always carries an order for the kinds that need
+    /// one, so the fallback is for one built by hand — a test, or a caller that
+    /// bypassed assembly. It is the order a *non-shuffling* group would have
+    /// stored: assembly computes `hides_the_answer(display_order())`,
+    /// `display_order` already ends in `hides_the_answer`, and a second
+    /// application is a no-op because a rotated identity is never the identity
+    /// again. A shuffling group's order cannot be recovered and is not guessed
+    /// at — being unrecoverable is why it is stored in the first place.
+    fn ordered(&self, default: Vec<usize>) -> Vec<usize> {
+        if self.option_order.is_empty() {
+            return default;
+        }
+        self.option_order.clone()
+    }
+}
+
+/// The text of each choice, in order.
+fn texts(choices: &[crate::model::Choice]) -> Vec<String> {
+    choices.iter().map(|choice| choice.text.clone()).collect()
 }
 
 /// One variant of a quiz, assembled and ready to render.

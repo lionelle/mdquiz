@@ -560,7 +560,7 @@ existing pattern.
    is derive a *different* order, which is what the bug above was.
 10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
     (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.
-11. **`mdquiz quiz` subcommand.** *Sheets and keys done; manifest still to do.*
+11. **`mdquiz quiz` subcommand.** *Done* — sheets, keys and the run manifest.
 
     `quiz::output::render` pairs every variant with its answer key and names
     both, returning `Vec<OutputFile>` of bare names and bytes; `cli.rs` creates
@@ -586,28 +586,44 @@ existing pattern.
     `run` is a two-arm dispatch and each subcommand destructures its own
     arguments.
 
-    **Still to do:** the manifest (per-variant question ids, the shuffled
-    choice order, the derived seed). `serde_norway` is already a dependency, so
-    YAML matches the spec format and needs nothing new.
+    **The manifest ships.** `quiz::manifest` writes `<stem>-manifest.yaml`
+    beside the sheets: the exam name, the seed, and per variant every question
+    id with its options *as printed*. YAML because a spec is YAML — an author
+    reading the record of a run should not have to change notation to do it,
+    and `serde_norway` was already a dependency.
 
-    It cannot record a choice *permutation* — assembly shuffles `choices` in
-    place and discards the authored order — so it records the presented texts,
-    or `assemble` starts tracking original positions. **This does not affect
-    whether a key matches its sheet.** For multiple choice and multiple select
-    the `correct` flag rides on the `Choice` itself, so the shuffle carries the
-    answer with the text and both writers letter by position in the same frozen
-    vector; there is no mapping to lose. The two kinds where the answer *cannot*
-    ride along — matching and ordering, whose authored order is the answer — are
-    exactly the two that store `option_order`. The permutation is wanted for an
-    audit trail, not for correctness, and the seed already rebuilds a paper
-    byte for byte (`quiz_is_reproducible_for_a_seed`).
+    It records presented **texts**, not a permutation of the authored choices:
+    assembly shuffles a choice payload in place and discards the order the
+    author wrote, so there is nothing left to diff against. Texts are
+    self-contained anyway — the record needs no second file to interpret.
 
-    One thing that gap did hide: the key letters a correct choice by its
-    position in the *whole* option list, and every fixture put its correct
-    answer first, where "position among all options" and "position among the
-    correct ones" agree. `the_key_letters_a_choice_by_its_place_in_the_whole_list`
-    uses correct answers at positions 1 and 3; swapping `enumerate` and `filter`
-    in `correct_choices` fails it and nothing else.
+    **That costs nothing in correctness.** For multiple choice and multiple
+    select the `correct` flag rides on the `Choice` itself, so the shuffle
+    carries the answer along with the text and both writers letter by position
+    in the same frozen vector; there is no mapping to lose. The two kinds where
+    the answer *cannot* ride along — matching and ordering, whose authored order
+    is the answer — are exactly the two that store `option_order`. Every kind is
+    covered, by whichever of the two mechanisms suits it.
+
+    **One accessor, so the record cannot lie.**
+    `ExamItem::presented_options` is now the single source of the printed
+    order, read by the docx writer, the answer key *and* the manifest;
+    `answers.rs` lost its private copy. A manifest computing the order itself
+    would be a record of a paper nobody sat.
+
+    Two things this turned up:
+
+    - The key letters a correct choice by its position in the *whole* option
+      list, and every fixture put its correct answer first — where "position
+      among all options" and "position among the correct ones" agree, so
+      swapping `enumerate` and `filter` in `correct_choices` would have passed
+      the entire suite.
+      `the_key_letters_a_choice_by_its_place_in_the_whole_list` uses correct
+      answers at positions 1 and 3 and fails on exactly that change.
+    - Verified against generated files, not just tests: for a three-variant
+      spec the manifest's option lists equal what each sheet printed, item for
+      item, and each key names its own sheet's letters.
+
 
 ### Tables in v1
 

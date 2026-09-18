@@ -7,7 +7,7 @@
 //! * [`assemble`] — the one place randomness happens,
 //! * [`exam`] — the finished [`Exam`](exam::Exam) the print writers consume, and
 //! * [`output`] — every variant paired with its answer key, named and ready to
-//!   write,
+//!   write, alongside the [`manifest`] recording what the run drew,
 //!
 //! with [`sample`] providing the seeded draws that [`assemble`] uses.
 //!
@@ -17,6 +17,7 @@
 
 pub mod assemble;
 pub mod exam;
+pub mod manifest;
 pub mod output;
 pub mod sample;
 pub mod spec;
