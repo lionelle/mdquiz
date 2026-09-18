@@ -480,12 +480,32 @@ existing pattern.
    spaces, and `|3|` for a padded table cell. The document itself is correct;
    `a_preformatted_block_keeps_its_whitespace_in_the_xml` checks it where it
    is observable, and runs in the gate rather than behind `#[ignore]`.
-9. **The six question kinds** + the answer-key document. This is where the
-   matching/ordering freeze gap closes: their presented order is currently
-   derived inside `export/markdown.rs` at render time rather than stored, so
-   `shuffle_choices` cannot vary them between variants and a key that printed
-   labels rather than text would have to re-derive that sort. Put the derived
-   order on `ExamItem` and have the writers read it.
+9. **The six question kinds** + the answer-key document.
+
+   **The freeze gap is closed.** `ExamItem::option_order` holds the presented
+   order as indices into the list a kind shows — an ordering question's items,
+   or a matching question's shared right-hand options — decided in `assemble`
+   with every other random choice. `shuffle_choices` now reaches both kinds,
+   so variants differ; nothing shuffles the payload itself, because for these
+   two the authored order *is* the answer.
+
+   **Found doing it: the text sort could print the answer.** Both
+   `display_order`s sorted by text and the doc claimed that "never hands the
+   student the correct order" — but items authored alphabetically sort
+   straight back to the authored order, and a shuffle can land on it by
+   chance. The repo's own fixtures are the bad case: `Compile, Link, Run` is
+   alphabetical, and a matching question's options sort into the order that
+   pairs each with the prompt it answers. `model::hides_the_answer` rotates a
+   presented order off the identity, applied inside both `display_order`s so
+   the *bank* print sheet is fixed too, and reused by `assemble` after a
+   shuffle. Rotation consumes no randomness, so an unshuffled sheet does not
+   depend on the seed at all.
+
+   **Still to do here:** the per-question answer structures in the DOCX writer
+   (it prints prompt + blank space today) and the answer-key document, both
+   reading `option_order` rather than deriving anything. `export/markdown.rs`
+   keeps deriving, correctly: it is the *bank* path and never sees an
+   `ExamItem`.
 10. **Images and diagrams.** PNG only; declare SVG-in-DOCX out of scope
     (it needs `asvg:svgBlip` plus a raster fallback) and force PNG diagrams.
 11. **`mdquiz quiz` subcommand.** Library returns

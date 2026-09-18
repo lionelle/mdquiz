@@ -652,6 +652,7 @@ mod tests {
                         kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
                     },
                     answer_space: 3,
+                    option_order: Vec::new(),
                 })
                 .collect(),
         }

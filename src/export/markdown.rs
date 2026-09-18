@@ -437,6 +437,38 @@ mod tests {
     }
 
     #[test]
+    /// Items authored in alphabetical order still are not presented in it.
+    /// The display order is a text sort, so an author who happens to write the
+    /// steps alphabetically would otherwise get the answer printed on the
+    /// sheet — the one thing this sort exists to prevent.
+    fn an_alphabetically_authored_ordering_is_not_presented_in_order() {
+        let bank = ItemBank {
+            name: "M".to_owned(),
+            items: vec![Question {
+                id: "ord".to_owned(),
+                title: None,
+                prompt: "Order the phases.".to_owned(),
+                points: 1.0,
+                tags: Vec::new(),
+                feedback: Feedback::default(),
+                // Authored (correct) order, and already alphabetical: the text
+                // sort alone would hand this straight back.
+                kind: QuestionKind::Ordering(Ordering {
+                    items: vec!["Compile".to_owned(), "Link".to_owned(), "Run".to_owned()],
+                }),
+            }],
+        };
+        let out = to_print_markdown(&bank).expect("renders");
+        let compile = out.find("____ Compile").expect("compile listed");
+        let link = out.find("____ Link").expect("link listed");
+        let run = out.find("____ Run").expect("run listed");
+        assert!(
+            !(compile < link && link < run),
+            "the sheet printed the answer: {out}"
+        );
+    }
+
+    #[test]
     /// The print sheet keeps math and diagram source verbatim (no rendering).
     fn print_keeps_math_and_diagrams_literal() {
         let bank = ItemBank {

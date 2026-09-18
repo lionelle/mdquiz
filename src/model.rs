@@ -326,6 +326,25 @@ pub struct MatchPair {
     pub right: String,
 }
 
+/// `order`, adjusted if it is the identity — the authored order itself.
+///
+/// The authored order is the answer. For an ordering question it *is* the
+/// sequence being asked for; for a matching one it pairs option *n* with the
+/// prompt it answers, because the options list the pair answers before the
+/// distractors. A text sort usually breaks that, but items authored in
+/// alphabetical order sort straight back to it — and a shuffle can land on it
+/// by chance, one time in six for three items.
+///
+/// Rotating by one is enough: it differs from the identity at every length
+/// above one, and it consumes no randomness, so a seeded sheet stays
+/// reproducible and an unshuffled one does not depend on the seed at all.
+pub(crate) fn hides_the_answer(mut order: Vec<usize>) -> Vec<usize> {
+    if order.len() > 1 && order.iter().enumerate().all(|(at, index)| at == *index) {
+        order.rotate_left(1);
+    }
+    order
+}
+
 impl Matching {
     /// The distinct right-hand options (pair answers then distractors), in
     /// order. These become the shared choice list every left selects from.
@@ -342,6 +361,19 @@ impl Matching {
             }
         }
         options
+    }
+
+    /// The option indices in display order: sorted by text, so the presented
+    /// list does not line each option up with the prompt it answers.
+    ///
+    /// [`Self::options`] returns the pair answers before the distractors, so
+    /// its own order makes option *n* the answer to prompt *n*. This is the
+    /// default a sheet uses when its group does not shuffle.
+    pub(crate) fn display_order(&self) -> Vec<usize> {
+        let options = self.options();
+        let mut indexed: Vec<(usize, &str)> = options.iter().copied().enumerate().collect();
+        indexed.sort_by(|left, right| left.1.cmp(right.1));
+        hides_the_answer(indexed.into_iter().map(|(index, _)| index).collect())
     }
 }
 
@@ -363,7 +395,7 @@ impl Ordering {
         let mut indexed: Vec<(usize, &str)> =
             self.items.iter().map(String::as_str).enumerate().collect();
         indexed.sort_by(|left, right| left.1.cmp(right.1));
-        indexed.into_iter().map(|(index, _)| index).collect()
+        hides_the_answer(indexed.into_iter().map(|(index, _)| index).collect())
     }
 }
 

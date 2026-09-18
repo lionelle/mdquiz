@@ -101,6 +101,7 @@ fn sample_item(n: usize) -> ExamItem {
             kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
         },
         answer_space: 4,
+        option_order: Vec::new(),
     }
 }
 

@@ -10,12 +10,12 @@
 //! renderings of the same data and cannot disagree about which option is `B`.
 //! A writer that reached for a random number would break that silently.
 //!
-//! With one known exception: matching and ordering questions have their
-//! presented order derived by the writer rather than stored here, so
-//! `shuffle_choices` does not vary them. Nothing is inconsistent today, because
-//! the answer key prints those answers as text rather than by label — but a key
-//! that named the labels would have to re-derive that order, which is what this
-//! type exists to prevent. See `Roadmap.md`.
+//! That holds for every kind. Matching and ordering questions used to have
+//! their presented order derived by the writer — a sort over the option text —
+//! so `shuffle_choices` could not vary them and a key naming labels rather
+//! than text would have had to re-derive that sort. The order now lives on
+//! [`ExamItem::option_order`], decided once during assembly like every other
+//! random choice.
 
 use crate::label::sequence;
 use crate::model::Question;
@@ -31,6 +31,17 @@ pub struct ExamItem {
     /// Already resolved from the question, its group and the layout, so a writer
     /// reads a number and never re-derives the precedence.
     pub answer_space: usize,
+    /// Indices into this item's option list, in the order they print.
+    ///
+    /// Which list depends on the kind: the items of an ordering question, or
+    /// the shared right-hand options of a matching one. Empty for the kinds
+    /// whose payload already holds its options in print order — multiple
+    /// choice and multiple select, which assembly permutes in place — and for
+    /// the kinds with no options at all.
+    ///
+    /// Stored rather than derived so a sheet and its key cannot disagree about
+    /// which option is `B`, and so a shuffling group can vary it per variant.
+    pub option_order: Vec<usize>,
 }
 
 /// One variant of a quiz, assembled and ready to render.
@@ -102,6 +113,7 @@ mod tests {
                 .map(|(index, points)| ExamItem {
                     question: question(&format!("q{index}"), *points),
                     answer_space: 3,
+                    option_order: Vec::new(),
                 })
                 .collect(),
         }

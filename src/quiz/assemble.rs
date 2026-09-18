@@ -6,12 +6,11 @@
 //! Keeping it that way is what stops a shuffled sheet and its answer key from
 //! disagreeing — they are two renderings of one already-decided thing.
 //!
-//! One gap in that freeze is known and deliberate: matching and ordering
-//! questions have their presented order derived at render time (a sort over the
-//! option text), not stored here, so `shuffle_choices` does not vary them
-//! between variants. Closing it means putting the derived order in
-//! [`ExamItem`] and having the writers read it — which is the writers' change
-//! to make, so it is recorded against the print exporter in `Roadmap.md`.
+//! That includes matching and ordering, whose presented order used to be
+//! derived at render time (a sort over the option text) and so was identical
+//! on every variant. It is settled here now and frozen into
+//! [`ExamItem::option_order`], which is also what lets `shuffle_choices` reach
+//! it.
 //!
 //! Diagram rendering is *not* done here yet. When it lands it belongs on each
 //! group pool's questions, before the variant loop: the questions are shared,
@@ -228,9 +227,11 @@ fn draw_items(pools: &[Pool], rng: &mut SampleRng) -> Vec<ExamItem> {
             if pool.shuffle_choices {
                 shuffle_choices(&mut question, rng);
             }
+            let option_order = option_order(&question, pool.shuffle_choices, rng);
             items.push(ExamItem {
                 question,
                 answer_space: pool.answer_space,
+                option_order,
             });
         }
     }
@@ -250,13 +251,12 @@ fn take_from(pool: &Pool, rng: &mut SampleRng) -> Vec<(String, Question)> {
     sample::within_group(pool.questions.clone(), limit, rng)
 }
 
-/// Permute a question's answer choices, if it has any.
+/// Permute a question's answer choices in place, if it has any.
 ///
-/// True/false and fill-in-the-blank have nothing to reorder. Matching and
-/// ordering do, but their presentation order is derived by the *writer* — a sort
-/// over the option text — so it is identical on every variant and
-/// `shuffle_choices` cannot reach it. That is a known gap rather than an
-/// oversight; see this module's header.
+/// Only the kinds whose payload *is* the printed list. Matching and ordering
+/// must keep their authored order — it is the answer — so their presentation
+/// is a separate permutation, held in [`ExamItem::option_order`] by
+/// [`option_order`]. True/false and fill-in-the-blank have nothing to reorder.
 fn shuffle_choices(question: &mut Question, rng: &mut SampleRng) {
     use crate::model::QuestionKind;
     match &mut question.kind {
@@ -267,6 +267,31 @@ fn shuffle_choices(question: &mut Question, rng: &mut SampleRng) {
         | QuestionKind::Matching(_)
         | QuestionKind::Ordering(_) => {}
     }
+}
+
+/// The order `question`'s options are printed in, as indices into the list its
+/// kind presents.
+///
+/// Empty for the kinds that have no separate presentation: their payload is
+/// already the printed list. For matching and ordering the authored order is
+/// the answer, so it is never used as-is — `display_order` text-sorts it when
+/// the group does not shuffle, a permutation replaces it when the group does,
+/// and either way [`crate::model::hides_the_answer`] keeps it off the
+/// identity.
+fn option_order(question: &Question, shuffle: bool, rng: &mut SampleRng) -> Vec<usize> {
+    use crate::model::QuestionKind;
+    let mut order = match &question.kind {
+        QuestionKind::Ordering(ordering) => ordering.display_order(),
+        QuestionKind::Matching(matching) => matching.display_order(),
+        QuestionKind::TrueFalse(_)
+        | QuestionKind::FillInBlank(_)
+        | QuestionKind::MultipleChoice(_)
+        | QuestionKind::MultipleSelect(_) => return Vec::new(),
+    };
+    if shuffle {
+        sample::shuffle(&mut order, rng);
+    }
+    crate::model::hides_the_answer(order)
 }
 
 #[cfg(test)]
@@ -339,6 +364,116 @@ mod tests {
         "---\nid: f\nkind: fill_in_blank\nblanks:\n  one: [alpha]\n  two: [beta]\n",
         "---\n\n{{one}} then {{two}}.\n",
     );
+
+    /// The stored presentation order of the item with `id`, on every exam.
+    fn option_orders(assembly: &Assembly, id: &str) -> Vec<Vec<usize>> {
+        assembly
+            .exams
+            .iter()
+            .filter_map(|exam| {
+                exam.items
+                    .iter()
+                    .find(|item| item.question.id == id)
+                    .map(|item| item.option_order.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    /// A presented order is never the authored one, even where the text sort
+    /// lands back on it. Both fixtures are that awkward case: `Compile, Link,
+    /// Run` is already alphabetical, and a matching question's options sort
+    /// into the order that pairs each with the prompt it answers. The sort
+    /// alone would therefore print an ordering question's answer on the sheet
+    /// and line every match up with its own prompt.
+    fn a_presented_order_is_never_the_authored_one() {
+        let yaml = "name: E\ngroups:\n  - dir: t\n    take: all\n";
+        let tree = HashMap::from([(
+            "t".to_owned(),
+            vec![
+                ("t/m.md".to_owned(), MATCHING.to_owned()),
+                ("t/o.md".to_owned(), ORDERING.to_owned()),
+            ],
+        )]);
+        let assembly = run(yaml, tree, 3);
+        for id in ["m", "o"] {
+            let order = option_orders(&assembly, id).pop().expect("one exam");
+            assert!(order.len() > 1, "{id} stored no order at all");
+            assert!(
+                order.iter().enumerate().any(|(at, index)| at != *index),
+                "{id} presents its options in the authored order: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    /// A shuffling group varies the presented order between variants, which is
+    /// the whole reason it is stored rather than derived: a sort over the
+    /// option text is identical on every sheet.
+    fn a_shuffling_group_varies_the_presented_order() {
+        let yaml = concat!(
+            "name: E\nvariants: 6\n",
+            "groups:\n  - dir: t\n    take: all\n    shuffle_choices: true\n",
+        );
+        let tree = HashMap::from([(
+            "t".to_owned(),
+            vec![("t/o.md".to_owned(), ORDERING.to_owned())],
+        )]);
+        let distinct: std::collections::HashSet<Vec<usize>> =
+            option_orders(&run(yaml, tree, 11), "o")
+                .into_iter()
+                .collect();
+        assert!(
+            distinct.len() > 1,
+            "six variants all presented one order: {distinct:?}"
+        );
+    }
+
+    #[test]
+    /// Without shuffling the presented order is the text sort, rotated off the
+    /// authored order, and it does not depend on the seed at all — no
+    /// randomness is consumed deciding it.
+    ///
+    /// `Compile, Link, Run` sorts to `[0, 1, 2]`, which is the answer, so the
+    /// stored order is that rotated by one.
+    fn the_presented_order_is_the_text_sort_when_nothing_shuffles() {
+        let yaml = "name: E\ngroups:\n  - dir: t\n    take: all\n";
+        let tree = HashMap::from([(
+            "t".to_owned(),
+            vec![("t/o.md".to_owned(), ORDERING.to_owned())],
+        )]);
+        for seed in [7, 11] {
+            assert_eq!(
+                option_orders(&run(yaml, tree.clone(), seed), "o"),
+                vec![vec![1, 2, 0]],
+                "seed {seed} changed an order nothing shuffles"
+            );
+        }
+    }
+
+    #[test]
+    /// The kinds whose payload is already the printed list store no separate
+    /// order. A writer that found one would have two lists to reconcile, and
+    /// nothing says which of them the labels belong to.
+    fn kinds_without_a_separate_presentation_store_no_order() {
+        let yaml = "name: E\ngroups:\n  - dir: t\n    take: all\n    shuffle_choices: true\n";
+        let tree = HashMap::from([(
+            "t".to_owned(),
+            vec![
+                ("t/c.md".to_owned(), multiple_choice("c")),
+                ("t/f.md".to_owned(), FILL_IN_BLANK.to_owned()),
+                ("t/t.md".to_owned(), true_false("t")),
+            ],
+        )]);
+        let assembly = run(yaml, tree, 5);
+        for id in ["c", "f", "t"] {
+            assert_eq!(
+                option_orders(&assembly, id).pop().expect("one exam"),
+                Vec::<usize>::new(),
+                "{id} stored a presentation order it has no list for"
+            );
+        }
+    }
 
     /// An ordering question's items in stored order; empty for other kinds.
     fn ordering_items(question: &Question) -> Vec<String> {
