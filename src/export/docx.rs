@@ -1735,6 +1735,43 @@ mod tests {
     }
 
     #[test]
+    /// The key letters a correct choice by its position in the *whole* option
+    /// list, not by its position among the correct ones.
+    ///
+    /// The sheet letters every option A, B, C, D; the key must name the same
+    /// letters. Counting only the correct ones would label these `A` and `B`
+    /// instead of `B` and `D` — and every existing fixture puts its correct
+    /// answer first, where the two counts agree and the bug hides.
+    fn the_key_letters_a_choice_by_its_place_in_the_whole_list() {
+        let choice = |text: &str, correct: bool| Choice {
+            text: text.to_owned(),
+            correct,
+        };
+        let kind = || {
+            QuestionKind::MultipleSelect(MultipleSelect {
+                choices: vec![
+                    choice("alpha", false),
+                    choice("beta", true),
+                    choice("gamma", false),
+                    choice("delta", true),
+                ],
+                scoring: ScoringMode::default(),
+            })
+        };
+        let sheet = answer_text("Pick any.", kind(), Vec::new());
+        assert!(sheet.contains("[ ] B. beta"), "{sheet}");
+        assert!(sheet.contains("[ ] D. delta"), "{sheet}");
+
+        let key = key_text("Pick any.", kind(), Vec::new());
+        assert!(key.contains("B. beta"), "{key}");
+        assert!(key.contains("D. delta"), "{key}");
+        assert!(
+            !key.contains("A. "),
+            "the key renumbered the correct ones: {key}"
+        );
+    }
+
+    #[test]
     /// The key states which of True and False is right, and carries none of
     /// the sheet's checkboxes.
     fn the_key_states_the_true_false_answer() {

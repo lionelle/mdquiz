@@ -587,11 +587,27 @@ existing pattern.
     arguments.
 
     **Still to do:** the manifest (per-variant question ids, the shuffled
-    choice order, the derived seed). Note it cannot record a choice
-    *permutation* — assembly shuffles `choices` in place and discards the
-    authored order — so it records the presented texts, or `assemble` has to
-    start tracking original positions. `serde_norway` is already a dependency,
-    so YAML matches the spec format and needs nothing new.
+    choice order, the derived seed). `serde_norway` is already a dependency, so
+    YAML matches the spec format and needs nothing new.
+
+    It cannot record a choice *permutation* — assembly shuffles `choices` in
+    place and discards the authored order — so it records the presented texts,
+    or `assemble` starts tracking original positions. **This does not affect
+    whether a key matches its sheet.** For multiple choice and multiple select
+    the `correct` flag rides on the `Choice` itself, so the shuffle carries the
+    answer with the text and both writers letter by position in the same frozen
+    vector; there is no mapping to lose. The two kinds where the answer *cannot*
+    ride along — matching and ordering, whose authored order is the answer — are
+    exactly the two that store `option_order`. The permutation is wanted for an
+    audit trail, not for correctness, and the seed already rebuilds a paper
+    byte for byte (`quiz_is_reproducible_for_a_seed`).
+
+    One thing that gap did hide: the key letters a correct choice by its
+    position in the *whole* option list, and every fixture put its correct
+    answer first, where "position among all options" and "position among the
+    correct ones" agree. `the_key_letters_a_choice_by_its_place_in_the_whole_list`
+    uses correct answers at positions 1 and 3; swapping `enumerate` and `filter`
+    in `correct_choices` fails it and nothing else.
 
 ### Tables in v1
 
