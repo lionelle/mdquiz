@@ -2,16 +2,35 @@
 name = "mdquiz"
 version = "0.2.0"
 edition = "2024"
-description = "Author quiz questions as Markdown + YAML and export them to a print-ready Markdown sheet or a Canvas New Quizzes QTI package."
+description = "Author quiz questions as Markdown + YAML and export them as printable Word exams, a print-ready Markdown sheet, or a Canvas New Quizzes QTI package."
 license = "MIT"
 repository = "https://github.com/lionelle/mdquiz"
 readme = "README.md"
 keywords = ["quiz", "markdown", "canvas", "qti", "education"]
 categories = ["command-line-utilities", "parsing"]
 
+# What a published crate ships. `docs/` and `samples/` are the authoring
+# guide and its worked examples, so they belong with the code; the rest of
+# what sits in the repository is how the project is *built*, not how it is
+# used, and only makes the download bigger.
+exclude = [
+    ".cargo/",
+    ".claude/",
+    ".github/",
+    ".pre-commit-config.yaml",
+    "CLAUDE.md",
+    "Roadmap.md",
+    "samples/**/*-generated.zip",
+]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
+# Pinned exactly, not loosely: this crate converts `math-core`'s MathML output
+# into OOXML by walking its element tree, so a change in what it emits is a
+# change in what lands on the page. A caret requirement would let a patch
+# release alter an exam silently. Raise it deliberately, with the OMML tests
+# as the check.
 math-core = "=0.8.2"
 pulldown-cmark = "0.13.4"
 roxmltree = "0.21.1"

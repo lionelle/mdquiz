@@ -1,5 +1,10 @@
 # Exporting an item bank
 
+> Looking for the **printable Word exam**? That is a different subcommand,
+> `mdquiz quiz`, driven by a YAML blueprint rather than by flags — see
+> [quizzes.md](quizzes.md). This page covers `mdquiz export`, which builds a
+> Canvas package or a Markdown sheet from a directory.
+
 `mdquiz` reads a **directory** of question files (one question per `*.md` file)
 and assembles them into a single item bank. Files are ordered by filename, so
 numeric prefixes control question order.

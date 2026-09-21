@@ -5,9 +5,12 @@ to draw from, how many questions to take from each, and how the sheet is laid
 out. It is the reproducible counterpart to a long command line — the same exam
 can be rebuilt next term by re-running the file that made it.
 
-> **Status:** the spec format and its validation ship now. Assembling and
-> printing from a spec arrive with the `mdquiz quiz` command; see
-> [`../Roadmap.md`](../Roadmap.md).
+Hand one to `mdquiz quiz` and it writes a Word sheet — and its own answer key —
+for every variant, plus a manifest recording the seed and what each paper said:
+
+```bash
+mdquiz quiz exam.yaml --out-dir exam/ --seed 20260921
+```
 
 ## A complete spec
 
@@ -149,6 +152,9 @@ printing the markers. (`page_footer` is the exception: it is plain text plus
 | `# Heading` … `### Heading` | Word's built-in Heading 1–3 styles |
 | `- item`, `1. item` | a real Word list, nesting and all |
 | `$x^2$`, `$$…$$` | a real Word equation |
+| `![alt](fig.png)` | the picture, sized from the PNG itself |
+| a pipe table | a real Word table, bordered, its header repeating across pages |
+| a fenced code block | a shaded panel in a monospace face, no backticks |
 
 Headings deeper than `###` are set as Heading 3. Because the built-in styles
 are used, headings also appear in Word's navigation pane and in a generated
@@ -166,31 +172,29 @@ formatting and math inside each item rendered. Each numbered list restarts at
 it. An item may hold more than one paragraph; only the first carries the
 number.
 
-**Printed as you typed it** — tables, block quotes, links, images, fenced and
-indented code blocks, horizontal rules and raw HTML are not laid out yet, so
-the block appears as its own Markdown source, indentation and line breaks
-intact:
+
+Images are PNG only. An SVG, a remote URL, or a file that could not be read
+falls back to its Markdown source, so the path stays visible for you to chase
+rather than the figure vanishing quietly.
+
+**Printed as you typed it** — block quotes, links, horizontal rules and raw
+HTML are not laid out yet, so the block appears as its own Markdown source,
+indentation and line breaks intact:
 
 ```markdown
-| Algorithm | Cost |
-|---|---|
-| merge sort | n log n |
+> Answer in pen.
 ```
 
-prints as three lines still carrying their pipes.
+prints with its `>` still attached. A table or code block holding something
+the writer cannot lay out falls back the same way, and those two fall back in
+a **monospace face** rather than the body one: their alignment carries
+meaning, so the columns and the indentation still line up on the page. A quote
+or a link is prose, and keeps the body face — misreporting it as code would be
+worse than leaving it plain.
 
-**Tables and code blocks are set in a monospace face.** Those two are the
-blocks whose alignment carries meaning — a pipe table in a proportional font
-loses its columns entirely, and so does the indentation of a code block — so
-they print in the same face as an inline `` `code` `` span. The other blocks
-that fall back keep the body face: a quote or a link is prose the writer
-cannot lay out, not something to misreport as code.
-
-This is deliberate: a table that is *visibly* unformatted is something you can
+This is deliberate: a block that is *visibly* unformatted is something you can
 see and work around, where one silently flattened into a run-on line is not.
-The same blocks render properly on the Canvas export, which builds real
-bordered HTML tables; that divergence is accepted for now, and the print sheet
-catches up over the releases tracked in [`../Roadmap.md`](../Roadmap.md).
+Remaining gaps are tracked in [`../Roadmap.md`](../Roadmap.md).
 
 Note that inline formatting inside such a block is printed too — a
 `~~struck~~` table cell shows its tildes — because the whole block is printed

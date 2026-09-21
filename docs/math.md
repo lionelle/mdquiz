@@ -18,10 +18,9 @@ Write LaTeX math in any prompt, choice, ordering item, or feedback message:
 - **Printable exam (Word):** the expression becomes a **real Word equation**
   (OOXML math), not a picture — selectable, searchable, and editable in Word.
   `$$…$$` alone on a line is centred; mid-sentence, or as the whole of a
-  question's first line, it stays inline. This path currently writes the
-  prompt and the exam's header/footer only, so math in a *choice*, ordering
-  item or feedback message does not reach the Word document at all yet — see
-  [`../Roadmap.md`](../Roadmap.md).
+  question's first line, it stays inline. Math in a *choice*, a matching or
+  ordering item, or a table cell is rendered too — and the answer key renders
+  it the same way, so a grader reads the formula rather than its source.
 
 ```markdown
 ---
