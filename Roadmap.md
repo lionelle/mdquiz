@@ -444,9 +444,11 @@ existing pattern.
    because drift between them resolves a `w:numPr` to nothing, which is a
    document Word will not open.
 
-8. **Preformatted blocks.** *Done* — code blocks *and* tables are emitted as
-   literal text in the monospace `Code` character style. See "Tables in v1"
-   below; folding them together is what removed a whole part from this plan.
+8. **Preformatted blocks.** *Done* — code blocks are emitted as literal text
+   in the monospace `Code` character style. Tables were too, until item 13
+   laid them out; the monospace path is now their *fallback*. See "Tables"
+   below. Folding the two together is what removed a whole part from this
+   plan, and it is also what gave tables a fallback worth having.
 
    Half of this had already landed for Part 7's list fallback: `literal` joins
    lines with explicit `<w:r><w:br/></w:r>` runs, because a `w:p` collapses

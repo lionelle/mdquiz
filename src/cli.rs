@@ -357,11 +357,12 @@ fn bundled<'a>(
     for warning in &outcome.warnings {
         eprintln!("warning: {warning}");
     }
+    // Deliberately unsorted: both writers look an image up by its authored
+    // path, and both sources are already deduplicated, so the order here
+    // cannot reach the output. Sorting it only reshuffled the Canvas
+    // manifest's `<resource>` list against every package built before.
     let mut images = load_images(dir, items);
     images.extend(outcome.images);
-    // Sorted so a package's media parts land in a stable order whatever order
-    // the questions happened to reference them in.
-    images.sort_by(|(one, _), (other, _)| one.cmp(other));
     images
 }
 
