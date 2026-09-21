@@ -1,6 +1,6 @@
 [package]
 name = "mdquiz"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Author quiz questions as Markdown + YAML and export them to a print-ready Markdown sheet or a Canvas New Quizzes QTI package."
 license = "MIT"
