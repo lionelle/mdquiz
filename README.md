@@ -48,8 +48,8 @@ Binary search requires its input array to be sorted.
 
 ## Install
 
-mdquiz is a Rust CLI. You need a recent stable [Rust toolchain](https://rustup.rs)
-(edition 2024). Build and install the `mdquiz` binary from source:
+mdquiz is a Rust CLI. You need [Rust](https://rustup.rs) **1.96 or newer**
+(`rustup update stable`). Build and install the `mdquiz` binary from source:
 
 ```bash
 git clone https://github.com/lionelle/mdquiz

@@ -2,6 +2,12 @@
 name = "mdquiz"
 version = "0.2.0"
 edition = "2024"
+# The minimum supported toolchain, and a deliberate floor rather than the
+# technical one. Edition 2024 needs 1.85 and the let-chains in `parse` and
+# `sample` need 1.88, but nothing older than the current stable is built or
+# tested here — so 1.96 is what is actually supported, and cargo should say
+# so rather than let an old toolchain get halfway through a build first.
+rust-version = "1.96"
 description = "Author quiz questions as Markdown + YAML and export them as printable Word exams, a print-ready Markdown sheet, or a Canvas New Quizzes QTI package."
 license = "MIT"
 repository = "https://github.com/lionelle/mdquiz"
