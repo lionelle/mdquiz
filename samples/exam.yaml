@@ -1,0 +1,32 @@
+# A worked quiz spec: the blueprint `mdquiz quiz` reads to build a printable
+# exam. Run it from the repository root:
+#
+#     mdquiz quiz samples/exam.yaml --out-dir exam/ --seed 20260921
+#
+# It draws from the sample banks beside this file and writes one Word sheet
+# and its own answer key per variant, plus a manifest of what each paper said.
+# See ../docs/quizzes.md for every field.
+
+name: "Sample Midterm"
+
+# Three different papers. Ask for more than the questions can fill and mdquiz
+# says so rather than printing the same paper under three letters.
+variants: 3
+
+# Shown above and below the questions. Ordinary Markdown.
+header: parts/instructions.md
+
+layout:
+  answer_space: 4          # blank lines left after each question
+  shuffle_choices: true    # permute answer options per variant
+  page_footer: "${name} (${variant}) — Page ${page} of ${pages}"
+
+groups:
+  - dir: multiple-choice
+    take: 2
+  - dir: multiple-select
+    take: 1
+  - dir: true-false
+    take: 2
+  - dir: matching
+    take: 1

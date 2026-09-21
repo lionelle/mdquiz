@@ -1,7 +1,8 @@
 # mdquiz samples
 
 Each subdirectory here is a ready-to-export **item bank**: a folder of
-per-question Markdown files. Point `mdquiz` at a directory to build one bank
+per-question Markdown files. One question type or feature per folder, so you
+can export any of them on their own and see exactly what it produces. Point `mdquiz` at a directory to build one bank
 from every `*.md` file inside it (files are ordered by filename, so the numeric
 prefixes control question order). Add `-r`/`--recursive` to gather nested
 subdirectories into a single bank — e.g. `export samples/ -r` builds one bank
@@ -9,15 +10,30 @@ from all of these; READMEs and partials (files without front-matter) are
 skipped. See [`../docs/exporting.md`](../docs/exporting.md).
 
 ```bash
-# Print-ready sheet (no answer key):
-cargo run -- export samples/true-false/ --output true-false.md --format markdown
+# Canvas New Quizzes item bank (zipped QTI package) — the main export:
+mdquiz export samples/true-false/ --output true-false.zip --format canvas
 
-# Canvas New Quizzes item bank (zipped QTI package):
-cargo run -- export samples/true-false/ --output true-false.zip --format canvas
+# Print-ready Markdown sheet (no answer key):
+mdquiz export samples/true-false/ --output true-false.md --format markdown
 ```
 
 The Canvas output is a zipped QTI package; import it through Canvas's **"QTI
 .zip file"** option, so use a `.zip` extension.
+
+### A printable exam
+
+[`exam.yaml`](exam.yaml) is a worked **quiz spec** — the blueprint for a paper
+exam drawn from the banks beside it:
+
+```bash
+mdquiz quiz samples/exam.yaml --out-dir exam/ --seed 20260921
+```
+
+That writes three variants, each a Word sheet with **its own answer key**, plus
+a manifest recording the seed and what each paper said. The header comes from
+[`parts/instructions.md`](parts/instructions.md), which has no front-matter and
+so is skipped when the same folder is exported as a bank. See
+[`../docs/quizzes.md`](../docs/quizzes.md) for every field.
 
 The [`partials/`](partials/) bank shows **file includes**: choices and feedback
 that pull their content (and an image) from separate Markdown files.

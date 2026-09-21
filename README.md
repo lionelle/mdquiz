@@ -1,11 +1,18 @@
 # mdquiz
 
-Author quiz questions as **Markdown + YAML**, then export a whole directory of
-them as a **Canvas *New Quizzes* item bank** (QTI package), a **print-ready
-Markdown sheet**, or a **printable Word exam** — several shuffled variants, each
-with its own answer key.
+Write your question bank once, as **Markdown + YAML**, and keep it in version
+control alongside everything else you teach.
 
-> **Status: alpha.** All six question types work on both exporters and the
+**mdquiz builds Canvas *New Quizzes* item banks.** Point it at a directory of
+questions and it produces a QTI package you import straight into Canvas — that
+is what it is for, and what the authoring format is shaped around.
+
+The same questions also **print**, because a course that runs online quizzes
+usually needs a paper exam too, and maintaining the questions twice is how the
+two drift apart. A print-ready Markdown sheet, or a Word `.docx` exam in
+several shuffled variants, each with its own answer key.
+
+> **Status: alpha.** All six question types work on every exporter and the
 > format is documented, but it hasn't been battle-tested across many Canvas
 > instances yet. Expect rough edges; feedback welcome.
 
@@ -31,15 +38,15 @@ Binary search requires its input array to be sorted.
   (`$…$`, rendered by Canvas's native equation service), [Mermaid](https://mermaid.js.org)
   and [Graphviz DOT](https://graphviz.org) diagrams (rendered to images), and
   `file:` includes that pull content from separate Markdown files.
-- **Three exports:** a Canvas New Quizzes **QTI `.zip`** (the default), a
-  **print-ready Markdown** sheet with no answer key (add `--include-key` for a
-  matching answer-key file), and a **Word `.docx` exam** for paper.
-- **Printable exams from a blueprint:** `mdquiz quiz` reads a YAML spec — which
-  topic folders to draw from, how many questions from each, how many variants —
-  and writes one Word sheet *and its own answer key* per variant, plus a
-  manifest recording the seed and what each paper actually said. Math becomes a
-  real Word equation, not a picture; lists, tables, images and code blocks are
-  laid out rather than printed as source.
+- **Canvas item banks:** a New Quizzes **QTI `.zip`**, the default export.
+  Import it through Canvas's "QTI .zip file" option; per-question and
+  per-answer feedback, scoring modes and regex-matched blanks all come across.
+- **Also prints:** a **Markdown sheet** for quick handouts (`--format
+  markdown`, with `--include-key` for a matching key), and a **Word `.docx`
+  exam** via `mdquiz quiz` — a YAML blueprint says which folders to draw from,
+  how many questions from each, and how many variants, and you get one sheet
+  *and its own answer key* per variant plus a manifest of what each paper
+  said. Math becomes a real Word equation, not a picture.
 - **One command:** point it at a directory; add `--recursive` to gather a whole
   tree of subfolders into one bank, or `--sample N` to draw N random questions
   from each folder. For print sheets, `--include-key` emits an answer key and
@@ -131,20 +138,26 @@ question type — try `mdquiz export samples/multiple-choice/ --output mc.zip`.
 ## How it works
 
 ```
-quiz/*.md ─▶ parse ─┬─▶ ItemBank ──────────▶ Canvas New Quizzes QTI (.zip)
-                    │                    └─▶ print Markdown (no solutions)
-                    │
-                    └─▶ spec ─▶ assemble ─▶ Exam ─▶ Word .docx sheet + answer key
+                      ┌─▶ ItemBank ─┬─▶ Canvas New Quizzes QTI (.zip)   ← the main path
+quiz/*.md ─▶ parse ─┤              └─▶ print Markdown sheet (+ key)
+                      │
+                      └─▶ spec ─▶ assemble ─▶ Exam ─▶ Word .docx + key, per variant
 ```
 
-Every random decision — which questions a variant draws, what order its options
-print in — is made once, while the exam is assembled, and frozen into the `Exam`
-the writers read. A sheet and its answer key are two renderings of settled data,
-so they cannot disagree about which option is `B`.
+Questions follow the Canvas **New Quizzes** model — that is what the fields
+mean, and where any disagreement is resolved. The print paths render the same
+questions; they do not define them.
 
-Questions follow the Canvas **New Quizzes** model. The parsing and export stages
-are pure data transforms with no filesystem or process dependencies (the CLI
-injects those), so the pipeline is easy to test and reason about.
+The two branches differ in one way worth knowing. An **item bank** is every
+question you wrote. An **exam** is a chosen, shuffled subset, so it needs
+somewhere to record the choosing: every random decision — which questions a
+variant draws, what order its options print in — is made once while the exam is
+assembled and frozen into the `Exam` the writers read. A sheet and its answer
+key are two renderings of settled data, so they cannot disagree about which
+option is `B`.
+
+Parsing and export are pure data transforms with no filesystem or process
+dependencies (the CLI injects those), so the pipeline is easy to test.
 
 ## Documentation
 
@@ -155,7 +168,11 @@ injects those), so the pipeline is easy to test and reason about.
   [diagrams](docs/diagrams.md) (Mermaid and Graphviz),
   [file includes](docs/partials.md), [exporting](docs/exporting.md), and
   [quiz specs](docs/quizzes.md) (the blueprint for a printable exam).
-- **[`samples/`](samples/)** — runnable example banks, one directory per feature.
+- **[`samples/`](samples/)** — runnable example banks, one directory per
+  feature, plus [`samples/exam.yaml`](samples/exam.yaml): a worked quiz spec
+  you can build a three-variant paper exam from.
+- **[`CHANGELOG.md`](CHANGELOG.md)** — what changed in each release, and the
+  known limitations of the current one.
 
 ## Development
 
