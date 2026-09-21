@@ -59,10 +59,18 @@ mdquiz is a Rust CLI. You need [Rust](https://rustup.rs) **1.96 or newer**
 (`rustup update stable`). Build and install the `mdquiz` binary from source:
 
 ```bash
+cargo install mdquiz
+```
+The above pulls the crate mdquiz, and installs the mdquiz command line tool. If you want the latest version or a development version, you can pull source directly from github and compile locally.
+
+
+```bash
 git clone https://github.com/lionelle/mdquiz
 cd mdquiz
 cargo install --path .
 ```
+
+
 
 That puts `mdquiz` on your `PATH` (via `~/.cargo/bin`). Prefer not to install?
 Run it in place with `cargo run -- <args>` instead of `mdquiz <args>`.
@@ -146,18 +154,9 @@ quiz/*.md ─▶ parse ─┤              └─▶ print Markdown sheet (+ key
 
 Questions follow the Canvas **New Quizzes** model — that is what the fields
 mean, and where any disagreement is resolved. The print paths render the same
-questions; they do not define them.
+questions. It is possible to take all questions or sample subsets, or even
+sample subsets within dub directories (often used for print ones).
 
-The two branches differ in one way worth knowing. An **item bank** is every
-question you wrote. An **exam** is a chosen, shuffled subset, so it needs
-somewhere to record the choosing: every random decision — which questions a
-variant draws, what order its options print in — is made once while the exam is
-assembled and frozen into the `Exam` the writers read. A sheet and its answer
-key are two renderings of settled data, so they cannot disagree about which
-option is `B`.
-
-Parsing and export are pure data transforms with no filesystem or process
-dependencies (the CLI injects those), so the pipeline is easy to test.
 
 ## Documentation
 
