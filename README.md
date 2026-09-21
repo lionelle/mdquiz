@@ -56,13 +56,14 @@ Binary search requires its input array to be sorted.
 ## Install
 
 mdquiz is a Rust CLI. You need [Rust](https://rustup.rs) **1.96 or newer**
-(`rustup update stable`). Build and install the `mdquiz` binary from source:
+(`rustup update stable`).
 
 ```bash
 cargo install mdquiz
 ```
-The above pulls the crate mdquiz, and installs the mdquiz command line tool. If you want the latest version or a development version, you can pull source directly from github and compile locally.
 
+That pulls the crate from crates.io and installs the `mdquiz` command line
+tool. For the latest development version, build from source instead:
 
 ```bash
 git clone https://github.com/lionelle/mdquiz
@@ -70,10 +71,9 @@ cd mdquiz
 cargo install --path .
 ```
 
-
-
-That puts `mdquiz` on your `PATH` (via `~/.cargo/bin`). Prefer not to install?
-Run it in place with `cargo run -- <args>` instead of `mdquiz <args>`.
+Either way `mdquiz` lands on your `PATH` (via `~/.cargo/bin`). Prefer not to
+install? Run it in place with `cargo run -- <args>` instead of `mdquiz
+<args>`.
 
 **Optional:** rendering diagrams needs the matching tool on your `PATH` —
 Mermaid uses the [mermaid CLI](https://github.com/mermaid-js/mermaid-cli)
@@ -154,9 +154,9 @@ quiz/*.md ─▶ parse ─┤              └─▶ print Markdown sheet (+ key
 
 Questions follow the Canvas **New Quizzes** model — that is what the fields
 mean, and where any disagreement is resolved. The print paths render the same
-questions. It is possible to take all questions or sample subsets, or even
-sample subsets within dub directories (often used for print ones).
-
+questions. Either path can take every question or a random sample, and the
+sample can be drawn *per subdirectory* — a few from each topic — which is
+usually what you want for a paper exam.
 
 ## Documentation
 
