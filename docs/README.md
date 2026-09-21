@@ -1,7 +1,8 @@
 # mdquiz documentation
 
 `mdquiz` turns a directory of **Markdown + YAML** question files into a Canvas
-*New Quizzes* **item bank** — or a print-ready sheet for paper. This folder is
+*New Quizzes* **item bank**. The same questions also print — as a Markdown
+sheet, or as a Word exam in several variants. This folder is
 the reference for the authoring format; [`../samples/`](../samples/) holds
 runnable examples you can export as-is.
 
@@ -103,3 +104,5 @@ See also:
 - [partials.md](partials.md) — pointing a choice, ordering item, or feedback
   message at a separate Markdown file (`file:`) instead of inline text.
 - [exporting.md](exporting.md) — the CLI and the Canvas import workflow.
+- [quizzes.md](quizzes.md) — quiz specs: the YAML blueprint for a printable
+  exam, sampled per topic folder and produced in several variants.

@@ -6,6 +6,10 @@
 .idea/
 .vscode/
 
+# Mutation-testing reports (`cargo mutants`)
+/mutants.out
+/mutants.out.old
+
 # Local export output while experimenting
 /out
 *.imscc

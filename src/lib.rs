@@ -13,6 +13,9 @@
 //! ` ```dot ` diagrams (rendered to bundled images via [`diagram`]), and `file:`
 //! partials pulled from separate Markdown files.
 //!
+//! [`quiz`] sits between the bank and the exports: it chooses *which* questions
+//! go on a given sheet, reproducibly from a seed.
+//!
 //! The crate is organised so the parsing and export stages never depend on the
 //! CLI: everything below [`model`] is a plain data transform that is easy to
 //! unit-test. Filesystem and process work (reading partials, shelling out to the
@@ -22,7 +25,10 @@
 pub mod diagram;
 pub mod error;
 pub mod export;
+pub mod label;
 pub mod model;
 pub mod parse;
+pub mod path;
+pub mod quiz;
 
 pub use error::{Error, Result};

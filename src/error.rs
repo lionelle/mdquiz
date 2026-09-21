@@ -27,10 +27,34 @@ pub enum Error {
         message: String,
     },
 
+    /// A quiz spec (the YAML blueprint) was invalid; names where in the spec
+    /// the problem is so the author knows what to fix.
+    #[error("invalid quiz spec at {at}: {message}")]
+    Spec {
+        /// Where the problem is: a group (`groups[1] "topics/graphs"`) or a
+        /// top-level key (`variants`). Not every spec failure is group-scoped.
+        at: String,
+        /// The underlying failure, rendered.
+        message: String,
+    },
+
     /// A question was structurally valid but semantically incomplete
     /// (for example, a multiple-choice item with no correct answer).
     #[error("invalid question: {0}")]
     InvalidQuestion(String),
+
+    /// Math that cannot be put on paper faithfully.
+    ///
+    /// Either the LaTeX was rejected outright, or it uses a construct with no
+    /// Word equivalent. Both are refusals rather than best-effort renders: a
+    /// silently wrong equation on a printed exam is worse than a failed build.
+    #[error("cannot render math `{latex}`: {reason}")]
+    UnsupportedMath {
+        /// The offending LaTeX, as the author wrote it.
+        latex: String,
+        /// Why it cannot be rendered.
+        reason: String,
+    },
 
     /// An export target could not represent the quiz as given.
     #[error("failed to export quiz: {0}")]

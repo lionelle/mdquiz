@@ -59,10 +59,11 @@ Canvas's `$IMS-CC-FILEBASE$` reference. See
 
 ## Limits (by design)
 
-- **No escaping the bank directory.** A `file:` (or a partial's image) whose path
-  contains `..` is refused. Keep a partial's images under the partial's own
-  folder — a partial in `parts/` that points at `../shared/x.png` would rebase to
-  a `..` path and be skipped.
+- **No escaping the bank directory.** A `file:` (or a partial's image) path must
+  be relative and stay inside the directory: a `..` component, an absolute path
+  (`/etc/passwd`) or a Windows drive prefix is refused. Keep a partial's images
+  under the partial's own folder — a partial in `parts/` that points at
+  `../shared/x.png` would rebase to a `..` path and be skipped.
 - **Inline image syntax only.** Rebasing rewrites inline `![alt](path)` images.
   Reference-style images (`![alt][ref]` with a separate `[ref]: path` definition)
   are **not** rebased — use the inline form inside partials.

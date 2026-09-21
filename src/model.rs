@@ -155,7 +155,7 @@ pub enum QuestionKind {
 impl QuestionKind {
     /// A short human-readable label for this type, used in diagnostics.
     #[must_use]
-    pub fn label(&self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
             Self::TrueFalse(_) => "true/false",
             Self::MultipleChoice(_) => "multiple choice",
@@ -276,8 +276,34 @@ impl FillInBlank {
 }
 
 /// The inline marker text for a blank named `name` (that is, `{{name}}`).
+///
+/// Quiz-spec templates deliberately use `${…}` (`quiz::spec::TEMPLATE_OPEN`)
+/// rather than this syntax, so a header or footer that later became a question
+/// partial cannot sprout blanks where it meant to name the exam. Changing
+/// either delimiter means checking the other.
 pub(crate) fn blank_marker(name: &str) -> String {
     ["{{", name, "}}"].concat()
+}
+
+/// The writing room a `{{name}}` marker prints as.
+///
+/// Wider than the [`crate::export::WRITE_IN`] rule a letter goes on: this
+/// blank sits mid-sentence and holds a whole word, so it has to read as a gap
+/// in the text rather than a rule under it — and a student has to be able to
+/// write in it. Twelve characters is about an inch in the monospace face the
+/// writers set it in.
+pub(crate) const BLANK_FILL: &str = "____________";
+
+/// `prompt` with every one of `blanks`'s markers replaced by writing room.
+///
+/// A marker is an instruction to the exporter rather than text, so a sheet
+/// printing the prompt verbatim would put `{{city}}` on the paper. Shared by
+/// both print paths, so a blank is the same width whichever sheet a student is
+/// handed.
+pub(crate) fn fill_blanks(prompt: &str, blanks: &[Blank]) -> String {
+    blanks.iter().fold(prompt.to_owned(), |filled, blank| {
+        filled.replace(&blank_marker(&blank.id), BLANK_FILL)
+    })
 }
 
 /// Scan `text` for inline `{{name}}` blank markers, in first-appearance order.
@@ -298,18 +324,6 @@ pub(crate) fn blank_markers(text: &str) -> Vec<String> {
         rest = after_close;
     }
     names
-}
-
-/// Whether an image URL is a local file path (rather than an absolute URL).
-///
-/// Shared by the parser (which rebases a partial's local images) and the Canvas
-/// exporter (which bundles them). Absolute URLs — `scheme://`, protocol-relative
-/// `//`, root-relative `/`, and `data:` — are not local.
-pub(crate) fn is_local_image(url: &str) -> bool {
-    !(url.contains("://")
-        || url.starts_with("//")
-        || url.starts_with('/')
-        || url.starts_with("data:"))
 }
 
 /// The payload for a [`QuestionKind::Matching`] question.
@@ -333,6 +347,25 @@ pub struct MatchPair {
     pub right: String,
 }
 
+/// `order`, adjusted if it is the identity — the authored order itself.
+///
+/// The authored order is the answer. For an ordering question it *is* the
+/// sequence being asked for; for a matching one it pairs option *n* with the
+/// prompt it answers, because the options list the pair answers before the
+/// distractors. A text sort usually breaks that, but items authored in
+/// alphabetical order sort straight back to it — and a shuffle can land on it
+/// by chance, one time in six for three items.
+///
+/// Rotating by one is enough: it differs from the identity at every length
+/// above one, and it consumes no randomness, so a seeded sheet stays
+/// reproducible and an unshuffled one does not depend on the seed at all.
+pub(crate) fn hides_the_answer(mut order: Vec<usize>) -> Vec<usize> {
+    if order.len() > 1 && order.iter().enumerate().all(|(at, index)| at == *index) {
+        order.rotate_left(1);
+    }
+    order
+}
+
 impl Matching {
     /// The distinct right-hand options (pair answers then distractors), in
     /// order. These become the shared choice list every left selects from.
@@ -349,6 +382,19 @@ impl Matching {
             }
         }
         options
+    }
+
+    /// The option indices in display order: sorted by text, so the presented
+    /// list does not line each option up with the prompt it answers.
+    ///
+    /// [`Self::options`] returns the pair answers before the distractors, so
+    /// its own order makes option *n* the answer to prompt *n*. This is the
+    /// default a sheet uses when its group does not shuffle.
+    pub(crate) fn display_order(&self) -> Vec<usize> {
+        let options = self.options();
+        let mut indexed: Vec<(usize, &str)> = options.iter().copied().enumerate().collect();
+        indexed.sort_by(|left, right| left.1.cmp(right.1));
+        hides_the_answer(indexed.into_iter().map(|(index, _)| index).collect())
     }
 }
 
@@ -370,29 +416,13 @@ impl Ordering {
         let mut indexed: Vec<(usize, &str)> =
             self.items.iter().map(String::as_str).enumerate().collect();
         indexed.sort_by(|left, right| left.1.cmp(right.1));
-        indexed.into_iter().map(|(index, _)| index).collect()
+        hides_the_answer(indexed.into_iter().map(|(index, _)| index).collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    /// Only relative paths count as local; every URL scheme is rejected.
-    fn is_local_image_rejects_urls_accepts_relative() {
-        for url in [
-            "http://x/y.png",
-            "https://x/y.png",
-            "//x/y.png",
-            "/root/y.png",
-            "data:image/png;base64,AAAA",
-        ] {
-            assert!(!is_local_image(url), "{url} should be non-local");
-        }
-        assert!(is_local_image("diagram.png"));
-        assert!(is_local_image("sub/diagram.png"));
-    }
 
     #[test]
     /// Every kind reports its documented human-readable label.

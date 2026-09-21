@@ -11,13 +11,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use pulldown_cmark::{Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
+
+use crate::path::{is_local_image, parent_dir};
 use serde::Deserialize;
 
 use crate::Result;
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
     MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse, blank_markers,
-    is_local_image,
 };
 
 /// Reads a partial's raw Markdown given its bank-relative `path`, returning a
@@ -287,7 +288,7 @@ enum QuestionSpec {
 }
 
 /// The default point value when a question omits `points`.
-fn default_points() -> f64 {
+const fn default_points() -> f64 {
     1.0
 }
 
@@ -449,14 +450,6 @@ fn read_partial(path: &str, read: &PartialReader<'_>, id: &str) -> Result<String
     Ok(rebase_images(&raw, parent_dir(path)))
 }
 
-/// The directory portion of a partial `path` (`""` when it has none).
-fn parent_dir(path: &str) -> &str {
-    match path.rfind('/') {
-        Some(index) => path.get(..index).unwrap_or(""),
-        None => "",
-    }
-}
-
 /// Prefix every local image path in `question`'s rich-text fields with `base`,
 /// the question's subdirectory relative to the export root.
 ///
@@ -473,16 +466,19 @@ pub fn rebase_local_paths(question: &mut Question, base: &str) {
 /// Rewrite each local image URL in `markdown` to sit under `base` (the partial's
 /// directory), so bundling resolves it relative to the bank root. External and
 /// absolute URLs are left untouched; an empty `base` needs no rewrite.
+///
+/// The join goes through [`crate::path::join_dir`], which is also what
+/// `assemble` resolves a question's partials with. The two have to agree
+/// exactly: the Word writer matches a supplied image by its authored path as
+/// a string, so a `./` one of them adds and the other does not is a picture
+/// that silently fails to place.
 fn rebase_images(markdown: &str, base: &str) -> String {
-    if base.is_empty() {
-        return markdown.to_owned();
-    }
     let mut spans = image_url_spans(markdown);
     // Apply back-to-front so earlier byte offsets stay valid as text is spliced.
     spans.sort_by_key(|span| std::cmp::Reverse(span.0));
     let mut out = markdown.to_owned();
     for (start, end, url) in spans {
-        out.replace_range(start..end, &format!("{base}/{url}"));
+        out.replace_range(start..end, &crate::path::join_dir(base, &url));
     }
     out
 }
@@ -852,8 +848,29 @@ where
     I: IntoIterator<Item = Question>,
 {
     let items: Vec<Question> = items.into_iter().collect();
-    let mut seen = HashSet::with_capacity(items.len());
-    for question in &items {
+    check_unique_ids(&items)?;
+    Ok(ItemBank {
+        name: name.into(),
+        items,
+    })
+}
+
+/// Reject a set of questions that reuses an `id`.
+///
+/// Ids identify a question across a whole bank or exam — Canvas keys items by
+/// them, and the print key pairs answers to them — so a repeat is ambiguous
+/// rather than merely untidy. Shared by both assembly paths so the two cannot
+/// disagree about what counts as a collision.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::InvalidQuestion`] naming the repeated id.
+pub fn check_unique_ids<'a, I>(questions: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a Question>,
+{
+    let mut seen = HashSet::new();
+    for question in questions {
         if !seen.insert(question.id.as_str()) {
             return Err(crate::Error::InvalidQuestion(format!(
                 "duplicate question id {:?}",
@@ -861,10 +878,7 @@ where
             )));
         }
     }
-    Ok(ItemBank {
-        name: name.into(),
-        items,
-    })
+    Ok(())
 }
 
 #[cfg(test)]

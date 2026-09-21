@@ -11,17 +11,16 @@
 //! Markdown to HTML, then XML-escaped for embedding).
 
 use std::fmt::Write as _;
-use std::io::{Cursor, Write};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, html};
-use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
+use pulldown_cmark::{Event, Parser, Tag, html};
 
 use crate::Result;
+use crate::export::{escape_xml, zip_package};
 use crate::model::{
     Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
-    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse, is_local_image,
+    MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse,
 };
+use crate::path::is_local_image;
 
 /// The `response_label` ident for the "True" choice; fills the item template.
 const TRUE_CHOICE_IDENT: &str = "true_choice";
@@ -401,7 +400,7 @@ pub fn to_qti(bank: &ItemBank, images: &[(String, Vec<u8>)]) -> Result<Vec<u8>> 
         .iter()
         .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
         .collect();
-    zip_package(&entries)
+    zip_package("QTI package", &entries)
 }
 
 /// Reminders about content that can't fully round-trip through the Canvas
@@ -1011,9 +1010,8 @@ fn general_condition_xml(feedback: &Feedback) -> String {
 /// `~~strikethrough~~` — renders as real HTML rather than literal text. Tables
 /// are then given visible rules by [`style_tables`].
 fn prompt_html(markdown: &str) -> String {
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_MATH;
     let mut rendered = String::new();
-    let parser = Parser::new_ext(markdown, options)
+    let parser = Parser::new_ext(markdown, crate::export::MARKDOWN)
         .map(rewrite_local_image)
         .map(rewrite_math);
     html::push_html(&mut rendered, parser);
@@ -1155,16 +1153,21 @@ fn percent_encode_component(text: &str) -> String {
     out
 }
 
-/// The distinct local-image paths referenced by any question in `bank`.
+/// The distinct local-image paths referenced by any question in `items`.
 ///
 /// Scans every rich-text field (see `Question::rich_text_fields`), so images
 /// embedded in answers and feedback are bundled just like prompt images. The
 /// exporter bundles these under `web_resources/`; the CLI resolves them to bytes
 /// relative to the question directory.
+///
+/// Operates on any run of questions, so a caller holding an [`ItemBank`]
+/// passes `bank.items.iter()` and one holding several assembled variants
+/// passes a chain across all of them — which is what dedupes a figure two
+/// variants both drew down to one bundled copy.
 #[must_use]
-pub fn local_image_paths(bank: &ItemBank) -> Vec<String> {
+pub fn local_image_paths<'a>(items: impl IntoIterator<Item = &'a Question>) -> Vec<String> {
     let mut paths = Vec::new();
-    for question in &bank.items {
+    for question in items {
         for field in question.rich_text_fields() {
             for url in image_urls(field) {
                 if is_local_image(&url) && !paths.contains(&url) {
@@ -1186,15 +1189,6 @@ fn image_urls(prompt: &str) -> Vec<String> {
         .collect()
 }
 
-/// XML-escape the five predefined entities, `&` first to avoid double-escaping.
-fn escape_xml(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 /// Reduce an authored string to a safe QTI identifier / path component.
 fn sanitize_ident(raw: &str) -> String {
     let cleaned: String = raw
@@ -1212,30 +1206,6 @@ fn sanitize_ident(raw: &str) -> String {
     } else {
         cleaned
     }
-}
-
-/// Zip the `(path, bytes)` files into a package byte payload.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Export`] if the zip archive cannot be written.
-fn zip_package(files: &[(&str, &[u8])]) -> Result<Vec<u8>> {
-    let mut cursor = Cursor::new(Vec::new());
-    {
-        let mut writer = ZipWriter::new(&mut cursor);
-        let options = SimpleFileOptions::default();
-        for (path, content) in files {
-            writer.start_file(*path, options).map_err(|e| zip_err(&e))?;
-            writer.write_all(content)?;
-        }
-        writer.finish().map_err(|e| zip_err(&e))?;
-    }
-    Ok(cursor.into_inner())
-}
-
-/// Map a zip-writer failure onto the crate export error.
-fn zip_err(error: &zip::result::ZipError) -> crate::Error {
-    crate::Error::Export(format!("building QTI zip package: {error}"))
 }
 
 #[cfg(test)]
@@ -1978,7 +1948,7 @@ mod tests {
     /// A local image URL is rewritten to `$IMS-CC-FILEBASE$`; external URLs stay.
     fn local_image_rewritten_external_untouched() {
         let bank = image_bank("See ![d](diagram.png) and ![x](https://ex.com/x.png).");
-        assert_eq!(local_image_paths(&bank), ["diagram.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["diagram.png"]);
         let xml = assessment_xml("a", &bank).expect("renders");
         assert!(xml.contains("$IMS-CC-FILEBASE$/diagram.png?canvas_download=1"));
         assert!(xml.contains("https://ex.com/x.png"));
@@ -1993,8 +1963,11 @@ mod tests {
         let images = vec![("sub/diagram.png".to_owned(), vec![1_u8, 2, 3])];
         let bytes = to_qti(&bank, &images).expect("export");
         let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
-        let names: Vec<&str> = archive.file_names().collect();
-        assert!(names.contains(&"web_resources/sub/diagram.png"));
+        assert!(
+            archive
+                .file_names()
+                .any(|name| name == "web_resources/sub/diagram.png")
+        );
         let manifest = manifest_xml("a", "a/a.xml", &images);
         assert!(manifest.contains(r#"href="web_resources/sub/diagram.png""#));
         assert!(manifest.contains("webcontent"));
@@ -2037,7 +2010,7 @@ mod tests {
         ];
         let bank = choice_image_bank(choices, feedback);
         // Choice image and feedback image collected, in field order; external skipped.
-        assert_eq!(local_image_paths(&bank), ["pic.png", "hint.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["pic.png", "hint.png"]);
     }
 
     #[test]
@@ -2047,7 +2020,7 @@ mod tests {
             vec![("![a](tree.png)", true), ("Neither", false)],
             Feedback::default(),
         );
-        assert_eq!(local_image_paths(&bank), ["tree.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["tree.png"]);
         let images = vec![("tree.png".to_owned(), vec![9_u8, 9, 9])];
         let bytes = to_qti(&bank, &images).expect("export");
         let archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("valid zip");
@@ -2063,7 +2036,24 @@ mod tests {
     fn ordering_item_image_is_collected() {
         let items = vec!["![step](step.png)".to_owned(), "Plain".to_owned()];
         let bank = ordering_bank(items, Feedback::default());
-        assert_eq!(local_image_paths(&bank), ["step.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["step.png"]);
+    }
+
+    #[test]
+    /// Every question is scanned, in question order, and an image shared by two
+    /// questions is collected once. An empty slice collects nothing.
+    fn images_collected_across_every_question_in_order() {
+        let mut bank = image_bank("![a](first.png) and ![s](shared.png)");
+        let mut second = image_bank("![s](shared.png) and ![b](second.png)");
+        if let Some(question) = second.items.first_mut() {
+            question.id = "q2".to_owned();
+        }
+        bank.items.append(&mut second.items);
+        assert_eq!(
+            local_image_paths(&bank.items),
+            ["first.png", "shared.png", "second.png"]
+        );
+        assert!(local_image_paths(&[]).is_empty());
     }
 
     #[test]
@@ -2076,7 +2066,7 @@ mod tests {
         if let Some(question) = bank.items.first_mut() {
             question.prompt = "See ![p](same.png)".to_owned();
         }
-        assert_eq!(local_image_paths(&bank), ["same.png"]);
+        assert_eq!(local_image_paths(&bank.items), ["same.png"]);
     }
 
     #[test]
@@ -2095,7 +2085,7 @@ mod tests {
             ],
             distractors: Vec::new(),
         };
-        assert!(local_image_paths(&matching_bank(matching, Feedback::default())).is_empty());
+        assert!(local_image_paths(&matching_bank(matching, Feedback::default()).items).is_empty());
     }
 
     #[test]
@@ -2121,7 +2111,7 @@ mod tests {
         use crate::diagram::{DiagramFormat, DiagramLanguage, render_diagrams};
         let mut bank = image_bank("```dot\ndigraph { a -> b; }\n```");
         let render = |_language: DiagramLanguage, _source: &str| Ok(vec![1_u8, 2, 3]);
-        let outcome = render_diagrams(&mut bank, &render, DiagramFormat::Png);
+        let outcome = render_diagrams(&mut bank.items, &render, DiagramFormat::Png);
         let path = outcome
             .images
             .first()
@@ -2143,7 +2133,7 @@ mod tests {
         let bank = image_bank("```dot\ndigraph { a -> b; }\n```");
         let xml = assessment_xml("a", &bank).expect("renders");
         assert!(xml.contains("language-dot") && xml.contains("digraph"));
-        assert!(local_image_paths(&bank).is_empty());
+        assert!(local_image_paths(&bank.items).is_empty());
     }
 
     #[test]

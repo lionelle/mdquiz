@@ -1,18 +1,45 @@
 [package]
 name = "mdquiz"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Author quiz questions as Markdown + YAML and export them to a print-ready Markdown sheet or a Canvas New Quizzes QTI package."
+# The minimum supported toolchain, and a deliberate floor rather than the
+# technical one. Edition 2024 needs 1.85 and the let-chains in `parse` and
+# `sample` need 1.88, but nothing older than the current stable is built or
+# tested here — so 1.96 is what is actually supported, and cargo should say
+# so rather than let an old toolchain get halfway through a build first.
+rust-version = "1.96"
+description = "Author quiz questions as Markdown + YAML and export them as printable Word exams, a print-ready Markdown sheet, or a Canvas New Quizzes QTI package."
 license = "MIT"
 repository = "https://github.com/lionelle/mdquiz"
 readme = "README.md"
 keywords = ["quiz", "markdown", "canvas", "qti", "education"]
 categories = ["command-line-utilities", "parsing"]
 
+# What a published crate ships. `docs/` and `samples/` are the authoring
+# guide and its worked examples, so they belong with the code; the rest of
+# what sits in the repository is how the project is *built*, not how it is
+# used, and only makes the download bigger.
+exclude = [
+    ".cargo/",
+    ".claude/",
+    ".github/",
+    ".pre-commit-config.yaml",
+    "CLAUDE.md",
+    "Roadmap.md",
+    "samples/**/*-generated.zip",
+]
+
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
+# Pinned exactly, not loosely: this crate converts `math-core`'s MathML output
+# into OOXML by walking its element tree, so a change in what it emits is a
+# change in what lands on the page. A caret requirement would let a patch
+# release alter an exam silently. Raise it deliberately, with the OMML tests
+# as the check.
+math-core = "=0.8.2"
 pulldown-cmark = "0.13.4"
+roxmltree = "0.21.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_norway = "0.9.42"
 tempfile = "3.27.0"
@@ -36,6 +63,18 @@ unreachable_pub = "warn"
 # Baseline lint groups.
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# The complexity ceiling in clippy.toml only binds if this lint is enabled by
+# name: it lives in `clippy::restriction`, which is not a group anyone enables
+# wholesale (it also bans `?`, `return`, indexing, and much else this crate
+# uses). Without this line `cognitive-complexity-threshold` is declared and
+# never enforced.
+#
+# `clippy::nursery` is deliberately NOT enabled. It was tried, on the mistaken
+# belief that it carried `cognitive_complexity`; it does not. What it did carry
+# was unstable lints that, against a floating toolchain and `-D warnings`, can
+# turn CI red on unchanged code — plus `redundant_pub_crate`, which contradicts
+# `unreachable_pub` above and forced a crate-wide relaxation to silence.
+cognitive_complexity = "warn"
 # Require doc comments on private items too (public items are covered by
 # `rust::missing_docs`). Together these mean every function is documented.
 missing_docs_in_private_items = "warn"

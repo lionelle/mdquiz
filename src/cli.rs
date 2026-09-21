@@ -5,18 +5,26 @@
 //! export target to disk. All real work lives in the library so it can be
 //! tested without a process.
 
+use std::collections::hash_map::RandomState;
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::BuildHasher as _;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::SystemTime;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use mdquiz::diagram::{self, DiagramFormat, DiagramLanguage};
 use mdquiz::export::{self, canvas, markdown};
-use mdquiz::model::ItemBank;
+use mdquiz::model::{ItemBank, Question};
 use mdquiz::parse;
+use mdquiz::path::escapes_dir;
+use mdquiz::quiz::assemble::{Assembly, assemble};
+use mdquiz::quiz::output::{self, OutputFile};
+use mdquiz::quiz::sample::{self, SampleRng, Source};
+use mdquiz::quiz::spec::Spec;
 
 /// Author quizzes in Markdown + YAML and export them for print or Canvas.
 #[derive(Debug, Parser)]
@@ -31,37 +39,67 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Assemble a directory of question files into an item bank and export it.
-    Export {
-        /// Directory of Markdown question files (one question per file).
-        dir: PathBuf,
-        /// Path to write the exported item bank to.
-        #[arg(short, long)]
-        output: PathBuf,
-        /// Export format to produce; defaults to the Canvas package.
-        #[arg(short, long, value_enum, default_value_t = FormatArg::Canvas)]
-        format: FormatArg,
-        /// Bank name; defaults to the directory's own name.
-        #[arg(short, long)]
-        name: Option<String>,
-        /// Recurse into subdirectories, gathering every question into one bank.
-        #[arg(short, long)]
-        recursive: bool,
-        /// Keep at most N randomly-chosen questions from each directory (handy
-        /// with `-r` to build a print quiz that samples every topic).
-        #[arg(long, value_name = "N")]
-        sample: Option<usize>,
-        /// Also write a matching answer key (markdown export only): a second
-        /// file, `<output>-key.md`, with each question's correct answer.
-        #[arg(long)]
-        include_key: bool,
-        /// Shuffle the questions into a random order after selection (markdown
-        /// export only).
-        #[arg(long)]
-        random_order: bool,
-        /// Image format for rendered diagrams (Canvas export only).
-        #[arg(long, value_enum, default_value_t = DiagramFormatArg::Png)]
-        diagram_format: DiagramFormatArg,
-    },
+    Export(ExportArgs),
+    /// Assemble a printable exam from a quiz spec: one Word sheet and one
+    /// answer key per variant.
+    Quiz(QuizArgs),
+}
+
+/// Arguments for `mdquiz export`.
+#[derive(Debug, Args)]
+pub(crate) struct ExportArgs {
+    /// Directory of Markdown question files (one question per file).
+    dir: PathBuf,
+    /// Path to write the exported item bank to.
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Export format to produce; defaults to the Canvas package.
+    #[arg(short, long, value_enum, default_value_t = FormatArg::Canvas)]
+    format: FormatArg,
+    /// Bank name; defaults to the directory's own name.
+    #[arg(short, long)]
+    name: Option<String>,
+    /// Recurse into subdirectories, gathering every question into one bank.
+    #[arg(short, long)]
+    recursive: bool,
+    /// Keep at most N randomly-chosen questions from each directory (handy
+    /// with `-r` to build a print quiz that samples every topic).
+    #[arg(long, value_name = "N")]
+    sample: Option<usize>,
+    /// Also write a matching answer key (markdown export only): a second
+    /// file, `<output>-key.md`, with each question's correct answer.
+    #[arg(long)]
+    include_key: bool,
+    /// Shuffle the questions into a random order after selection (markdown
+    /// export only).
+    #[arg(long)]
+    random_order: bool,
+    /// Seed the random draw so `--sample`/`--random-order` reproduce
+    /// exactly; omit for a different draw each run.
+    #[arg(long, value_name = "N")]
+    seed: Option<u64>,
+    /// Image format for rendered diagrams (Canvas export only).
+    #[arg(long, value_enum, default_value_t = DiagramFormatArg::Png)]
+    diagram_format: DiagramFormatArg,
+}
+
+/// Arguments for `mdquiz quiz`.
+#[derive(Debug, Args)]
+pub(crate) struct QuizArgs {
+    /// The quiz spec (YAML) describing what to draw and how to lay it out.
+    spec: PathBuf,
+    /// Directory to write the sheets and keys into.
+    #[arg(short, long, default_value = ".")]
+    out_dir: PathBuf,
+    /// Base name for the files; defaults to the spec file's own stem.
+    #[arg(short, long)]
+    name: Option<String>,
+    /// Seed the draw so a run reproduces exactly; omit for a fresh draw.
+    ///
+    /// The seed is printed either way, so a run worth keeping can be repeated
+    /// — without it a sheet handed out can never be rebuilt.
+    #[arg(long, value_name = "N")]
+    seed: Option<u64>,
 }
 
 /// The export format as selected on the command line.
@@ -110,34 +148,137 @@ impl From<DiagramFormatArg> for DiagramFormat {
 /// bank, or writing the output file.
 pub(crate) fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Export {
-            dir,
-            output,
-            format,
-            name,
-            recursive,
-            sample,
-            include_key,
-            random_order,
-            diagram_format,
-        } => {
-            if (include_key || random_order) && matches!(format, FormatArg::Canvas) {
-                anyhow::bail!("--include-key and --random-order apply only to `--format markdown`");
-            }
-            let mut bank = assemble_bank(&dir, name, recursive, sample, random_order)?;
-            // Diagram rendering and image bundling apply only to the Canvas package.
-            let images = match format {
-                FormatArg::Canvas => canvas_images(&dir, &mut bank, diagram_format.into()),
-                FormatArg::Markdown => Vec::new(),
-            };
-            let reminders = write_export(&bank, format.into(), &output, &images)?;
-            if include_key {
-                write_answer_key(&bank, &output)?;
-            }
-            print_import_reminders(&reminders);
-            Ok(())
-        }
+        Command::Export(args) => run_export(args),
+        Command::Quiz(args) => run_quiz(args),
     }
+}
+
+/// Export an item bank in the requested format.
+///
+/// # Errors
+///
+/// Returns an error if the sources cannot be read or parsed, the bank cannot be
+/// exported, or the output file cannot be written. Also rejects flags that
+/// apply only to the Markdown sheet being passed with `--format canvas`.
+fn run_export(args: ExportArgs) -> anyhow::Result<()> {
+    let ExportArgs {
+        dir,
+        output,
+        format,
+        name,
+        recursive,
+        sample: sample_size,
+        include_key,
+        random_order,
+        seed,
+        diagram_format,
+    } = args;
+    if (include_key || random_order) && matches!(format, FormatArg::Canvas) {
+        anyhow::bail!("--include-key and --random-order apply only to `--format markdown`");
+    }
+    let mut bank = assemble_bank(&dir, name, recursive, sample_size, random_order, seed)?;
+    // Diagram rendering and image bundling apply only to the Canvas package.
+    let images = match format {
+        FormatArg::Canvas => canvas_images(&dir, &mut bank.items, diagram_format.into()),
+        FormatArg::Markdown => Vec::new(),
+    };
+    let reminders = write_export(&bank, format.into(), &output, &images)?;
+    if include_key {
+        write_answer_key(&bank, &output)?;
+    }
+    print_import_reminders(&reminders);
+    Ok(())
+}
+
+/// Assemble a quiz spec and write every variant's sheet and key.
+///
+/// # Errors
+///
+/// Returns an error if the spec cannot be read or parsed, a question folder
+/// cannot be listed, a variant cannot be rendered, or a file cannot be written.
+fn run_quiz(args: QuizArgs) -> anyhow::Result<()> {
+    let QuizArgs {
+        spec: spec_path,
+        out_dir,
+        name,
+        seed,
+    } = args;
+    let spec_path = spec_path.as_path();
+    let out_dir = out_dir.as_path();
+    let yaml = fs::read_to_string(spec_path)
+        .with_context(|| format!("cannot read quiz spec {}", spec_path.display()))?;
+    let spec = Spec::from_yaml(&yaml)?;
+    // Folders in the spec are relative to the spec itself, not to the shell's
+    // working directory: a spec is checked in beside the questions it draws.
+    let root = spec_path.parent().unwrap_or(Path::new("."));
+    let seed = seed.unwrap_or_else(entropy_seed);
+    let mut assembly = assemble(
+        &spec,
+        &|dir: &str| list_group_sources(root, dir),
+        &partial_reader(root),
+        seed,
+    )?;
+    for warning in &assembly.warnings {
+        eprintln!("warning: {warning}");
+    }
+    // After assembly, so the diagram pass sees the questions the variants
+    // actually drew — and before rendering, because a `w:drawing` needs the
+    // image bytes the pass produces.
+    let images = quiz_images(root, &mut assembly);
+    let stem = name.unwrap_or_else(|| spec_stem(spec_path));
+    let files = output::render(&assembly, &stem, seed, &images)?;
+    write_output_files(out_dir, &files)?;
+    // Printed even when it was given, so the line in the terminal is the whole
+    // record of how this paper was built.
+    eprintln!("seed: {seed}");
+    Ok(())
+}
+
+/// List one spec group's question sources, named relative to the spec's folder.
+///
+/// Spec-relative, not group-relative, because that is what [`assemble`]
+/// promises its questions: it recovers each one's own folder from the
+/// directory part of its path, and rebases that question's images and `file:`
+/// partials against it. A bare `q1.md` would send a group's
+/// `figures/maple.png` looking beside the *spec* instead of beside the
+/// question — and would make two groups' identically named figures collide.
+///
+/// # Errors
+///
+/// Returns the failure as a string, which is the contract [`assemble`] injects.
+fn list_group_sources(root: &Path, dir: &str) -> std::result::Result<Vec<Source>, String> {
+    if escapes_dir(dir) {
+        return Err(format!("group folder {dir:?} escapes the spec's directory"));
+    }
+    let sources = read_question_sources(&root.join(dir), false).map_err(|e| e.to_string())?;
+    Ok(sources
+        .into_iter()
+        .map(|(path, contents)| (mdquiz::path::join_dir(dir, &path), contents))
+        .collect())
+}
+
+/// The base name for a spec's output files: the spec file's own stem.
+fn spec_stem(spec_path: &Path) -> String {
+    spec_path.file_stem().map_or_else(
+        || "quiz".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    )
+}
+
+/// Write every rendered file into `out_dir`, creating it if needed.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be created or a file not written.
+fn write_output_files(out_dir: &Path, files: &[OutputFile]) -> anyhow::Result<()> {
+    fs::create_dir_all(out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
+    for file in files {
+        let path = out_dir.join(&file.name);
+        fs::write(&path, &file.bytes)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        println!("{}", path.display());
+    }
+    Ok(())
 }
 
 /// Read a directory's questions into a bank, optionally recursing, sampling,
@@ -152,53 +293,90 @@ fn assemble_bank(
     recursive: bool,
     sample: Option<usize>,
     random_order: bool,
+    seed: Option<u64>,
 ) -> anyhow::Result<ItemBank> {
-    let mut rng = SampleRng::from_entropy();
+    let mut rng = SampleRng::seeded(seed.unwrap_or_else(entropy_seed));
     let mut sources = read_question_sources(dir, recursive)?;
     if let Some(limit) = sample {
-        sources = sample_per_directory(sources, limit, &mut rng);
+        sources = sample::per_directory(sources, limit, &mut rng);
     }
     let mut bank = build_bank(dir, bank_name(dir, name), sources)?;
     if random_order {
-        shuffle(&mut bank.items, &mut rng);
+        sample::shuffle(&mut bank.items, &mut rng);
     }
     Ok(bank)
 }
 
-/// Randomly permute `items` in place (Fisher-Yates).
-fn shuffle<T>(items: &mut [T], rng: &mut SampleRng) {
-    for index in (1..items.len()).rev() {
-        items.swap(index, rng.index(index + 1));
-    }
+/// A seed drawn from operating-system entropy mixed with the current time.
+///
+/// Lives in the binary, not the library: seeding from ambient state is exactly
+/// the impurity the library avoids, so the caller decides when a draw should be
+/// unpredictable and when `--seed` should make it reproducible.
+fn entropy_seed() -> u64 {
+    RandomState::new().hash_one(SystemTime::now())
 }
 
-/// Render the diagrams in `bank`, then gather every image the Canvas package
+/// Render the diagrams in `items`, then gather every image the Canvas package
 /// needs: the generated diagrams plus the local images read from `dir`.
 fn canvas_images(
     dir: &Path,
-    bank: &mut ItemBank,
+    items: &mut [Question],
     diagram_format: DiagramFormat,
 ) -> Vec<(String, Vec<u8>)> {
     let renderer = move |language: DiagramLanguage, source: &str| {
         render_diagram(language, source, diagram_format)
     };
-    let outcome = diagram::render_diagrams(bank, &renderer, diagram_format);
+    let outcome = diagram::render_diagrams(&mut *items, &renderer, diagram_format);
+    bundled(dir, &*items, outcome)
+}
+
+/// Render the diagrams across every variant of `assembly`, then gather every
+/// image its sheets need.
+///
+/// Always [`DiagramFormat::Png`]: Word places SVG only through the
+/// `asvg:svgBlip` extension, which needs a rasterised copy alongside it
+/// anyway, so the Word path has no SVG mode to choose. One pass across all the
+/// variants at once, so a figure four of them share is rendered once.
+fn quiz_images(root: &Path, assembly: &mut Assembly) -> Vec<(String, Vec<u8>)> {
+    let renderer = |language: DiagramLanguage, source: &str| {
+        render_diagram(language, source, DiagramFormat::Png)
+    };
+    let outcome = diagram::render_diagrams(assembly.questions_mut(), &renderer, DiagramFormat::Png);
+    bundled(root, assembly.questions(), outcome)
+}
+
+/// The images to bundle: the diagrams just rendered, plus the local images
+/// `items` reference, read from `dir`. Diagram warnings are reported here
+/// because a diagram left as code is the author's to fix, not an export
+/// failure.
+fn bundled<'a>(
+    dir: &Path,
+    items: impl IntoIterator<Item = &'a Question>,
+    outcome: diagram::DiagramOutcome,
+) -> Vec<(String, Vec<u8>)> {
     for warning in &outcome.warnings {
         eprintln!("warning: {warning}");
     }
-    let mut images = load_images(dir, bank);
+    // Deliberately unsorted: both writers look an image up by its authored
+    // path, and both sources are already deduplicated, so the order here
+    // cannot reach the output. Sorting it only reshuffled the Canvas
+    // manifest's `<resource>` list against every package built before.
+    let mut images = load_images(dir, items);
     images.extend(outcome.images);
     images
 }
 
-/// Load the bytes of every local image referenced by the bank, resolved
+/// Load the bytes of every local image referenced by `items`, resolved
 /// relative to `dir`. Missing or unsafe paths are skipped with a warning.
 ///
 /// Generated-diagram paths (under [`diagram::GENERATED_DIR`]) are skipped here:
 /// their bytes come from the diagram pass, not the question directory.
-fn load_images(dir: &Path, bank: &ItemBank) -> Vec<(String, Vec<u8>)> {
+fn load_images<'a>(
+    dir: &Path,
+    items: impl IntoIterator<Item = &'a Question>,
+) -> Vec<(String, Vec<u8>)> {
     let mut images = Vec::new();
-    for path in canvas::local_image_paths(bank) {
+    for path in canvas::local_image_paths(items) {
         if diagram::is_generated_path(&path) {
             continue;
         }
@@ -348,14 +526,6 @@ fn partial_reader(dir: &Path) -> impl Fn(&str) -> std::result::Result<String, St
     }
 }
 
-/// Whether `path` walks out of its base directory via a `..` component.
-///
-/// The single source of truth for the path-escape rule shared by
-/// [`partial_reader`] (which errors) and [`load_images`] (which skips).
-fn escapes_dir(path: &str) -> bool {
-    path.split('/').any(|part| part == "..")
-}
-
 /// Print any post-import manual-fix reminders to stderr after a Canvas export.
 fn print_import_reminders(reminders: &[String]) {
     if reminders.is_empty() {
@@ -457,7 +627,7 @@ fn build_bank(
     sources.sort_by(|a, b| a.0.cmp(&b.0));
     let mut questions = Vec::with_capacity(sources.len());
     for (rel_path, content) in sources {
-        let base = rel_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let base = mdquiz::path::parent_dir(&rel_path);
         let question_dir = dir.join(base);
         let reader = partial_reader(&question_dir);
         let mut question = parse::parse_question_with(&content, &reader)
@@ -466,80 +636,6 @@ fn build_bank(
         questions.push(question);
     }
     Ok(parse::item_bank_from_questions(name, questions)?)
-}
-
-/// Keep at most `limit` questions from each directory, chosen at random.
-///
-/// Sources are grouped by their parent directory (top-level files form one
-/// group, keyed by `""`), and each group is independently down-sampled to
-/// `limit`. Group order and the relative order of the questions kept within a
-/// group are preserved; only which questions survive is random.
-fn sample_per_directory(
-    sources: Vec<(String, String)>,
-    limit: usize,
-    rng: &mut SampleRng,
-) -> Vec<(String, String)> {
-    let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    for source in sources {
-        let dir = source.0.rsplit_once('/').map_or("", |(parent, _)| parent);
-        match groups.iter_mut().find(|(name, _)| name == dir) {
-            Some((_, group)) => group.push(source),
-            None => groups.push((dir.to_owned(), vec![source])),
-        }
-    }
-    let mut kept = Vec::new();
-    for (_, group) in groups {
-        kept.extend(sample_group(group, limit, rng));
-    }
-    kept
-}
-
-/// Randomly keep `limit` of `group` (all of it when it is already that small),
-/// preserving the relative order of the survivors.
-fn sample_group(
-    mut group: Vec<(String, String)>,
-    limit: usize,
-    rng: &mut SampleRng,
-) -> Vec<(String, String)> {
-    if group.len() <= limit {
-        return group;
-    }
-    // Partial Fisher-Yates: move `limit` random items to the front, then keep
-    // them in their original relative order for a stable sheet layout.
-    for slot in 0..limit {
-        let pick = slot + rng.index(group.len() - slot);
-        group.swap(slot, pick);
-    }
-    group.truncate(limit);
-    group.sort_by(|a, b| a.0.cmp(&b.0));
-    group
-}
-
-/// A tiny non-cryptographic PRNG (`SplitMix64`) for sampling questions.
-struct SampleRng(u64);
-
-impl SampleRng {
-    /// Seed from operating-system entropy mixed with the current time.
-    fn from_entropy() -> Self {
-        use std::hash::BuildHasher as _;
-        let seed =
-            std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
-        Self(seed)
-    }
-
-    /// The next pseudo-random `u64`.
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// A pseudo-random index in `0..bound` (`bound` must be non-zero).
-    fn index(&mut self, bound: usize) -> usize {
-        usize::try_from(self.next_u64() % bound as u64).unwrap_or(0)
-    }
 }
 
 /// Choose the bank name: the `--name` override, else the directory's own name.
@@ -582,7 +678,8 @@ fn write_export(
     }
 }
 
-/// Write the answer key beside the markdown sheet, at [`key_path`]`(output)`.
+/// Write the answer key beside the markdown sheet, at the path [`key_path`]
+/// derives from `output`.
 ///
 /// # Errors
 ///
@@ -640,6 +737,54 @@ mod tests {
     }
 
     #[test]
+    /// A seed reproduces both the draw and the shuffled order exactly, and a
+    /// different seed is free to differ. This is the promise `docs/exporting.md`
+    /// makes for `--seed`.
+    fn assemble_bank_is_reproducible_for_a_seed() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        for n in 0..6 {
+            fs::write(
+                dir.path().join(format!("q{n}.md")),
+                format!("---\nid: q{n}\nkind: true_false\nanswer: true\n---\n\nQ{n}?\n"),
+            )
+            .expect("write question");
+        }
+        let ids = |seed| {
+            assemble_bank(dir.path(), None, false, Some(3), true, seed)
+                .expect("assemble")
+                .items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<String>>()
+        };
+        let drawn = ids(Some(7));
+        assert_eq!(drawn.len(), 3);
+        assert_eq!(drawn, ids(Some(7)), "same seed must reproduce the sheet");
+        let others: Vec<Vec<String>> = (1..8).map(|seed| ids(Some(seed))).collect();
+        assert!(
+            others.iter().any(|other| *other != drawn),
+            "no seed produced a different sheet"
+        );
+        // The unseeded branch is the default path and must stay unpredictable:
+        // pinned to a constant, every "random" sheet would be the same one and
+        // none of the seeded assertions above would notice.
+        let unseeded: Vec<Vec<String>> = (0..5).map(|_| ids(None)).collect();
+        assert_eq!(unseeded.first().map(Vec::len), Some(3));
+        assert!(
+            unseeded.windows(2).any(|pair| pair.first() != pair.get(1)),
+            "five unseeded runs all produced the same sheet"
+        );
+    }
+
+    #[test]
+    /// Two unseeded runs get different seeds. This is the only thing worth
+    /// asserting about a reader of ambient state: not *what* it returns, but
+    /// that it is not a constant.
+    fn entropy_seed_is_not_a_constant() {
+        assert_ne!(entropy_seed(), entropy_seed());
+    }
+
+    #[test]
     /// An explicit `--name` overrides the directory-derived default.
     fn bank_name_prefers_explicit_override() {
         let name = bank_name(
@@ -680,70 +825,6 @@ mod tests {
         let sources = read_question_sources(dir.path(), false).expect("read sources");
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["q1.md"]);
-    }
-
-    /// Build `(path, "")` sources for the given relative paths.
-    fn sources(paths: &[&str]) -> Vec<(String, String)> {
-        paths
-            .iter()
-            .map(|p| ((*p).to_owned(), String::new()))
-            .collect()
-    }
-
-    /// The directory of each kept source, in order.
-    fn dirs_of(kept: &[(String, String)]) -> Vec<&str> {
-        kept.iter()
-            .map(|(p, _)| p.rsplit_once('/').map_or("", |(dir, _)| dir))
-            .collect()
-    }
-
-    #[test]
-    /// Sampling caps each directory at `limit` and keeps smaller groups whole.
-    fn sample_per_directory_caps_each_group() {
-        let src = sources(&["a/1.md", "a/2.md", "a/3.md", "b/1.md"]);
-        let kept = sample_per_directory(src, 2, &mut SampleRng(1));
-        let dirs = dirs_of(&kept);
-        assert_eq!(kept.len(), 3); // a: 3 -> 2, b: 1 -> 1
-        assert_eq!(dirs.iter().filter(|d| **d == "a").count(), 2);
-        assert_eq!(dirs.iter().filter(|d| **d == "b").count(), 1);
-    }
-
-    #[test]
-    /// A fixed seed makes sampling reproducible, and survivors stay in path order.
-    fn sample_is_deterministic_and_ordered() {
-        let src = sources(&["d/0.md", "d/1.md", "d/2.md", "d/3.md", "d/4.md"]);
-        let first = sample_per_directory(src.clone(), 3, &mut SampleRng(42));
-        let again = sample_per_directory(src, 3, &mut SampleRng(42));
-        assert_eq!(first, again);
-        assert_eq!(first.len(), 3);
-        let paths: Vec<&str> = first.iter().map(|(p, _)| p.as_str()).collect();
-        let mut sorted = paths.clone();
-        sorted.sort_unstable();
-        assert_eq!(paths, sorted);
-    }
-
-    #[test]
-    /// The PRNG always yields an index within bounds.
-    fn sample_rng_index_is_in_bounds() {
-        let mut rng = SampleRng(7);
-        for _ in 0..100 {
-            assert!(rng.index(5) < 5);
-        }
-    }
-
-    #[test]
-    /// Shuffling permutes the items and is reproducible for a fixed seed.
-    fn shuffle_permutes_deterministically() {
-        let original: Vec<u32> = (0..8).collect();
-        let mut first = original.clone();
-        let mut again = original.clone();
-        shuffle(&mut first, &mut SampleRng(99));
-        shuffle(&mut again, &mut SampleRng(99));
-        assert_eq!(first, again); // same seed -> same order
-        assert_ne!(first, original); // it actually reordered
-        let mut sorted = first.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, original); // and it is a permutation (nothing lost)
     }
 
     #[test]
@@ -791,7 +872,7 @@ mod tests {
                 .is_some_and(|c| c.text.contains("![p](topics/inpartial.png)"))
         ));
         // Both rebased paths resolve on disk through the root-rooted loader.
-        let names: Vec<String> = load_images(dir.path(), &bank)
+        let names: Vec<String> = load_images(dir.path(), &bank.items)
             .into_iter()
             .map(|(path, _)| path)
             .collect();
@@ -830,7 +911,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         fs::write(dir.path().join("here.png"), b"png-bytes").expect("write image");
         let bank = true_false_bank("![a](here.png) ![b](missing.png) ![c](../escape.png)");
-        let images = load_images(dir.path(), &bank);
+        let images = load_images(dir.path(), &bank.items);
         assert_eq!(images.len(), 1);
         assert_eq!(
             images.first().map(|(path, _)| path.as_str()),
@@ -847,7 +928,7 @@ mod tests {
         fs::create_dir(&qdir).expect("qdir");
         let bank = true_false_bank("![e](../secret.png)");
         // The file exists outside `qdir`, so only the `..` guard can skip it.
-        assert!(load_images(&qdir, &bank).is_empty());
+        assert!(load_images(&qdir, &bank.items).is_empty());
     }
 
     #[test]
@@ -860,7 +941,7 @@ mod tests {
         fs::create_dir(dir.path().join("generated")).expect("generated dir");
         fs::write(dir.path().join("generated/mermaid-abc.png"), b"x").expect("write generated");
         let bank = true_false_bank("![d](generated/mermaid-abc.png) and ![r](real.png)");
-        let images = load_images(dir.path(), &bank);
+        let images = load_images(dir.path(), &bank.items);
         assert_eq!(images.len(), 1);
         assert_eq!(
             images.first().map(|(path, _)| path.as_str()),
@@ -917,7 +998,7 @@ mod tests {
         let read = partial_reader(dir.path());
         let bank = parse::item_bank_from_sources_with("m", sources, &read).expect("bank");
         // The partial's `img.png` was rebased to `parts/img.png`, which exists.
-        let images = load_images(dir.path(), &bank);
+        let images = load_images(dir.path(), &bank.items);
         assert_eq!(
             images.first().map(|(p, _)| p.as_str()),
             Some("parts/img.png")
@@ -945,6 +1026,294 @@ mod tests {
         write_export(&true_false_bank("P?"), export::Format::Markdown, &out, &[]).expect("write");
         let text = fs::read_to_string(&out).expect("read back");
         assert!(text.starts_with("# M"));
+    }
+
+    /// The arguments a `mdquiz quiz` run would parse to.
+    #[test]
+    /// A group's sources are named relative to the *spec*, not the group. That
+    /// prefix is what lets `assemble` recover a question's own folder and
+    /// rebase its images against it — without it an image beside a question
+    /// is looked for beside the spec, which is where it is not.
+    fn group_sources_are_named_relative_to_the_spec() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        quiz_fixture(dir.path(), 1);
+        let sources = list_group_sources(dir.path(), "topics").expect("lists");
+        let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, ["topics/q.md"]);
+    }
+
+    #[test]
+    /// An image beside a question in a group folder is found, placed, and
+    /// bundled into the sheet. This is the whole chain: the source path names
+    /// the group, the parser rebases the image onto it, the CLI reads it from
+    /// there, and the writer embeds it.
+    fn an_image_beside_a_question_reaches_the_sheet() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = illustrated_fixture(dir.path());
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 4)).expect("quiz runs");
+        let bytes = fs::read(out.join("midterm.docx")).expect("the sheet is written");
+        let names = part_names(&bytes);
+        assert!(
+            names.contains(&"word/media/image1.png".to_owned()),
+            "no image was bundled: {names:?}"
+        );
+    }
+
+    #[test]
+    /// Two groups may each hold a `figures/fig.png`, and they are two
+    /// different pictures. Group-relative source paths would have collapsed
+    /// them into one, printing whichever was read last under both questions.
+    fn identically_named_figures_in_two_groups_stay_distinct() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (group, width) in [("trees", 96_u32), ("graphs", 48_u32)] {
+            let figures = dir.path().join(group).join("figures");
+            fs::create_dir_all(&figures).expect("create figures");
+            fs::write(figures.join("fig.png"), sized_png(width)).expect("write image");
+            fs::write(
+                dir.path().join(group).join("q.md"),
+                format!(
+                    "---\nid: {group}\nkind: true_false\nanswer: true\n---\n\n\
+                     See ![a figure](figures/fig.png)\n"
+                ),
+            )
+            .expect("write question");
+        }
+        let spec = dir.path().join("midterm.yaml");
+        fs::write(
+            &spec,
+            "name: M\nvariants: 1\ngroups:\n  - dir: trees\n    take: all\n\
+             \x20 - dir: graphs\n    take: all\n",
+        )
+        .expect("write spec");
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 9)).expect("quiz runs");
+        let bytes = fs::read(out.join("midterm.docx")).expect("the sheet is written");
+        let media: Vec<String> = part_names(&bytes)
+            .into_iter()
+            .filter(|name| name.starts_with("word/media/"))
+            .collect();
+        assert_eq!(media.len(), 2, "the two figures collided: {media:?}");
+    }
+
+    #[test]
+    /// Every variant that draws an illustrated question carries the figure,
+    /// and carries it once. A shared figure is bundled per *sheet* — each is
+    /// a standalone file — but never twice within one.
+    fn every_variant_carries_a_shared_figure_exactly_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = illustrated_fixture(dir.path());
+        fs::write(
+            &spec,
+            "name: M\nvariants: 3\nlayout:\n  shuffle_choices: true\n\
+             groups:\n  - dir: topics\n    take: all\n",
+        )
+        .expect("write spec");
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 3)).expect("quiz runs");
+        for variant in ["A", "B", "C"] {
+            let bytes =
+                fs::read(out.join(format!("midterm-{variant}.docx"))).expect("sheet written");
+            let media: Vec<String> = part_names(&bytes)
+                .into_iter()
+                .filter(|name| name.starts_with("word/media/"))
+                .collect();
+            assert_eq!(media, ["word/media/image1.png"], "variant {variant}");
+        }
+    }
+
+    /// A one-question spec whose question embeds an image in its own folder.
+    fn illustrated_fixture(dir: &Path) -> PathBuf {
+        let figures = dir.join("topics").join("figures");
+        fs::create_dir_all(&figures).expect("create figures");
+        fs::write(figures.join("tree.png"), tiny_png()).expect("write image");
+        fs::write(
+            dir.join("topics").join("q.md"),
+            "---
+id: q
+kind: true_false
+answer: true
+---
+
+             Is this a maple? ![a maple](figures/tree.png)
+",
+        )
+        .expect("write question");
+        let spec = dir.join("midterm.yaml");
+        fs::write(
+            &spec,
+            "name: M
+variants: 1
+groups:
+  - dir: topics
+    take: all
+",
+        )
+        .expect("write spec");
+        spec
+    }
+
+    /// A 1x1 PNG header, which is all the writer measures.
+    ///
+    /// Built here rather than shared with `export::docx::media`'s fixture:
+    /// this is the binary crate, which cannot see that module's internals.
+    fn tiny_png() -> Vec<u8> {
+        sized_png(1)
+    }
+
+    /// A square PNG header `side` pixels across, so two fixtures can differ.
+    fn sized_png(side: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend(13_u32.to_be_bytes());
+        bytes.extend(b"IHDR");
+        bytes.extend(side.to_be_bytes());
+        bytes.extend(side.to_be_bytes());
+        bytes.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        bytes
+    }
+
+    /// The part names inside a `.docx`.
+    fn part_names(bytes: &[u8]) -> Vec<String> {
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("a zip");
+        archive.file_names().map(ToOwned::to_owned).collect()
+    }
+
+    fn quiz_args(spec: &Path, out_dir: &Path, name: Option<&str>, seed: u64) -> QuizArgs {
+        QuizArgs {
+            spec: spec.to_path_buf(),
+            out_dir: out_dir.to_path_buf(),
+            name: name.map(ToOwned::to_owned),
+            seed: Some(seed),
+        }
+    }
+
+    /// A spec folder holding one multiple-choice question, plus the spec.
+    fn quiz_fixture(dir: &Path, variants: usize) -> PathBuf {
+        let topics = dir.join("topics");
+        fs::create_dir_all(&topics).expect("create topics");
+        fs::write(
+            topics.join("q.md"),
+            "---\nid: q\nkind: multiple_choice\nchoices:\n  \
+             - text: alpha\n    correct: true\n  - text: beta\n---\n\nPick one.\n",
+        )
+        .expect("write question");
+        let spec = dir.join("midterm.yaml");
+        fs::write(
+            &spec,
+            format!(
+                "name: M\nvariants: {variants}\nlayout:\n  shuffle_choices: true\n\
+                 groups:\n  - dir: topics\n    take: all\n"
+            ),
+        )
+        .expect("write spec");
+        spec
+    }
+
+    #[test]
+    /// A multi-variant run writes a sheet *and* a key for every variant. One
+    /// key cannot grade two papers, so a variant without its own key is a pile
+    /// of exams nobody can mark.
+    fn quiz_writes_a_sheet_and_a_key_for_every_variant() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = quiz_fixture(dir.path(), 3);
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 7)).expect("quiz runs");
+        for name in [
+            "midterm-A.docx",
+            "midterm-A-key.docx",
+            "midterm-B.docx",
+            "midterm-B-key.docx",
+            "midterm-C.docx",
+            "midterm-C-key.docx",
+        ] {
+            let path = out.join(name);
+            assert!(path.is_file(), "{name} was not written");
+            assert!(
+                fs::metadata(&path).expect("metadata").len() > 0,
+                "{name} is empty"
+            );
+        }
+    }
+
+    #[test]
+    /// The run is recorded beside the sheets: the seed that drew it, every
+    /// variant, and the options as printed. Without it a paper handed out
+    /// months ago cannot be accounted for.
+    fn quiz_writes_a_manifest_recording_the_seed_and_variants() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = quiz_fixture(dir.path(), 2);
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, None, 77)).expect("quiz runs");
+        let manifest =
+            fs::read_to_string(out.join("midterm-manifest.yaml")).expect("manifest written");
+        assert!(manifest.contains("seed: 77"), "{manifest}");
+        assert!(manifest.contains("variant: A"), "{manifest}");
+        assert!(manifest.contains("variant: B"), "{manifest}");
+        assert!(manifest.contains("id: q"), "{manifest}");
+        // The options as printed, so the record says what the paper said.
+        assert!(manifest.contains("alpha"), "{manifest}");
+        assert!(manifest.contains("beta"), "{manifest}");
+    }
+
+    #[test]
+    /// The output directory is created rather than required to exist: the
+    /// first run of a new quiz should not fail on a missing folder.
+    fn quiz_creates_its_output_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = quiz_fixture(dir.path(), 1);
+        let out = dir.path().join("nested/sheets");
+        run_quiz(quiz_args(&spec, &out, None, 1)).expect("quiz runs");
+        assert!(out.join("midterm.docx").is_file());
+        assert!(out.join("midterm-key.docx").is_file());
+    }
+
+    #[test]
+    /// A seed reproduces a run exactly, byte for byte. A sheet handed out can
+    /// otherwise never be rebuilt — which is why the seed is printed.
+    fn quiz_is_reproducible_for_a_seed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = quiz_fixture(dir.path(), 2);
+        let read = |out: &Path| fs::read(out.join("midterm-B.docx")).expect("read sheet");
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        run_quiz(quiz_args(&spec, &first, None, 99)).expect("first run");
+        run_quiz(quiz_args(&spec, &second, None, 99)).expect("second run");
+        assert_eq!(
+            read(&first),
+            read(&second),
+            "the same seed drew differently"
+        );
+    }
+
+    #[test]
+    /// `--name` overrides the spec's stem, so two specs can write into one
+    /// folder without colliding.
+    fn quiz_name_overrides_the_spec_stem() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let spec = quiz_fixture(dir.path(), 1);
+        let out = dir.path().join("out");
+        run_quiz(quiz_args(&spec, &out, Some("final"), 3)).expect("quiz runs");
+        assert!(out.join("final.docx").is_file());
+        assert!(!out.join("midterm.docx").exists());
+    }
+
+    #[test]
+    /// A group folder cannot climb out of the spec's own directory. A spec is
+    /// checked in beside its questions; one reaching `../../etc` is reading
+    /// somewhere its author did not choose.
+    fn quiz_group_folder_cannot_escape_the_spec_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let refused = list_group_sources(dir.path(), "../elsewhere");
+        assert!(refused.is_err(), "the escape was allowed");
+    }
+
+    #[test]
+    /// Output files are named from the spec, and a spec with no stem still
+    /// gets a name rather than an extension-only file.
+    fn spec_stem_names_the_output() {
+        assert_eq!(spec_stem(Path::new("out/midterm.yaml")), "midterm");
+        assert_eq!(spec_stem(Path::new("final.yml")), "final");
+        assert_eq!(spec_stem(Path::new("")), "quiz");
     }
 
     #[test]
@@ -1107,7 +1476,7 @@ mod tests {
                 kind: QuestionKind::TrueFalse(TrueFalse { answer: true }),
             }],
         };
-        let images = canvas_images(dir.path(), &mut bank, DiagramFormat::Png);
+        let images = canvas_images(dir.path(), &mut bank.items, DiagramFormat::Png);
         let names: Vec<&str> = images.iter().map(|(path, _)| path.as_str()).collect();
         assert!(names.contains(&"real.png"));
         let prompt = bank.items.first().map_or("", |q| q.prompt.as_str());
