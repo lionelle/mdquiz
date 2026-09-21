@@ -287,9 +287,12 @@ pub(crate) fn blank_marker(name: &str) -> String {
 
 /// The writing room a `{{name}}` marker prints as.
 ///
-/// Wider than the `____` a whole answer is written on: this blank sits mid
-/// sentence and has to read as a gap in the text rather than a rule under it.
-pub(crate) const BLANK_FILL: &str = "________";
+/// Wider than the [`crate::export::WRITE_IN`] rule a letter goes on: this
+/// blank sits mid-sentence and holds a whole word, so it has to read as a gap
+/// in the text rather than a rule under it — and a student has to be able to
+/// write in it. Twelve characters is about an inch in the monospace face the
+/// writers set it in.
+pub(crate) const BLANK_FILL: &str = "____________";
 
 /// `prompt` with every one of `blanks`'s markers replaced by writing room.
 ///

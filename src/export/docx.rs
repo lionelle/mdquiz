@@ -505,8 +505,15 @@ fn question_xml(
     for block in prompt {
         xml.push_str(&set(&block, ParagraphStyle::Continuation));
     }
-    for line in answers::lines(item, refs)? {
-        xml.push_str(&paragraph(&line, ParagraphStyle::Answer));
+    match answers::lines(item, refs)? {
+        answers::Answers::Lines(lines) => {
+            for line in lines {
+                xml.push_str(&paragraph(&line, ParagraphStyle::Answer));
+            }
+        }
+        // A `w:tbl` is not a `w:p`, so it is emitted as it stands — the same
+        // rule `set` applies to a table in a prompt.
+        answers::Answers::Block(block) => xml.push_str(&block),
     }
     xml.push_str(&answer_space(item.answer_space));
     Ok(xml)
@@ -568,7 +575,7 @@ fn prose(markdown: &str, refs: &mut Refs<'_>) -> Result<String> {
 fn set(block: &inline::Paragraph, style: ParagraphStyle) -> String {
     match block.kind {
         Kind::Table => block.runs.clone(),
-        Kind::Prose | Kind::Heading(_) | Kind::Equation | Kind::Item(_) => {
+        Kind::Prose | Kind::Heading(_) | Kind::Equation | Kind::Item(_) | Kind::CodeBlock => {
             paragraph(&block.centred(), style.or_block(block.kind))
         }
     }
@@ -586,6 +593,8 @@ enum ParagraphStyle {
     /// A prompt's second and later paragraphs: kept with the first, and
     /// separated from it, but without the wide gap that opens a question.
     Continuation,
+    /// A code block: monospace on a shaded panel, indented from the text.
+    CodeBlock,
     /// A Markdown heading, at the given level.
     Heading(u8),
     /// One line of a question's answer structure: an option, a checkbox, a
@@ -626,6 +635,7 @@ impl ParagraphStyle {
             },
             // A table brings its whole `w:tbl` and is never wrapped, so no
             // paragraph style applies to it; `set` never reaches here for one.
+            Kind::CodeBlock => Self::CodeBlock,
             Kind::Prose | Kind::Equation | Kind::Table => self,
         }
     }
@@ -653,6 +663,12 @@ impl ParagraphStyle {
             Self::Answer => {
                 format!(r#"{STICKY}<w:spacing w:after="60"/><w:ind w:left="{ANSWER_INDENT}"/>"#)
             }
+            Self::CodeBlock => {
+                format!(r#"{STICKY}<w:shd w:val="clear" w:color="auto" w:fill="{CODE_FILL}"/>"#)
+                    + &format!(
+                        r#"<w:spacing w:before="120" w:after="120"/><w:ind w:left="{CODE_INDENT}" w:right="{CODE_INDENT}"/>"#
+                    )
+            }
             Self::Heading(level) => format!(r#"<w:pStyle w:val="{}"/>"#, heading_style(level)),
             Self::Item { item, sticky } => item_properties(item, sticky),
         }
@@ -669,6 +685,19 @@ impl ParagraphStyle {
 /// knob. `an_answer_line_lines_up_with_a_first_level_list_item` is what holds
 /// the two numbers together.
 const ANSWER_INDENT: u32 = 720;
+
+/// How far a code block is inset from the text, in twips.
+///
+/// Both sides, so the shaded panel reads as a block set into the page rather
+/// than as a stripe running edge to edge.
+const CODE_INDENT: u32 = 360;
+
+/// The panel colour behind a code block.
+///
+/// Light enough to photocopy without turning the code grey, dark enough to
+/// show where the block begins and ends — which is the job the backticks used
+/// to do before they stopped being printed.
+const CODE_FILL: &str = "F2F2F2";
 
 /// The `w:pPr` tags that hold a paragraph to the one after it.
 ///
@@ -810,6 +839,8 @@ fn field_run(instruction: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export::{CHECKBOX, RADIO, WRITE_IN};
+    use crate::model::BLANK_FILL;
     use crate::model::{
         Blank, Choice, ChoiceSet, Feedback, FillInBlank, MatchMode, MatchPair, Matching,
         MultipleSelect, Ordering, Question, QuestionKind, ScoringMode, TrueFalse,
@@ -965,6 +996,30 @@ mod tests {
             }
         }
         ids
+    }
+
+    #[test]
+    /// A code block prints on a shaded panel, inset from the text, in the
+    /// monospace face — and the fence that used to mark it does not print.
+    fn a_code_block_is_set_on_a_shaded_panel() {
+        let quiz = exam_asking("Trace it:\n\n```python\nfor i in range(3):\n    print(i)\n```");
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
+        assert!(
+            document.contains(&format!(
+                r#"<w:shd w:val="clear" w:color="auto" w:fill="{CODE_FILL}"/>"#
+            )),
+            "no shaded panel: {document}"
+        );
+        assert!(
+            document.contains(&format!(
+                r#"<w:ind w:left="{CODE_INDENT}" w:right="{CODE_INDENT}"/>"#
+            )),
+            "the panel is not inset: {document}"
+        );
+        let text = text_of(&document);
+        assert!(!text.contains("```"), "the fence printed: {text}");
+        assert!(!text.contains("python"), "the info string printed: {text}");
+        assert!(text.contains("for i in range(3):"), "{text}");
     }
 
     /// A one-question exam whose prompt holds an image, and the bytes for it.
@@ -1171,12 +1226,15 @@ mod tests {
 
     /// The `CT_PPrBase` child sequence, in schema order. Only the elements this
     /// writer emits need listing; an unknown one fails the check loudly.
-    const PPR_ORDER: [&str; 9] = [
+    const PPR_ORDER: [&str; 10] = [
         "w:pStyle",
         "w:keepNext",
         "w:keepLines",
         "w:pageBreakBefore",
         "w:numPr",
+        // `w:shd` sits between the borders and the spacing in `CT_PPrBase`,
+        // which is the one place a code block's panel could be misfiled.
+        "w:shd",
         "w:spacing",
         "w:ind",
         "w:jc",
@@ -1716,6 +1774,86 @@ mod tests {
     }
 
     #[test]
+    /// The shape of the mark says how many answers to give: round where
+    /// exactly one is right, square where several may be. A student should
+    /// not have to read the instruction to know whether to tick one box or
+    /// three.
+    fn pick_one_and_pick_many_are_marked_differently() {
+        let one = answer_text(
+            "Pick one.",
+            QuestionKind::MultipleChoice(ChoiceSet {
+                choices: two_choices(),
+            }),
+            Vec::new(),
+        );
+        let many = answer_text(
+            "Pick any.",
+            QuestionKind::MultipleSelect(MultipleSelect {
+                choices: two_choices(),
+                scoring: ScoringMode::default(),
+            }),
+            Vec::new(),
+        );
+        // True/false is a pick-one, whatever its payload is called.
+        let either = answer_text(
+            "True?",
+            QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            Vec::new(),
+        );
+        assert!(one.contains(RADIO) && !one.contains(CHECKBOX), "{one}");
+        assert!(many.contains(CHECKBOX) && !many.contains(RADIO), "{many}");
+        assert!(
+            either.contains(RADIO) && !either.contains(CHECKBOX),
+            "{either}"
+        );
+    }
+
+    #[test]
+    /// A mark is set in the monospace face, so the gap inside it is the same
+    /// width on every reader. Built from body-face spaces it would be a
+    /// different size in every substituted font, and too small to mark in
+    /// most of them.
+    fn a_mark_is_set_in_the_monospace_face() {
+        let quiz = exam_of(
+            "Pick any.",
+            QuestionKind::MultipleSelect(MultipleSelect {
+                choices: two_choices(),
+                scoring: ScoringMode::default(),
+            }),
+            Vec::new(),
+        );
+        let document = part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml");
+        let holding = document
+            .split("<w:r>")
+            .find(|run| run.contains(CHECKBOX))
+            .expect("the mark reached the page");
+        assert!(
+            holding.contains(&format!(r#"<w:rStyle w:val="{}"/>"#, inline::CODE_STYLE)),
+            "the mark is not monospace: {holding}"
+        );
+    }
+
+    #[test]
+    /// The key carries no marks. There is nothing for a grader to tick, and a
+    /// column of empty boxes beside the answers would only invite it.
+    fn the_key_prints_no_marks_to_tick() {
+        for kind in [
+            QuestionKind::TrueFalse(TrueFalse { answer: true }),
+            QuestionKind::MultipleChoice(ChoiceSet {
+                choices: two_choices(),
+            }),
+            QuestionKind::MultipleSelect(MultipleSelect {
+                choices: two_choices(),
+                scoring: ScoringMode::default(),
+            }),
+        ] {
+            let key = key_text("Prompt.", kind, Vec::new());
+            assert!(!key.contains(RADIO), "{key}");
+            assert!(!key.contains(CHECKBOX), "{key}");
+        }
+    }
+
+    #[test]
     /// A single-answer question letters its options with no box; a
     /// choose-all-that-apply one adds a box to each. Nothing else on the page
     /// says how many letters the student may pick.
@@ -1729,10 +1867,6 @@ mod tests {
         );
         assert!(single.contains("A. alpha"), "{single}");
         assert!(single.contains("B. beta"), "{single}");
-        assert!(
-            !single.contains("[ ]"),
-            "a single answer got a box: {single}"
-        );
 
         let multiple = answer_text(
             "Pick any.",
@@ -1742,8 +1876,8 @@ mod tests {
             }),
             Vec::new(),
         );
-        assert!(multiple.contains("[ ] A. alpha"), "{multiple}");
-        assert!(multiple.contains("[ ] B. beta"), "{multiple}");
+        assert!(multiple.contains("A. alpha"), "{multiple}");
+        assert!(multiple.contains("B. beta"), "{multiple}");
     }
 
     #[test]
@@ -1755,8 +1889,8 @@ mod tests {
             QuestionKind::TrueFalse(TrueFalse { answer: true }),
             Vec::new(),
         );
-        assert!(text.contains("[ ] True"), "{text}");
-        assert!(text.contains("[ ] False"), "{text}");
+        assert!(text.contains(&format!("{RADIO}True")), "{text}");
+        assert!(text.contains(&format!("{RADIO}False")), "{text}");
     }
 
     #[test]
@@ -1775,9 +1909,69 @@ mod tests {
             }),
             Vec::new(),
         );
-        assert!(text.contains("The capital is ________."), "{text}");
+        assert!(
+            text.contains(&format!("The capital is {BLANK_FILL}.")),
+            "{text}"
+        );
         assert!(!text.contains("{{city}}"), "the marker printed: {text}");
         assert!(!text.contains("Paris"), "the answer printed: {text}");
+    }
+
+    #[test]
+    /// A matching question is laid out in two columns, so a student can draw
+    /// a line from a prompt to its option. Stacked one list above the other
+    /// there is nothing to draw between.
+    fn a_matching_question_is_laid_out_in_two_columns() {
+        let document = matching_document();
+        assert!(document.contains("<w:tbl>"), "not a table: {document}");
+        for row in document.split("<w:tr>").skip(1) {
+            let row = row.split("</w:tr>").next().unwrap_or_default();
+            assert_eq!(row.matches("<w:tc>").count(), 2, "not two columns: {row}");
+        }
+    }
+
+    #[test]
+    /// The columns are borderless. A matching question is two lists that
+    /// happen to be aligned, not a grid — ruled boxes would fight the lines
+    /// the student is drawing across them.
+    fn the_matching_columns_are_borderless() {
+        assert!(
+            !matching_document().contains("<w:tblBorders>"),
+            "the matching grid drew its lines"
+        );
+    }
+
+    #[test]
+    /// The prompts go on the left and the options on the right, and the
+    /// short column is padded rather than left ragged — there are always
+    /// more options than prompts, because the distractors are the point.
+    fn the_short_matching_column_is_padded() {
+        let document = matching_document();
+        let rows: Vec<&str> = document
+            .split("<w:tr>")
+            .skip(1)
+            .map(|row| row.split("</w:tr>").next().unwrap_or_default())
+            .collect();
+        let first = rows.first().copied().unwrap_or_default();
+        assert!(
+            first.contains("char"),
+            "prompts are not on the left: {first}"
+        );
+        assert!(first.contains("bytes") || first.contains("byte"), "{first}");
+        // Three options against two prompts, so the last row's left cell is
+        // an empty paragraph rather than a missing one.
+        let last = rows.last().copied().unwrap_or_default();
+        assert_eq!(
+            last.matches("<w:p>").count(),
+            2,
+            "a cell went missing: {last}"
+        );
+    }
+
+    /// The document for an exam of one matching question.
+    fn matching_document() -> String {
+        let quiz = exam_of("Match them.", matching_kind(), vec![2, 0, 1]);
+        part(&to_docx(&quiz, &[]).expect("renders"), "word/document.xml")
     }
 
     #[test]
@@ -1803,8 +1997,8 @@ mod tests {
             }),
             vec![2, 0, 1],
         );
-        assert!(text.contains("____ 1. char"), "{text}");
-        assert!(text.contains("____ 2. int"), "{text}");
+        assert!(text.contains(&format!("{WRITE_IN}1. char")), "{text}");
+        assert!(text.contains(&format!("{WRITE_IN}2. int")), "{text}");
         // The stored order is [8 bytes, 1 byte, 4 bytes], so the labels follow
         // it rather than the authored order that pairs A with prompt 1.
         assert!(text.contains("A. 8 bytes"), "{text}");
@@ -1824,9 +2018,11 @@ mod tests {
             }),
             vec![1, 2, 0],
         );
-        let link = text.find("____ Link").expect("link listed");
-        let run = text.find("____ Run").expect("run listed");
-        let compile = text.find("____ Compile").expect("compile listed");
+        let link = text.find(&format!("{WRITE_IN}Link")).expect("link listed");
+        let run = text.find(&format!("{WRITE_IN}Run")).expect("run listed");
+        let compile = text
+            .find(&format!("{WRITE_IN}Compile"))
+            .expect("compile listed");
         assert!(link < run && run < compile, "wrong order: {text}");
     }
 
@@ -1849,8 +2045,8 @@ mod tests {
             vec![2, 1, 0],
         );
         assert_ne!(
-            sorted.find("____ Run") < sorted.find("____ Compile"),
-            reversed.find("____ Run") < reversed.find("____ Compile"),
+            sorted.find(&format!("{WRITE_IN}Run")) < sorted.find(&format!("{WRITE_IN}Compile")),
+            reversed.find(&format!("{WRITE_IN}Run")) < reversed.find(&format!("{WRITE_IN}Compile")),
             "the order on the page did not follow option_order"
         );
     }
@@ -1866,9 +2062,11 @@ mod tests {
             items: items.clone(),
         });
         let text = answer_text("Order them.", kind, Vec::new());
-        let compile = text.find("____ Compile").expect("compile listed");
-        let link = text.find("____ Link").expect("link listed");
-        let run = text.find("____ Run").expect("run listed");
+        let compile = text
+            .find(&format!("{WRITE_IN}Compile"))
+            .expect("compile listed");
+        let link = text.find(&format!("{WRITE_IN}Link")).expect("link listed");
+        let run = text.find(&format!("{WRITE_IN}Run")).expect("run listed");
         assert!(
             !(compile < link && link < run),
             "the sheet printed the authored order: {text}"
@@ -1976,8 +2174,8 @@ mod tests {
             })
         };
         let sheet = answer_text("Pick any.", kind(), Vec::new());
-        assert!(sheet.contains("[ ] B. beta"), "{sheet}");
-        assert!(sheet.contains("[ ] D. delta"), "{sheet}");
+        assert!(sheet.contains(&format!("{CHECKBOX}B. beta")), "{sheet}");
+        assert!(sheet.contains(&format!("{CHECKBOX}D. delta")), "{sheet}");
 
         let key = key_text("Pick any.", kind(), Vec::new());
         assert!(key.contains("B. beta"), "{key}");

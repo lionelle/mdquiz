@@ -819,6 +819,58 @@ existing pattern.
     laid out for writing.
 
 
+14. **Print formatting for real exams.** *Done* — three changes driven by a
+    real course bank (CS 5001, 357 questions).
+
+    **Marks a student can actually mark.** `[ ] ` is two characters wide; a
+    pen needs more. The marks are now round where exactly one answer is right
+    (multiple choice *and* true/false, which is a pick-one whatever its
+    payload is called) and square where several may be, so the shape says how
+    many to give before the instruction is read. Multiple choice had no mark
+    at all before — only a letter.
+
+    All three marks are set in the **monospace face**. A box built from
+    body-face spaces is a different size in every substituted font, and too
+    small to mark in most; in Consolas it is the same box everywhere. They
+    live in `export.rs` beside `points_label`, shared by both print paths, so
+    a student handed either sheet sees the same affordance.
+
+    **Code blocks are blocks.** They were printed from their *source span*,
+    which is why the ``` ``` ``` fences and the info string reached the page.
+    Built from the block's own events instead, the parser hands over the code
+    without them. `ParagraphStyle::CodeBlock` then sets it on a shaded panel
+    (`w:shd`, `F2F2F2`) inset from both margins — the panel does the job the
+    backticks used to do, marking where the block starts and ends. Verified
+    by rendering a page to PNG: 30,800 pixels of exactly `F2F2F2`.
+
+    Note `w:shd` sits between `w:numPr` and `w:spacing` in `CT_PPrBase`;
+    `PPR_ORDER` grew an entry so a misfiled panel fails the schema test
+    rather than Word.
+
+    **Matching is two columns**, so a student can draw between them. A
+    borderless `w:tbl` rather than tab stops, because a tab-stop layout wraps
+    a long prompt *under* the option column — and the real bank's prompts are
+    sentences ("Accessing an element of an array by its index"). The split is
+    60/40, not even: a prompt is a sentence and an option is a word.
+
+    That needed `table.rs` split in two — `of_cells` takes already-rendered
+    `Row`s and owns the Word requirements, while the Markdown path renders
+    cells first and calls it. `answers::lines` returns `Answers::Lines` or
+    `Answers::Block`, mirroring `Kind::Table`/`set`: a `w:tbl` is not a `w:p`
+    and cannot travel as one. The Markdown sheet uses a pipe table, the only
+    thing Markdown has that puts two things on one line.
+
+    The write-in blank stays on the left, so the sheet works whether a course
+    grades drawn lines or written letters.
+
+    **The conversion test now reads `pdftotext -layout`.** Without it a wide
+    mark is read as its own column and lands on a line of its own, and a
+    matching question's two columns interleave — so the old flat read could
+    not see either change. It now asserts a prompt and an option share a
+    line, which is the whole point of the layout and the one thing only a
+    converted page proves.
+
+
 ### Tables
 
 A Markdown pipe table is a real `w:tbl` (see item 13). The section that stood

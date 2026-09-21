@@ -76,6 +76,8 @@ pub(super) enum Kind {
     Equation,
     /// A paragraph inside a list item, in the list [`Item`] names.
     Item(Item),
+    /// A fenced or indented code block, set as a shaded block.
+    CodeBlock,
     /// A whole `w:tbl`, already complete.
     ///
     /// The odd one out: a table is a block-level sibling of `w:p`, not
@@ -102,7 +104,9 @@ impl Paragraph {
     pub(super) fn centred(&self) -> String {
         match self.kind {
             Kind::Equation => format!("<m:oMathPara>{}</m:oMathPara>", self.runs),
-            Kind::Prose | Kind::Heading(_) | Kind::Item(_) | Kind::Table => self.runs.clone(),
+            Kind::Prose | Kind::Heading(_) | Kind::Item(_) | Kind::Table | Kind::CodeBlock => {
+                self.runs.clone()
+            }
         }
     }
 }
@@ -145,6 +149,16 @@ pub(super) fn paragraphs(markdown: &str, refs: &mut Refs<'_>) -> Result<Vec<Para
 /// One literal text run.
 pub(super) fn text_run(text: &str) -> String {
     run(text, "")
+}
+
+/// One literal run in the monospace face.
+///
+/// For the fixed-width furniture a student marks — a checkbox, a write-in
+/// rule. A space in Calibri is narrow and varies by face, so a box drawn from
+/// body-face spaces is a different size on every reader; in Consolas it is
+/// the same box everywhere.
+pub(super) fn mono_run(text: &str) -> String {
+    run(text, &Marks::default().as_code().properties())
 }
 
 /// One top-level Markdown block.
@@ -222,7 +236,7 @@ impl<'e> Block<'e> {
                 };
                 out.extend(paragraphs);
             }
-            Self::Preformatted(events) => return Ok(Some((events, Face::Code))),
+            Self::Preformatted(events) => out.push(code_block(&events)),
             Self::Table(alignments, events) => {
                 let Some(xml) = table::table(&alignments, &events, refs)? else {
                     // A cell this writer cannot lay out sends the whole
@@ -537,7 +551,9 @@ fn nested<'a, 'e>(events: &'a [Event<'e>], start: usize) -> (&'a [Event<'e>], us
 fn runs(events: &[Event<'_>], kind: Kind, refs: &mut Refs<'_>) -> Result<Option<String>> {
     let display = match kind {
         Kind::Equation => Display::Block,
-        Kind::Prose | Kind::Heading(_) | Kind::Item(_) | Kind::Table => Display::Inline,
+        Kind::Prose | Kind::Heading(_) | Kind::Item(_) | Kind::Table | Kind::CodeBlock => {
+            Display::Inline
+        }
     };
     marked_runs(events, Marks::default(), display, refs)
 }
@@ -625,6 +641,34 @@ fn character_run(event: &Event<'_>, marks: Marks, display: Display) -> Result<Op
         Event::DisplayMath(latex) => omml::to_omml(latex, display)?,
         _ => return Ok(None),
     }))
+}
+
+/// One code block, set as its own shaded paragraph.
+///
+/// Built from the block's own events rather than its source span: a fence is
+/// a marker, not content, so the parser reports the code without it and the
+/// backticks never reach the page. Math needs no refusing here — inside a
+/// fence pulldown reports `$x^2$` as text, not as math.
+fn code_block(events: &[Event<'_>]) -> Paragraph {
+    Paragraph {
+        kind: Kind::CodeBlock,
+        runs: literal(&code_text(events), &Face::Code.properties()),
+    }
+}
+
+/// The text inside a code block, fences and info string excluded.
+///
+/// Concatenated rather than joined with newlines: the parser already reports
+/// a fenced block's content with its own line endings intact, and adding more
+/// would double every blank line.
+fn code_text(events: &[Event<'_>]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Text(text) | Event::Code(text) => Some(text.as_ref()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The alt text of an image: the plain text authored inside its `![…]`.
@@ -1258,7 +1302,6 @@ mod tests {
             // An info string is part of the fence line, which prints too.
             "```rust\nlet x = 1;\n```",
             "    let x = 1;",
-            "```\n```",
         ] {
             let runs = only(source);
             assert!(
@@ -1277,7 +1320,7 @@ mod tests {
         let runs = only("```\nlet x = 1;\nlet y = 2;\n```");
         assert_eq!(
             runs.matches(r#"<w:rStyle w:val="Code"/>"#).count(),
-            4,
+            2,
             "{runs}"
         );
     }
@@ -1330,11 +1373,34 @@ mod tests {
     }
 
     #[test]
+    /// A fence is a marker, not content: neither the backticks nor the info
+    /// string reaches the page. They used to, because the block was printed
+    /// from its source span rather than from what the parser found inside it.
+    fn a_fence_does_not_print() {
+        for source in ["```\nlet x = 1;\n```", "```rust\nlet x = 1;\n```"] {
+            let runs = only(source);
+            assert!(!runs.contains("```"), "{source} printed its fence: {runs}");
+            assert!(!runs.contains("rust"), "{source} printed its info: {runs}");
+            assert!(runs.contains(">let x = 1;<"), "{runs}");
+        }
+    }
+
+    #[test]
+    /// A code block is reported as one, so the container can set it on a
+    /// shaded panel. Without that the block has nothing marking where it
+    /// starts and ends, which is the job the backticks used to do.
+    fn a_code_block_is_reported_as_a_block() {
+        let rendered = rendered("```\nlet x = 1;\n```").expect("renders");
+        let block = rendered.first().expect("one block");
+        assert!(matches!(block.kind, Kind::CodeBlock), "{block:?}");
+    }
+
+    #[test]
     /// A pipe table keeps its rows on separate lines, which is the whole of
     /// what makes it readable as a table.
-    fn a_code_block_falls_back_line_by_line() {
+    fn a_code_block_keeps_its_lines() {
         let runs = only("```\nlet x = 1;\nlet y = 2;\n```");
-        assert_eq!(runs.matches("<w:r><w:br/></w:r>").count(), 3, "{runs}");
+        assert_eq!(runs.matches("<w:r><w:br/></w:r>").count(), 1, "{runs}");
         assert!(runs.contains(">let x = 1;<"), "{runs}");
     }
 
@@ -1343,8 +1409,15 @@ mod tests {
     /// from its *content*, so slicing that span alone de-indents the first
     /// line — and alignment is the one thing this fallback exists to keep.
     fn an_indented_code_block_keeps_its_indent() {
-        let runs = only("    let x = 1;\n    let y = 2;");
-        assert_eq!(runs.matches(">    let").count(), 2, "{runs}");
+        // The leading four spaces are the *marker* for an indented block, so
+        // they are dropped like a fence is — what has to survive is the
+        // indentation inside the code, which is what the code means.
+        let runs = only("    def f():\n        return 1");
+        assert!(runs.contains(">def f():<"), "{runs}");
+        assert!(
+            runs.contains(">    return 1<"),
+            "lost its body indent: {runs}"
+        );
     }
 
     #[test]
@@ -1355,7 +1428,7 @@ mod tests {
         let rendered = rendered("intro\n\n    let x = 1;").expect("renders");
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         let code = rendered.last().expect("two paragraphs");
-        assert!(code.runs.contains(">    let x = 1;<"), "{code:?}");
+        assert!(code.runs.contains(">let x = 1;<"), "{code:?}");
         assert!(
             !code.runs.contains("intro"),
             "the paragraph reprinted: {code:?}"
@@ -1368,7 +1441,7 @@ mod tests {
     /// line is an ordinary authoring slip — and an off-by-one here drags the
     /// last letter of the paragraph onto the list.
     fn widening_a_block_starts_at_a_line_boundary() {
-        let rendered = rendered("text\n\n    indented code").expect("renders");
+        let rendered = rendered("text\n\n> quoted block").expect("renders");
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         let block = rendered.last().expect("two paragraphs");
         // The text of the first run, whatever `w:rPr` it carries: the block
@@ -1380,7 +1453,7 @@ mod tests {
             .and_then(|(head, _)| head.rsplit_once('>'))
             .map_or_else(String::new, |(_, text)| text.to_owned());
         assert_eq!(
-            first, "    indented code",
+            first, "&gt; quoted block",
             "the paragraph bled into the block: {block:?}"
         );
     }

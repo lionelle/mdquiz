@@ -84,20 +84,108 @@ pub(super) fn table(
     if columns == 0 {
         return Ok(None);
     }
-    let mut xml = format!("<w:tbl>{}{}", properties(), grid(columns));
+    let mut built = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let Some(cells) = row_xml(row, alignments, columns, index == 0, refs)? else {
+        let header = index == 0;
+        let Some(cells) = row_cells(row, alignments, columns, header, refs)? else {
             return Ok(None);
         };
-        xml.push_str(&cells);
+        built.push(Row { cells, header });
+    }
+    Ok(Some(of_cells(&built, &even_widths(columns), Borders::Grid)))
+}
+
+/// One cell's contents: the runs inside its paragraph, and the `w:pPr`
+/// children that paragraph carries.
+pub(super) struct Cell {
+    /// The runs the cell's single paragraph holds.
+    pub(super) runs: String,
+    /// The paragraph properties, already in schema order, or empty.
+    pub(super) properties: String,
+}
+
+impl Cell {
+    /// A cell holding `runs` and nothing else.
+    pub(super) fn plain(runs: String) -> Self {
+        Self {
+            runs,
+            properties: String::new(),
+        }
+    }
+}
+
+/// Whether a table draws its lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Borders {
+    /// Every edge, inside and out — an authored pipe table.
+    Grid,
+    /// None at all: two columns of text that happen to be aligned, which is
+    /// what a matching question needs so a student can draw between them.
+    None,
+}
+
+/// One row of cells, and whether it is the table's heading.
+pub(super) struct Row {
+    /// The cells, left to right. Short rows are padded when written.
+    pub(super) cells: Vec<Cell>,
+    /// Whether this row repeats when the table breaks across a page.
+    pub(super) header: bool,
+}
+
+/// A table of already-rendered `rows`, each column `widths` wide.
+///
+/// The shared half of both callers: an authored pipe table renders its cells
+/// from Markdown first, a matching question hands over runs it built itself,
+/// and from here on the Word requirements are the same for both.
+pub(super) fn of_cells(rows: &[Row], widths: &[u32], borders: Borders) -> String {
+    let mut xml = format!("<w:tbl>{}{}", properties(borders), grid(widths));
+    for row in rows {
+        xml.push_str(&row_xml(row, widths));
     }
     xml.push_str("</w:tbl>");
     xml.push_str(SEPARATOR);
-    Ok(Some(xml))
+    xml
+}
+
+/// `columns` equal shares of the text width.
+pub(super) fn even_widths(columns: usize) -> Vec<u32> {
+    vec![column_width(columns); columns]
+}
+
+/// One row of already-rendered cells as a `w:tr`.
+fn row_xml(row: &Row, widths: &[u32]) -> String {
+    let mut xml = String::from("<w:tr>");
+    // A header row repeats when the table breaks across a page. Without it a
+    // student reading the second page has columns and no names for them.
+    if row.header {
+        xml.push_str("<w:trPr><w:tblHeader/></w:trPr>");
+    }
+    for (index, width) in widths.iter().enumerate() {
+        let cell = row.cells.get(index);
+        let runs = cell.map_or("", |cell| cell.runs.as_str());
+        let properties = cell.map_or("", |cell| cell.properties.as_str());
+        let properties = if properties.is_empty() {
+            String::new()
+        } else {
+            format!("<w:pPr>{properties}</w:pPr>")
+        };
+        // Always a paragraph, even with no runs: a `w:tc` holding no `w:p` is
+        // the one table mistake Word refuses to open a document over.
+        let _ = write!(
+            xml,
+            r#"<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/></w:tcPr><w:p>{properties}{runs}</w:p></w:tc>"#
+        );
+    }
+    xml.push_str("</w:tr>");
+    xml
 }
 
 /// The table-wide properties: full width, fixed layout, and borders.
-fn properties() -> String {
+fn properties(borders: Borders) -> String {
+    let lines = match borders {
+        Borders::Grid => BORDERS,
+        Borders::None => "",
+    };
     format!(
         concat!(
             "<w:tblPr>",
@@ -107,16 +195,15 @@ fn properties() -> String {
             "</w:tblPr>",
         ),
         width = TABLE_WIDTH,
-        borders = BORDERS,
+        borders = lines,
     )
 }
 
 /// The column grid: `columns` equal shares of the text width.
-fn grid(columns: usize) -> String {
-    let each = column_width(columns);
+fn grid(widths: &[u32]) -> String {
     let mut xml = String::from("<w:tblGrid>");
-    for _ in 0..columns {
-        let _ = write!(xml, r#"<w:gridCol w:w="{each}"/>"#);
+    for width in widths {
+        let _ = write!(xml, r#"<w:gridCol w:w="{width}"/>"#);
     }
     xml.push_str("</w:tblGrid>");
     xml
@@ -130,7 +217,7 @@ fn column_width(columns: usize) -> u32 {
         .map_or(TABLE_WIDTH, |columns| TABLE_WIDTH / columns)
 }
 
-/// One row as a `w:tr`, padded to `columns` cells.
+/// One Markdown row's cells, padded to `columns`.
 ///
 /// `Ok(None)` when a cell cannot be laid out.
 ///
@@ -138,32 +225,26 @@ fn column_width(columns: usize) -> u32 {
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a cell holds math that cannot
 /// be converted.
-fn row_xml(
+fn row_cells(
     row: &[Vec<Event<'_>>],
     alignments: &[Alignment],
     columns: usize,
     header: bool,
     refs: &mut Refs<'_>,
-) -> Result<Option<String>> {
-    // A header row repeats when the table breaks across a page. Without it a
-    // student reading the second page has columns and no names for them.
-    let width = column_width(columns);
-    let mut xml = String::from("<w:tr>");
-    if header {
-        xml.push_str("<w:trPr><w:tblHeader/></w:trPr>");
-    }
+) -> Result<Option<Vec<Cell>>> {
+    let mut cells = Vec::new();
     for column in 0..columns {
         let events = row.get(column).map(Vec::as_slice).unwrap_or_default();
-        let Some(cell) = cell_xml(events, alignments.get(column), header, width, refs)? else {
+        let Some(cell) = cell(events, alignments.get(column), header, refs)? else {
             return Ok(None);
         };
-        xml.push_str(&cell);
+        cells.push(cell);
     }
-    xml.push_str("</w:tr>");
-    Ok(Some(xml))
+    Ok(Some(cells))
 }
 
-/// One cell as a `w:tc`, holding exactly one paragraph.
+/// One Markdown cell, bold if it is a column heading and justified if its
+/// column asks for it.
 ///
 /// `Ok(None)` when the cell's content cannot be laid out.
 ///
@@ -171,13 +252,12 @@ fn row_xml(
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if the cell holds math that
 /// cannot be converted.
-fn cell_xml(
+fn cell(
     events: &[Event<'_>],
     alignment: Option<&Alignment>,
     header: bool,
-    width: u32,
     refs: &mut Refs<'_>,
-) -> Result<Option<String>> {
+) -> Result<Option<Cell>> {
     // Header cells open bold, so the marks a cell's own `**…**` applies stack
     // on top rather than replacing it.
     let marks = if header {
@@ -188,20 +268,10 @@ fn cell_xml(
     let Some(runs) = runs_for(events, marks, refs)? else {
         return Ok(None);
     };
-    // Stated in twips to match the grid: under a fixed layout an `auto`
-    // cell width leaves the reader to guess, and readers guess differently.
-    let sizing = format!(r#"<w:tcPr><w:tcW w:w="{width}" w:type="dxa"/></w:tcPr>"#);
-    let properties = justification(alignment);
-    let properties = if properties.is_empty() {
-        String::new()
-    } else {
-        format!("<w:pPr>{properties}</w:pPr>")
-    };
-    // Always a paragraph, even with no runs: a `w:tc` holding no `w:p` is the
-    // one table mistake Word refuses to open a document over.
-    Ok(Some(format!(
-        "<w:tc>{sizing}<w:p>{properties}{runs}</w:p></w:tc>"
-    )))
+    Ok(Some(Cell {
+        runs,
+        properties: justification(alignment),
+    }))
 }
 
 /// The `w:jc` a column's Markdown alignment asks for, or nothing for the

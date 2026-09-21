@@ -30,21 +30,21 @@ use std::fmt::Write as _;
 use super::Refs;
 use super::inline;
 use super::inline::Kind;
+use super::table;
 use crate::Result;
 use crate::label::sequence as choice_label;
 use crate::model::{Choice, Matching, Ordering, Question, QuestionKind};
 use crate::quiz::exam::ExamItem;
 
 /// The blank a student writes an answer into.
-const BLANK: &str = "____ ";
+use crate::export::{CHECKBOX, RADIO, WRITE_IN};
 
-/// The box a student ticks when more than one option may be picked.
+/// How the two matching columns divide the text width, in twips.
 ///
-/// Brackets rather than `☐`: the ballot-box code point is missing from some
-/// of the faces a reader may substitute, and a missing glyph prints as a box
-/// that looks deliberate — so the sheet would be wrong in a way nobody can
-/// see. Brackets are in every face.
-const CHECKBOX: &str = "[ ] ";
+/// Not an even split: a prompt is a sentence and an option is a word or two,
+/// so equal columns would wrap every prompt while the options sat in white
+/// space. The gap between them is where the student draws.
+const MATCHING_WIDTHS: [u32; 2] = [5_600, 3_760];
 
 /// `question`'s prompt as it should be printed.
 ///
@@ -73,17 +73,31 @@ pub(super) fn prompt(question: &Question) -> String {
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if an option holds math that
 /// cannot be rendered.
-pub(super) fn lines(item: &ExamItem, refs: &mut Refs<'_>) -> Result<Vec<String>> {
-    match &item.question.kind {
+pub(super) fn lines(item: &ExamItem, refs: &mut Refs<'_>) -> Result<Answers> {
+    let lines = match &item.question.kind {
         QuestionKind::TrueFalse(_) => true_false(refs),
         QuestionKind::MultipleChoice(set) => choices(&set.choices, false, refs),
         QuestionKind::MultipleSelect(set) => choices(&set.choices, true, refs),
         QuestionKind::FillInBlank(_) => Ok(Vec::new()),
         QuestionKind::Matching(matching) => {
-            matching_lines(matching, &item.presented_options(), refs)
+            return matching_grid(matching, &item.presented_options(), refs);
         }
         QuestionKind::Ordering(_) => ordering_lines(&item.presented_options(), refs),
-    }
+    };
+    lines.map(Answers::Lines)
+}
+
+/// The shape a question's answer structure takes on the page.
+///
+/// Most kinds are a list of lines the container sets as answer paragraphs.
+/// Matching is not: its two columns are a `w:tbl`, which is a block-level
+/// sibling of `w:p` rather than something that fits inside one — the same
+/// division [`super::inline::Kind::Table`] draws, and for the same reason.
+pub(super) enum Answers {
+    /// One line per option, each set as its own answer paragraph.
+    Lines(Vec<String>),
+    /// A complete block-level element, emitted as it stands.
+    Block(String),
 }
 
 /// The two options of a true/false question, each with a box to tick.
@@ -94,7 +108,7 @@ pub(super) fn lines(item: &ExamItem, refs: &mut Refs<'_>) -> Result<Vec<String>>
 fn true_false(refs: &mut Refs<'_>) -> Result<Vec<String>> {
     ["True", "False"]
         .into_iter()
-        .map(|answer| option_line(CHECKBOX, answer, refs))
+        .map(|answer| option_line(RADIO, "", answer, refs))
         .collect()
 }
 
@@ -112,9 +126,9 @@ fn choices(choices: &[Choice], multiple: bool, refs: &mut Refs<'_>) -> Result<Ve
         .iter()
         .enumerate()
         .map(|(index, choice)| {
-            let box_ = if multiple { CHECKBOX } else { "" };
-            let label = format!("{box_}{}. ", choice_label(index));
-            option_line(&label, &choice.text, refs)
+            let mark = if multiple { CHECKBOX } else { RADIO };
+            let label = format!("{}. ", choice_label(index));
+            option_line(mark, &label, &choice.text, refs)
         })
         .collect()
 }
@@ -129,15 +143,28 @@ fn choices(choices: &[Choice], multiple: bool, refs: &mut Refs<'_>) -> Result<Ve
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if a prompt or option holds math
 /// that cannot be rendered.
-fn matching_lines(
-    matching: &Matching,
-    options: &[String],
-    refs: &mut Refs<'_>,
-) -> Result<Vec<String>> {
-    let mut lines = matching_prompts(matching, refs)?;
-    lines.push(String::new());
-    lines.extend(matching_options(options, refs)?);
-    Ok(lines)
+fn matching_grid(matching: &Matching, options: &[String], refs: &mut Refs<'_>) -> Result<Answers> {
+    let prompts = matching_prompts(matching, refs)?;
+    let options = matching_options(options, refs)?;
+    let rows = prompts.len().max(options.len());
+    let mut grid = Vec::with_capacity(rows);
+    for row in 0..rows {
+        // Short side padded with an empty cell: the two columns rarely have
+        // the same length, because the distractors are the point.
+        let cells = [prompts.get(row), options.get(row)]
+            .map(|cell| table::Cell::plain(cell.cloned().unwrap_or_default()))
+            .into_iter()
+            .collect();
+        grid.push(table::Row {
+            cells,
+            header: false,
+        });
+    }
+    Ok(Answers::Block(table::of_cells(
+        &grid,
+        &MATCHING_WIDTHS,
+        table::Borders::None,
+    )))
 }
 
 /// The numbered left prompts, each with a blank for the letter it matches.
@@ -151,7 +178,7 @@ fn matching_prompts(matching: &Matching, refs: &mut Refs<'_>) -> Result<Vec<Stri
         .pairs
         .iter()
         .enumerate()
-        .map(|(index, pair)| option_line(&format!("{BLANK}{}. ", index + 1), &pair.left, refs))
+        .map(|(index, pair)| option_line(WRITE_IN, &format!("{}. ", index + 1), &pair.left, refs))
         .collect()
 }
 
@@ -169,7 +196,7 @@ fn matching_options(options: &[String], refs: &mut Refs<'_>) -> Result<Vec<Strin
         .iter()
         .enumerate()
         .map(|(position, option)| {
-            option_line(&format!("{}. ", choice_label(position)), option, refs)
+            option_line("", &format!("{}. ", choice_label(position)), option, refs)
         })
         .collect()
 }
@@ -183,7 +210,7 @@ fn matching_options(options: &[String], refs: &mut Refs<'_>) -> Result<Vec<Strin
 fn ordering_lines(items: &[String], refs: &mut Refs<'_>) -> Result<Vec<String>> {
     items
         .iter()
-        .map(|item| option_line(BLANK, item, refs))
+        .map(|item| option_line(WRITE_IN, "", item, refs))
         .collect()
 }
 
@@ -202,7 +229,12 @@ fn ordering_lines(items: &[String], refs: &mut Refs<'_>) -> Result<Vec<String>> 
 ///
 /// Returns [`crate::Error::UnsupportedMath`] if `text` holds math that cannot
 /// be rendered.
-fn option_line(label: &str, text: &str, refs: &mut Refs<'_>) -> Result<String> {
+fn option_line(mark: &str, label: &str, text: &str, refs: &mut Refs<'_>) -> Result<String> {
+    // The mark is furniture, not text: it is set in the monospace face so a
+    // box is the same size on every reader, while the label beside it stays
+    // in the body font with the option it introduces. The key passes no mark
+    // — there is nothing for a grader to tick.
+    let lead = inline::mono_run(mark) + &inline::text_run(label);
     let blocks = inline::paragraphs(text, refs)?;
     // An option is one line, so every block is folded into it — and a table
     // is not something that folds. Its `w:tbl` inside a `w:p` is well-formed
@@ -210,9 +242,9 @@ fn option_line(label: &str, text: &str, refs: &mut Refs<'_>) -> Result<String> {
     // prints its source instead. Nonsense to author, but a visibly odd
     // option beats an unopenable paper.
     if blocks.iter().any(|block| matches!(block.kind, Kind::Table)) {
-        return Ok(inline::text_run(label) + &inline::text_run(text));
+        return Ok(lead + &inline::text_run(text));
     }
-    let mut runs = inline::text_run(label);
+    let mut runs = lead;
     for block in blocks {
         let _ = write!(runs, "{}", block.runs);
     }
@@ -262,7 +294,7 @@ fn correct_choices(choices: &[Choice], refs: &mut Refs<'_>) -> Result<String> {
     let mut lines = Vec::new();
     for (index, choice) in correct {
         let label = format!("{}. ", choice_label(index));
-        lines.push(option_line(&label, &choice.text, refs)?);
+        lines.push(option_line("", &label, &choice.text, refs)?);
     }
     Ok(joined(&lines))
 }
@@ -280,7 +312,7 @@ fn blank_answers(blanks: &[crate::model::Blank], refs: &mut Refs<'_>) -> Result<
     let mut lines = Vec::new();
     for blank in blanks {
         let label = format!("{}: ", blank.id);
-        lines.push(option_line(&label, &blank.answers.join(", "), refs)?);
+        lines.push(option_line("", &label, &blank.answers.join(", "), refs)?);
     }
     Ok(joined(&lines))
 }
@@ -301,7 +333,7 @@ fn matching_key(matching: &Matching, options: &[String], refs: &mut Refs<'_>) ->
     for (index, pair) in matching.pairs.iter().enumerate() {
         let label = label_of(&pair.right, options);
         let prefix = format!("{}. ", index + 1);
-        let mut runs = option_line(&prefix, &pair.left, refs)?;
+        let mut runs = option_line("", &prefix, &pair.left, refs)?;
         let _ = write!(runs, "{}", inline::text_run(&format!(" → {label}")));
         lines.push(runs);
     }
@@ -334,7 +366,7 @@ fn ordering_key(ordering: &Ordering, refs: &mut Refs<'_>) -> Result<String> {
     let mut lines = Vec::new();
     for (index, item) in ordering.items.iter().enumerate() {
         let label = format!("{}. ", index + 1);
-        lines.push(option_line(&label, item, refs)?);
+        lines.push(option_line("", &label, item, refs)?);
     }
     Ok(joined(&lines))
 }

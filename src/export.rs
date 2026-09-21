@@ -93,6 +93,30 @@ pub(crate) fn zip_package(what: &str, files: &[(&str, &[u8])]) -> Result<Vec<u8>
     Ok(cursor.into_inner())
 }
 
+/// The mark a student fills in when exactly one option is right.
+///
+/// Round for one, square for many: the shape says how many to mark before the
+/// student has read the instruction. Both are drawn from characters every
+/// font has — a `\u{25EF}` or a ballot box is cleaner, but those code points
+/// are missing from some substituted faces and a missing glyph prints as a
+/// box that looks deliberate.
+///
+/// Set in the monospace face by the writers, so the gap inside is a
+/// predictable width rather than however narrow a space happens to be in the
+/// body font. Six characters is about half an inch at 11pt — room for a pen.
+pub const RADIO: &str = "(    )  ";
+
+/// The mark a student fills in when more than one option may be right.
+///
+/// See [`RADIO`] for why the shapes differ and why they are plain characters.
+pub const CHECKBOX: &str = "[    ]  ";
+
+/// The rule a student writes a letter or a position on.
+///
+/// Shorter than [`crate::model::BLANK_FILL`] because only a letter or a
+/// number goes here, where that one holds a word mid-sentence.
+pub const WRITE_IN: &str = "______  ";
+
 /// A point value as it reads on a printed sheet: `1 point`, `2.5 points`.
 ///
 /// Shared by the print writers so a Word sheet and a Markdown one word it the

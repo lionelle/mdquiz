@@ -22,6 +22,7 @@ use std::path::Path;
 use std::process::Command;
 
 use mdquiz::export::docx::{to_answer_key, to_docx};
+use mdquiz::export::{CHECKBOX, RADIO, WRITE_IN};
 use mdquiz::model::{
     Choice, Feedback, MatchPair, Matching, MultipleSelect, Question, QuestionKind, ScoringMode,
     TrueFalse,
@@ -411,7 +412,11 @@ fn libreoffice_converts_the_document() {
 
 /// Assert the converted PDF's text is the exam we rendered.
 fn assert_pdf_reads_as_the_exam(pdf: &Path) {
+    // `-layout` keeps the page's columns: without it a wide mark like
+    // `(    )` is read as its own column and lands on a line of its own, and
+    // a matching question's two columns are interleaved rather than paired.
     let text = Command::new("pdftotext")
+        .arg("-layout")
         .arg(pdf)
         .arg("-")
         .output()
@@ -578,17 +583,27 @@ fn assert_table_was_laid_out(rendered: &str) {
 /// paragraph a matching question puts between its prompts and its options,
 /// which is the one line here that carries no text of its own.
 fn assert_answer_structures(rendered: &str) {
-    // Multiple select: a box per option, and the option's italics do not eat
-    // its text.
+    // Compared with runs of spaces collapsed: LibreOffice's plain-text filter
+    // squeezes them, so the marks' real widths are pinned on the XML by
+    // `export::docx` and what a converted page proves is that the mark and
+    // its option arrived together.
+    let page = collapsed(rendered);
+    // Pick-many gets a square box per option, pick-one a round one.
     assert!(
-        rendered.contains("[ ] A. merge sort"),
+        page.contains(&collapsed(&format!("{CHECKBOX}A. merge sort"))),
         "the multiple-select options are missing: {rendered}"
     );
-    // Matching: numbered prompts with a blank each, then every option
-    // lettered, distractor included.
-    for line in ["____ 1. char", "____ 2. int"] {
+    assert!(
+        page.contains(&collapsed(&format!("{RADIO}True")))
+            && page.contains(&collapsed(&format!("{RADIO}False"))),
+        "the true/false options are missing: {rendered}"
+    );
+    // Matching: numbered prompts with a write-in rule each, then every
+    // option lettered, distractor included.
+    for line in ["1. char", "2. int"] {
+        let expected = collapsed(&format!("{WRITE_IN}{line}"));
         assert!(
-            rendered.contains(line),
+            page.contains(&expected),
             "the matching prompt {line:?} is missing: {rendered}"
         );
     }
@@ -598,11 +613,34 @@ fn assert_answer_structures(rendered: &str) {
             "the matching option {right:?} is missing: {rendered}"
         );
     }
-    // True/false still prints both options and neither answer.
+    assert_matching_pairs_on_one_line(rendered);
+}
+
+/// Assert a matching prompt and an option share a line on the printed page.
+///
+/// The two-column `w:tbl` is pinned on the XML by `export::docx`; what a
+/// converted page adds is that they actually *land* side by side, which is
+/// the whole reason for the layout — stacked, there is nothing to draw a
+/// line between.
+fn assert_matching_pairs_on_one_line(rendered: &str) {
+    let paired = rendered
+        .lines()
+        .any(|line| line.contains("1. char") && line.contains("byte"));
     assert!(
-        rendered.contains("[ ] True") && rendered.contains("[ ] False"),
-        "the true/false options are missing: {rendered}"
+        paired,
+        "the matching columns did not land side by side: {rendered}"
     );
+}
+
+/// `text` with every run of spaces squeezed to one.
+fn collapsed(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch != ' ' || !out.ends_with(' ') {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// The `word/document.xml` of the sample exam.

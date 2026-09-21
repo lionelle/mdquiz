@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 
 use crate::Result;
-use crate::export::points_label;
+use crate::export::{CHECKBOX, RADIO, WRITE_IN, points_label};
 use crate::label::sequence as choice_label;
 use crate::model::{Blank, Choice, Matching, Ordering, Question, QuestionKind};
 
@@ -75,7 +75,7 @@ fn render_ordering(lead: &str, prompt: &str, ordering: &Ordering) -> String {
     for index in ordering.display_order() {
         if let Some(item) = ordering.items.get(index) {
             // Writing to a `String` is infallible, so the result is discarded.
-            let _ = write!(out, "\n   ____ {item}");
+            let _ = write!(out, "\n   {WRITE_IN}{item}");
         }
     }
     out.push('\n');
@@ -91,19 +91,33 @@ fn render_ordering(lead: &str, prompt: &str, ordering: &Ordering) -> String {
 /// back on the order that makes option *n* the answer to prompt *n* whenever
 /// the answers happen to sort that way. `display_order` rotates off it.
 fn render_matching(lead: &str, prompt: &str, matching: &Matching) -> String {
-    let mut out = format!("{lead}{prompt}\n");
-    for (index, pair) in matching.pairs.iter().enumerate() {
+    let prompts: Vec<String> = matching
+        .pairs
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| format!("{WRITE_IN}{}. {}", index + 1, pair.left))
+        .collect();
+    let all = matching.options();
+    let options: Vec<String> = matching
+        .display_order()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, index)| {
+            all.get(index)
+                .map(|right| format!("{}. {right}", choice_label(position)))
+        })
+        .collect();
+    // A table, because the two lists have to sit side by side for a student
+    // to draw between them, and a table is the only thing Markdown has that
+    // puts two columns on one line. The header is blank: these are not
+    // named columns, they are the two halves of one question.
+    let mut out = format!("{lead}{prompt}\n\n   |   |   |\n   |---|---|\n");
+    for row in 0..prompts.len().max(options.len()) {
+        let left = prompts.get(row).map_or("", String::as_str);
+        let right = options.get(row).map_or("", String::as_str);
         // Writing to a `String` is infallible, so the result is discarded.
-        let _ = write!(out, "\n   {}. {}", index + 1, pair.left);
+        let _ = writeln!(out, "   | {left} | {right} |");
     }
-    out.push('\n');
-    let options = matching.options();
-    for (position, index) in matching.display_order().into_iter().enumerate() {
-        if let Some(right) = options.get(index) {
-            let _ = write!(out, "\n   {}. {right}", choice_label(position));
-        }
-    }
-    out.push('\n');
     out
 }
 
@@ -114,7 +128,7 @@ fn render_fill_in_blank(lead: &str, prompt: &str, blanks: &[Blank]) -> String {
 
 /// Render a true/false item: the prompt plus blank True/False checkboxes.
 fn render_true_false(lead: &str, prompt: &str) -> String {
-    format!("{lead}{prompt}\n\n   - [ ] True\n   - [ ] False\n")
+    format!("{lead}{prompt}\n\n   {RADIO}True\n   {RADIO}False\n")
 }
 
 /// Render a choice-based item: the prompt then lettered options, no key.
@@ -126,11 +140,13 @@ fn render_choices(lead: &str, prompt: &str, choices: &[Choice], multiple: bool) 
     for (index, choice) in choices.iter().enumerate() {
         let label = choice_label(index);
         // Writing to a `String` is infallible, so the result is discarded.
-        if multiple {
-            let _ = write!(out, "\n   - [ ] {label}. {}", choice.text);
-        } else {
-            let _ = write!(out, "\n   {label}. {}", choice.text);
-        }
+        // The same marks the Word sheet prints, so a student handed either
+        // one sees the same affordance: round where exactly one answer is
+        // right, square where several may be. Wide enough to mark — the GFM
+        // `- [ ]` task item this replaced is a two-character box, and no
+        // wider spelling of it is still a task item.
+        let mark = if multiple { CHECKBOX } else { RADIO };
+        let _ = write!(out, "\n   {mark}{label}. {}", choice.text);
     }
     out.push('\n');
     out
@@ -210,6 +226,7 @@ fn ordering_answer(ordering: &Ordering) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::BLANK_FILL;
     use crate::model::{
         Blank, Choice, ChoiceSet, Feedback, FillInBlank, ItemBank, MatchMode, MatchPair, Matching,
         MultipleSelect, Question, QuestionKind, ScoringMode, TrueFalse,
@@ -249,8 +266,8 @@ mod tests {
     fn renders_true_false_without_answer() {
         let rendered = to_print_markdown(&true_false_bank()).expect("bank renders");
         assert!(rendered.contains("1. (1 point) Binary search needs a sorted array."));
-        assert!(rendered.contains("- [ ] True"));
-        assert!(rendered.contains("- [ ] False"));
+        assert!(rendered.contains(&format!("{RADIO}True")), "{rendered}");
+        assert!(rendered.contains(&format!("{RADIO}False")), "{rendered}");
         // The print sheet must never leak the correct answer.
         assert!(!rendered.contains("[x]"));
         assert!(!rendered.to_lowercase().contains("answer"));
@@ -418,8 +435,9 @@ mod tests {
             }],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        assert!(out.contains("- [ ] A. Binary search"));
-        assert!(out.contains("- [ ] B. Linear search"));
+        for option in ["A. Binary search", "B. Linear search"] {
+            assert!(out.contains(&format!("{CHECKBOX}{option}")), "{out}");
+        }
         assert!(!out.contains("[x]"));
     }
 
@@ -446,7 +464,12 @@ mod tests {
             }],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        assert!(out.contains("1. (1 point) HTTP ________ returns ________."));
+        assert!(
+            out.contains(&format!(
+                "1. (1 point) HTTP {BLANK_FILL} returns {BLANK_FILL}."
+            )),
+            "{out}"
+        );
         assert!(!out.contains("{{"));
         assert!(!out.contains("GET"));
     }
@@ -476,12 +499,35 @@ mod tests {
     }
 
     #[test]
+    /// Matching is laid out in two columns, as a table — the only thing
+    /// Markdown has that puts two things on one line — so a student can draw
+    /// between them, as on the Word sheet.
+    fn matching_is_laid_out_in_two_columns() {
+        let out = to_print_markdown(&matching_bank()).expect("renders");
+        assert!(out.contains("|---|---|"), "not a table: {out}");
+        // The body rows: past the blank header and the `|---|` separator.
+        let rows: Vec<&str> = out
+            .lines()
+            .skip_while(|line| !line.contains("|---|"))
+            .skip(1)
+            .filter(|line| line.trim_start().starts_with('|'))
+            .collect();
+        let first = rows.first().copied().unwrap_or_default();
+        assert!(first.contains("1. char"), "prompt not on the left: {first}");
+        assert!(first.contains("| A. "), "option not on the right: {first}");
+        // Three options against two prompts, so the last row's left cell is
+        // empty rather than absent — the columns stay aligned.
+        let last = rows.last().copied().unwrap_or_default();
+        assert!(last.trim_start().starts_with("|  |"), "ragged: {last}");
+    }
+
+    #[test]
     /// A matching item renders numbered prompts and lettered options, no key.
     fn renders_matching_without_answer_key() {
         let out = to_print_markdown(&matching_bank()).expect("renders");
         assert!(out.contains("1. (1 point) Match each type to its size."));
-        assert!(out.contains("   1. char"));
-        assert!(out.contains("   2. int"));
+        assert!(out.contains(&format!("{WRITE_IN}1. char")), "{out}");
+        assert!(out.contains(&format!("{WRITE_IN}2. int")), "{out}");
         // Every option is lettered and the distractor is among them: leaving
         // it out would let a student count options against prompts and get
         // the last pair free.
@@ -521,9 +567,11 @@ mod tests {
         let out = to_print_markdown(&bank).expect("renders");
         assert!(out.contains("1. (1 point) Order the phases."));
         // Sorted display order, not the authored order, with write-in blanks.
-        let items = out.find("____ Compile").expect("compile listed");
-        let link = out.find("____ Link").expect("link listed");
-        let run = out.find("____ Run").expect("run listed");
+        let items = out
+            .find(&format!("{WRITE_IN}Compile"))
+            .expect("compile listed");
+        let link = out.find(&format!("{WRITE_IN}Link")).expect("link listed");
+        let run = out.find(&format!("{WRITE_IN}Run")).expect("run listed");
         assert!(items < link && link < run);
     }
 
@@ -550,9 +598,11 @@ mod tests {
             }],
         };
         let out = to_print_markdown(&bank).expect("renders");
-        let compile = out.find("____ Compile").expect("compile listed");
-        let link = out.find("____ Link").expect("link listed");
-        let run = out.find("____ Run").expect("run listed");
+        let compile = out
+            .find(&format!("{WRITE_IN}Compile"))
+            .expect("compile listed");
+        let link = out.find(&format!("{WRITE_IN}Link")).expect("link listed");
+        let run = out.find(&format!("{WRITE_IN}Run")).expect("run listed");
         assert!(
             !(compile < link && link < run),
             "the sheet printed the answer: {out}"
